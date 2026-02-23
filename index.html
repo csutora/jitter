@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jitter - ARM64 Dynamic Recompiler</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
+      background: #0a0a0a;
+      color: #00ff41;
+      padding: 2em;
+      line-height: 1.5;
+    }
+    h1 { color: #00ff41; margin-bottom: 0.2em; font-size: 1.5em; }
+    .subtitle { color: #666; margin-bottom: 1.5em; font-size: 0.9em; }
+    .controls { margin-bottom: 1em; }
+    button {
+      font-family: inherit;
+      font-size: 1em;
+      padding: 0.4em 1.2em;
+      margin-right: 0.5em;
+      margin-bottom: 0.5em;
+      background: #1a1a1a;
+      color: #00ff41;
+      border: 1px solid #00ff41;
+      cursor: pointer;
+    }
+    button:hover { background: #00ff41; color: #0a0a0a; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #output {
+      background: #111;
+      border: 1px solid #333;
+      padding: 1em;
+      min-height: 400px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-size: 0.9em;
+      overflow-y: auto;
+    }
+    .error { color: #ff4141; }
+    .dim { color: #666; }
+    .highlight { color: #ffff41; }
+  </style>
+</head>
+<body>
+  <h1>jitter</h1>
+  <div class="subtitle">ARM64 &rarr; WASM dynamic recompiler</div>
+  <div class="controls">
+    <button id="btn-fib" onclick="window.runFib()">Fib(40)</button>
+    <button id="btn-fib-large" onclick="window.runFibLarge()">Fib(10M)</button>
+    <button id="btn-sum" onclick="window.runSum()">Sum 1..100M</button>
+    <button id="btn-sumsq" onclick="window.runSumSq()">Sum&sup2; 1..10M</button>
+  </div>
+  <pre id="output">Ready.\n</pre>
+  <script type="module">/* BUNDLE */</script>
+</body>
+</html>
