@@ -2,11 +2,22 @@ import { regOffset, SP_OFFSET, PC_OFFSET, NZCV_OFFSET } from './types.js';
 
 export class CpuState {
   readonly memory: WebAssembly.Memory;
-  readonly view: DataView;
+  private _view: DataView;
+  private _buffer: ArrayBuffer;
 
   constructor(memory: WebAssembly.Memory) {
     this.memory = memory;
-    this.view = new DataView(memory.buffer);
+    this._buffer = memory.buffer;
+    this._view = new DataView(this._buffer);
+  }
+
+  /** Get a DataView that's always backed by the current memory buffer */
+  get view(): DataView {
+    if (this._buffer !== this.memory.buffer) {
+      this._buffer = this.memory.buffer;
+      this._view = new DataView(this._buffer);
+    }
+    return this._view;
   }
 
   getReg(r: number): bigint {

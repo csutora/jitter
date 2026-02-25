@@ -1,7 +1,7 @@
 import { WasmModuleBuilder } from './wasm-emit.js';
 import {
-  ValType, BLOCKTYPE_VOID, HALT_PC,
-  regOffset, SP_OFFSET, NZCV_OFFSET, ITER_OFFSET,
+  ValType, BLOCKTYPE_VOID, HALT_PC, SVC_PC,
+  regOffset, vregOffset, SP_OFFSET, NZCV_OFFSET, ITER_OFFSET, TPIDR_OFFSET, PC_OFFSET, GUEST_MEM_BASE, V_OFFSET,
 } from './types.js';
 import type { DecodedInsn, ShiftType, CompiledBlock, CompiledRegion } from './types.js';
 import type { BasicBlock, Region } from './block.js';
@@ -34,10 +34,14 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
     switch (insn.kind) {
       case 'add_imm': case 'sub_imm':
         if (insn.rn !== 31) reads.add(regLocal(insn.rn));
-        else reads.add(SP_LOCAL); // ADD/SUB imm uses SP for reg 31
-        if (insn.rd !== 31) writes.add(regLocal(insn.rd));
-        else writes.add(SP_LOCAL);
-        if (insn.setFlags) { reads.add(NZCV_LOCAL); writes.add(NZCV_LOCAL); }
+        else reads.add(SP_LOCAL); // ADD/SUB imm uses SP for Rn=31
+        if (insn.rd === 31) {
+          if (!insn.setFlags) writes.add(SP_LOCAL); // Rd=31 without flags → SP
+          // Rd=31 with flags → XZR (CMP/CMN), no write needed
+        } else {
+          writes.add(regLocal(insn.rd));
+        }
+        if (insn.setFlags) writes.add(NZCV_LOCAL);
         break;
       case 'add_reg': case 'sub_reg':
         addRead(reads, insn.rn); addRead(reads, insn.rm);
@@ -58,13 +62,19 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
         if (insn.setFlags) writes.add(NZCV_LOCAL);
         break;
       case 'and_imm':
-        addRead(reads, insn.rn);
-        addWrite(writes, insn.rd);
-        if (insn.setFlags) writes.add(NZCV_LOCAL);
+        // For logical immediates, R31 = SP (not XZR)
+        if (insn.rn === 31) reads.add(SP_LOCAL); else addRead(reads, insn.rn);
+        if (insn.setFlags) {
+          // ANDS: Rd=31 is XZR
+          addWrite(writes, insn.rd);
+          writes.add(NZCV_LOCAL);
+        } else {
+          if (insn.rd === 31) writes.add(SP_LOCAL); else addWrite(writes, insn.rd);
+        }
         break;
       case 'orr_imm': case 'eor_imm':
-        addRead(reads, insn.rn);
-        addWrite(writes, insn.rd);
+        if (insn.rn === 31) reads.add(SP_LOCAL); else addRead(reads, insn.rn);
+        if (insn.rd === 31) writes.add(SP_LOCAL); else addWrite(writes, insn.rd);
         break;
       case 'movz':
         addWrite(writes, insn.rd);
@@ -77,6 +87,7 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
         addWrite(writes, insn.rd);
         break;
       case 'madd': case 'msub':
+      case 'smaddl': case 'smsubl': case 'umaddl': case 'umsubl':
         addRead(reads, insn.rn); addRead(reads, insn.rm); addRead(reads, insn.ra);
         addWrite(writes, insn.rd);
         break;
@@ -89,8 +100,13 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
         reads.add(NZCV_LOCAL);
         addWrite(writes, insn.rd);
         break;
-      case 'sbfm': case 'ubfm': case 'bfm':
+      case 'sbfm': case 'ubfm':
         addRead(reads, insn.rn);
+        addWrite(writes, insn.rd);
+        break;
+      case 'bfm':
+        addRead(reads, insn.rn);
+        addRead(reads, insn.rd); // BFM merges into Rd
         addWrite(writes, insn.rd);
         break;
       case 'b_cond':
@@ -123,6 +139,177 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
           if (insn.rn !== 31) addWrite(writes, insn.rn); else writes.add(SP_LOCAL);
         }
         break;
+      case 'ldrb_imm': case 'ldrh_imm': case 'ldrsw_imm':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addWrite(writes, insn.rt);
+        if (insn.mode !== 'offset') {
+          if (insn.rn !== 31) addWrite(writes, insn.rn); else writes.add(SP_LOCAL);
+        }
+        break;
+      case 'ldrsb_imm': case 'ldrsh_imm':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addWrite(writes, insn.rt);
+        if (insn.mode !== 'offset') {
+          if (insn.rn !== 31) addWrite(writes, insn.rn); else writes.add(SP_LOCAL);
+        }
+        break;
+      case 'strb_imm': case 'strh_imm':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rt);
+        if (insn.mode !== 'offset') {
+          if (insn.rn !== 31) addWrite(writes, insn.rn); else writes.add(SP_LOCAL);
+        }
+        break;
+      case 'ldr_reg':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rm);
+        addWrite(writes, insn.rt);
+        break;
+      case 'str_reg':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rm);
+        addRead(reads, insn.rt);
+        break;
+      case 'ldp':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addWrite(writes, insn.rt);
+        addWrite(writes, insn.rt2);
+        if (insn.mode !== 'offset') {
+          if (insn.rn !== 31) addWrite(writes, insn.rn); else writes.add(SP_LOCAL);
+        }
+        break;
+      case 'stp':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rt);
+        addRead(reads, insn.rt2);
+        if (insn.mode !== 'offset') {
+          if (insn.rn !== 31) addWrite(writes, insn.rn); else writes.add(SP_LOCAL);
+        }
+        break;
+      case 'adr': case 'adrp':
+        addWrite(writes, insn.rd);
+        break;
+      case 'smulh': case 'umulh':
+        addRead(reads, insn.rn); addRead(reads, insn.rm);
+        addWrite(writes, insn.rd);
+        break;
+      case 'tbz': case 'tbnz':
+        addRead(reads, insn.rt);
+        break;
+      case 'clz': case 'cls': case 'rbit': case 'rev': case 'rev16':
+        addRead(reads, insn.rn);
+        addWrite(writes, insn.rd);
+        break;
+      case 'rev32':
+        addRead(reads, insn.rn);
+        addWrite(writes, insn.rd);
+        break;
+      case 'extr':
+        addRead(reads, insn.rn); addRead(reads, insn.rm);
+        addWrite(writes, insn.rd);
+        break;
+      case 'ccmp': case 'ccmn':
+        addRead(reads, insn.rn);
+        if (!insn.isImm) addRead(reads, insn.rm_imm);
+        reads.add(NZCV_LOCAL);
+        writes.add(NZCV_LOCAL);
+        break;
+      case 'ldr_lit': case 'ldrsw_lit':
+        addWrite(writes, insn.rt);
+        break;
+      case 'ldrb_reg': case 'ldrh_reg': case 'ldrsw_reg':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rm);
+        addWrite(writes, insn.rt);
+        break;
+      case 'ldrsb_reg': case 'ldrsh_reg':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rm);
+        addWrite(writes, insn.rt);
+        break;
+      case 'strb_reg': case 'strh_reg':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rm);
+        addRead(reads, insn.rt);
+        break;
+      case 'ldxr':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addWrite(writes, insn.rt);
+        break;
+      case 'stxr':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rt);
+        addWrite(writes, insn.rs);
+        break;
+      case 'mrs':
+        addWrite(writes, insn.rt);
+        if (insn.sysreg === 'nzcv') reads.add(NZCV_LOCAL);
+        break;
+      case 'msr':
+        addRead(reads, insn.rt);
+        if (insn.sysreg === 'nzcv') writes.add(NZCV_LOCAL);
+        break;
+      case 'add_ext': case 'sub_ext':
+        if (insn.rn !== 31) addRead(reads, insn.rn); else reads.add(SP_LOCAL);
+        addRead(reads, insn.rm);
+        if (insn.setFlags) { reads.add(NZCV_LOCAL); writes.add(NZCV_LOCAL); }
+        if (insn.rd === 31) { if (!insn.setFlags) writes.add(SP_LOCAL); }
+        else addWrite(writes, insn.rd);
+        break;
+      // Variable shifts
+      case 'lslv': case 'lsrv': case 'asrv': case 'rorv':
+        addRead(reads, insn.rn);
+        addRead(reads, insn.rm);
+        addWrite(writes, insn.rd);
+        break;
+      // SIMD load/store: reads base register (SP or GPR), may write back
+      case 'str_simd': case 'ldr_simd':
+        if (insn.rn === 31) reads.add(SP_LOCAL); else addRead(reads, insn.rn);
+        if (insn.mode !== 'offset') {
+          if (insn.rn === 31) writes.add(SP_LOCAL); else addWrite(writes, insn.rn);
+        }
+        break;
+      case 'stp_simd': case 'ldp_simd':
+        if (insn.rn === 31) reads.add(SP_LOCAL); else addRead(reads, insn.rn);
+        if (insn.mode !== 'offset') {
+          if (insn.rn === 31) writes.add(SP_LOCAL); else addWrite(writes, insn.rn);
+        }
+        break;
+      // SIMD data ops: read/write V regs directly from memory, may read GPRs
+      case 'simd_dup_gpr':
+        addRead(reads, insn.rn);
+        break;
+      case 'simd_umov':
+        addWrite(writes, insn.rd);
+        break;
+      case 'simd_ins_gpr':
+        addRead(reads, insn.rn);
+        break;
+      case 'simd_dup_elem': case 'simd_movi':
+        // V registers are in linear memory, no GPR involvement
+        break;
+      // FMOV GPR → FP: reads GPR
+      case 'fmov_to_fp':
+        addRead(reads, insn.rn);
+        break;
+      // FMOV FP → GPR: writes GPR
+      case 'fmov_from_fp':
+        addWrite(writes, insn.rd);
+        break;
+      // FP-only / SIMD-only: no GPR involvement
+      case 'fmov_fp': case 'fmul': case 'fdiv': case 'fadd': case 'fsub':
+      case 'fabs': case 'fneg': case 'fcvt':
+      case 'simd_sshll': case 'simd_ushll':
+      case 'simd_scvtf': case 'simd_ucvtf':
+      case 'simd_fcvtzs': case 'simd_fcvtzu':
+        break;
+      // FP int conversions: read/write GPRs
+      case 'scvtf_int': case 'ucvtf_int':
+        addRead(reads, insn.rn);
+        break;
+      case 'fcvtzs_int': case 'fcvtzu_int':
+        addWrite(writes, insn.rd);
+        break;
       default:
         break;
     }
@@ -139,6 +326,140 @@ function addWrite(set: Set<number>, r: number): void {
   if (r !== 31) set.add(regLocal(r)); // XZR writes are discarded
 }
 
+// ── Helper function imports for instructions that need JS helpers ────────────
+
+interface HelperImports {
+  smulhIdx: number;
+  umulhIdx: number;
+  // FP helpers (i64 bit-pattern ↔ f64 arithmetic)
+  f64_mulIdx: number;
+  f64_divIdx: number;
+  f64_addIdx: number;
+  f64_subIdx: number;
+  f64_absIdx: number;
+  f64_negIdx: number;
+  f64_from_s64Idx: number;
+  f64_from_u64Idx: number;
+  f64_from_s32Idx: number;
+  f64_from_u32Idx: number;
+  f64_to_s64Idx: number;
+  f64_to_u64Idx: number;
+  f64_to_s32Idx: number;
+  f64_to_u32Idx: number;
+  f32_to_f64Idx: number;
+  f64_to_f32Idx: number;
+}
+
+function setupHelperImports(b: WasmModuleBuilder): HelperImports {
+  const helperType = b.addFuncType([ValType.I64, ValType.I64], [ValType.I64]);
+  const smulhIdx = b.addFunctionImport('env', 'smulh', helperType);
+  const umulhIdx = b.addFunctionImport('env', 'umulh', helperType);
+
+  // FP 2-operand helpers: (i64, i64) -> i64
+  const f64_mulIdx = b.addFunctionImport('env', 'f64_mul', helperType);
+  const f64_divIdx = b.addFunctionImport('env', 'f64_div', helperType);
+  const f64_addIdx = b.addFunctionImport('env', 'f64_add', helperType);
+  const f64_subIdx = b.addFunctionImport('env', 'f64_sub', helperType);
+
+  // FP 1-operand helpers: (i64, i64) -> i64 (second arg unused, kept for uniform type)
+  const unaryType = b.addFuncType([ValType.I64], [ValType.I64]);
+  const f64_absIdx = b.addFunctionImport('env', 'f64_abs', unaryType);
+  const f64_negIdx = b.addFunctionImport('env', 'f64_neg', unaryType);
+
+  // Int→FP conversions: (i64) -> i64  (input: int bits, output: FP bits)
+  const f64_from_s64Idx = b.addFunctionImport('env', 'f64_from_s64', unaryType);
+  const f64_from_u64Idx = b.addFunctionImport('env', 'f64_from_u64', unaryType);
+  const f64_from_s32Idx = b.addFunctionImport('env', 'f64_from_s32', unaryType);
+  const f64_from_u32Idx = b.addFunctionImport('env', 'f64_from_u32', unaryType);
+
+  // FP→Int conversions: (i64) -> i64  (input: FP bits, output: int bits)
+  const f64_to_s64Idx = b.addFunctionImport('env', 'f64_to_s64', unaryType);
+  const f64_to_u64Idx = b.addFunctionImport('env', 'f64_to_u64', unaryType);
+  const f64_to_s32Idx = b.addFunctionImport('env', 'f64_to_s32', unaryType);
+  const f64_to_u32Idx = b.addFunctionImport('env', 'f64_to_u32', unaryType);
+
+  // Precision conversions: (i64) -> i64  (f32 bits → f64 bits and vice versa)
+  const f32_to_f64Idx = b.addFunctionImport('env', 'f32_to_f64', unaryType);
+  const f64_to_f32Idx = b.addFunctionImport('env', 'f64_to_f32', unaryType);
+
+  return {
+    smulhIdx, umulhIdx,
+    f64_mulIdx, f64_divIdx, f64_addIdx, f64_subIdx,
+    f64_absIdx, f64_negIdx,
+    f64_from_s64Idx, f64_from_u64Idx, f64_from_s32Idx, f64_from_u32Idx,
+    f64_to_s64Idx, f64_to_u64Idx, f64_to_s32Idx, f64_to_u32Idx,
+    f32_to_f64Idx, f64_to_f32Idx,
+  };
+}
+
+// Shared Float64Array + Uint8Array for bit reinterpretation
+const _fpBuf = new ArrayBuffer(8);
+const _f64View = new Float64Array(_fpBuf);
+const _u8View = new Uint8Array(_fpBuf);
+const _f32View = new Float32Array(_fpBuf);
+const _i64View = new BigInt64Array(_fpBuf);
+const _u64View = new BigUint64Array(_fpBuf);
+
+function f64FromBits(bits: bigint): number {
+  _u64View[0] = BigInt.asUintN(64, bits);
+  return _f64View[0];
+}
+function f64ToBits(val: number): bigint {
+  _f64View[0] = val;
+  return _u64View[0];
+}
+function f32FromBits(bits: number): number {
+  new DataView(_fpBuf).setUint32(0, bits, true);
+  return _f32View[0];
+}
+function f32ToBits(val: number): number {
+  _f32View[0] = val;
+  return new DataView(_fpBuf).getUint32(0, true);
+}
+
+// JS implementations for 128-bit multiply high halves
+const helperFunctions: Record<string, Function> = {
+  smulh(a: bigint, b: bigint): bigint {
+    const sa = BigInt.asIntN(64, a);
+    const sb = BigInt.asIntN(64, b);
+    return BigInt.asUintN(64, (sa * sb) >> 64n);
+  },
+  umulh(a: bigint, b: bigint): bigint {
+    const ua = BigInt.asUintN(64, a);
+    const ub = BigInt.asUintN(64, b);
+    return BigInt.asUintN(64, (ua * ub) >> 64n);
+  },
+  // FP 2-source: operate on f64 bit patterns (or f32 widened to f64 bits)
+  f64_mul(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) * f64FromBits(b)); },
+  f64_div(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) / f64FromBits(b)); },
+  f64_add(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) + f64FromBits(b)); },
+  f64_sub(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) - f64FromBits(b)); },
+  // FP 1-source
+  f64_abs(a: bigint): bigint { return f64ToBits(Math.abs(f64FromBits(a))); },
+  f64_neg(a: bigint): bigint { return f64ToBits(-f64FromBits(a)); },
+  // Int → FP
+  f64_from_s64(a: bigint): bigint { return f64ToBits(Number(BigInt.asIntN(64, a))); },
+  f64_from_u64(a: bigint): bigint { return f64ToBits(Number(BigInt.asUintN(64, a))); },
+  f64_from_s32(a: bigint): bigint { return f64ToBits(Number(BigInt.asIntN(32, a))); },
+  f64_from_u32(a: bigint): bigint { return f64ToBits(Number(BigInt.asUintN(32, a))); },
+  // FP → Int (round toward zero)
+  f64_to_s64(a: bigint): bigint { return BigInt.asUintN(64, BigInt(Math.trunc(f64FromBits(a)))); },
+  f64_to_u64(a: bigint): bigint { const v = Math.trunc(f64FromBits(a)); return v < 0 ? 0n : BigInt.asUintN(64, BigInt(v)); },
+  f64_to_s32(a: bigint): bigint { return BigInt.asUintN(64, BigInt(Math.trunc(f64FromBits(a))) & 0xFFFFFFFFn); },
+  f64_to_u32(a: bigint): bigint { const v = Math.trunc(f64FromBits(a)); return v < 0 ? 0n : BigInt(v) & 0xFFFFFFFFn; },
+  // Precision conversions
+  f32_to_f64(a: bigint): bigint {
+    // a has f32 bits in low 32; widen to f64
+    const f = f32FromBits(Number(a & 0xFFFFFFFFn));
+    return f64ToBits(f);
+  },
+  f64_to_f32(a: bigint): bigint {
+    // a has f64 bits; narrow to f32 bits
+    const f = f64FromBits(a);
+    return BigInt(f32ToBits(Math.fround(f)));
+  },
+};
+
 // ── Translate a basic block to a compiled WASM module ────────────────────────
 
 // The NEXT_PC local stores the return value. Branch instructions write to it
@@ -153,6 +474,7 @@ export function translateBlock(
 ): CompiledBlock {
   const b = new WasmModuleBuilder();
   b.addMemoryImport('env', 'memory', 256);
+  const helpers = setupHelperImports(b);
   const typeIdx = b.addFuncType([], [ValType.I64]); // () -> i64 (next PC)
   b.beginFunction(typeIdx);
 
@@ -174,9 +496,9 @@ export function translateBlock(
   b.local_set(NEXT_PC_LOCAL);
 
   if (block.isSelfLoop) {
-    emitSelfLoopBlock(b, block, TMP0, TMP1, TMP2, TMP3);
+    emitSelfLoopBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers);
   } else {
-    emitLinearBlock(b, block, TMP0, TMP1, TMP2, TMP3);
+    emitLinearBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers);
     // ── Epilogue: store modified registers back ──
     emitEpilogue(b, usage.writes);
   }
@@ -188,8 +510,10 @@ export function translateBlock(
   b.exportFunction('run');
 
   const bytes = b.finalize();
+
+  // Debug: dump WASM bytes for specific block
   const mod = new WebAssembly.Module(bytes);
-  const instance = new WebAssembly.Instance(mod, { env: { memory } });
+  const instance = new WebAssembly.Instance(mod, { env: { memory, ...helperFunctions } });
   const run = instance.exports.run as () => bigint;
 
   return {
@@ -225,12 +549,17 @@ function emitLinearBlock(
   b: WasmModuleBuilder,
   block: BasicBlock,
   TMP0: number, TMP1: number, TMP2: number, TMP3: number,
+  helpers?: HelperImports,
 ): void {
   const startPC = Number(block.startPC);
   for (let i = 0; i < block.insns.length; i++) {
     const pc = startPC + i * 4;
-    emitInsn(b, block.insns[i], pc, TMP0, TMP1, TMP2, TMP3);
+    emitInsn(b, block.insns[i], pc, TMP0, TMP1, TMP2, TMP3, helpers);
   }
+  // Write instruction count to memory for the dispatch loop
+  b.i32_const(ITER_OFFSET);
+  b.i64_const(BigInt(block.insns.length));
+  b.i64_store(3, 0);
 }
 
 // ── Emit a self-looping block ────────────────────────────────────────────────
@@ -239,6 +568,7 @@ function emitSelfLoopBlock(
   b: WasmModuleBuilder,
   block: BasicBlock,
   TMP0: number, TMP1: number, TMP2: number, TMP3: number,
+  helpers?: HelperImports,
 ): void {
   const startPC = Number(block.startPC);
   const insns = block.insns;
@@ -265,11 +595,22 @@ function emitSelfLoopBlock(
   b.i64_add();
   b.local_set(ITER_LOCAL);
 
+  // Safety cap: prevent infinite self-loops from causing OOB memory access
+  const safetyExitPC = startPC + insns.length * 4;
+  b.local_get(ITER_LOCAL);
+  b.i64_const(BigInt(10_000_000));
+  b.i64_gt_u();
+  b.if_(BLOCKTYPE_VOID);
+  b.i64_const(BigInt(safetyExitPC));
+  b.local_set(NEXT_PC_LOCAL);
+  b.br(2); // break to $exit block
+  b.end();
+
   // Emit all instructions except the last (and penultimate if fusing)
   const skipLast = canFuse ? 2 : 1;
   for (let i = 0; i < insns.length - skipLast; i++) {
     const pc = startPC + i * 4;
-    emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3);
+    emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3, helpers);
   }
 
   // Handle the backward branch
@@ -293,6 +634,23 @@ function emitSelfLoopBlock(
     b.i64_const(0n);
     b.i64_ne();
     b.br_if(0);
+  } else if (lastInsn.kind === 'tbz') {
+    b.local_get(regLocal(lastInsn.rt));
+    b.i64_const(BigInt(lastInsn.bit));
+    b.i64_shr_u();
+    b.i64_const(1n);
+    b.i64_and();
+    b.i64_eqz(); // tbz: loop back if bit is zero
+    b.br_if(0);
+  } else if (lastInsn.kind === 'tbnz') {
+    b.local_get(regLocal(lastInsn.rt));
+    b.i64_const(BigInt(lastInsn.bit));
+    b.i64_shr_u();
+    b.i64_const(1n);
+    b.i64_and();
+    b.i64_const(0n);
+    b.i64_ne(); // tbnz: loop back if bit is non-zero
+    b.br_if(0);
   }
 
   // Fall through: exit the loop
@@ -307,7 +665,7 @@ function emitSelfLoopBlock(
       emitGetReg(b, cmpInsn.rn, cmpInsn.sf);
       b.local_tee(TMP0);
       emitGetReg(b, cmpInsn.rm, cmpInsn.sf);
-      emitShift(b, cmpInsn.shift, cmpInsn.amount);
+      emitShift(b, cmpInsn.shift, cmpInsn.amount, cmpInsn.sf);
       if (cmpInsn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
       b.local_tee(TMP1);
       b.i64_sub();
@@ -368,7 +726,7 @@ function emitFusedCmpBranch(
   // Push operand2 (Rm or #imm)
   if (cmpInsn.kind === 'sub_reg') {
     emitGetReg(b, cmpInsn.rm, cmpInsn.sf);
-    emitShift(b, cmpInsn.shift, cmpInsn.amount);
+    emitShift(b, cmpInsn.shift, cmpInsn.amount, cmpInsn.sf);
     if (cmpInsn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
   } else {
     b.i64_const(BigInt(cmpInsn.imm));
@@ -432,30 +790,203 @@ function emitInsn(
   insn: DecodedInsn,
   pc: number,
   TMP0: number, TMP1: number, TMP2: number, TMP3: number,
+  helpers?: HelperImports,
 ): void {
   switch (insn.kind) {
     case 'add_imm': emitAddSubImm(b, insn, true, TMP0, TMP1, TMP2); break;
     case 'sub_imm': emitAddSubImm(b, insn, false, TMP0, TMP1, TMP2); break;
     case 'add_reg': emitAddSubReg(b, insn, true, TMP0, TMP1, TMP2); break;
     case 'sub_reg': emitAddSubReg(b, insn, false, TMP0, TMP1, TMP2); break;
-    case 'orr_reg': emitLogicalReg(b, insn); break;
-    case 'eor_reg': emitLogicalReg(b, insn); break;
-    case 'and_reg': emitLogicalReg(b, insn); break;
-    case 'and_imm': emitLogicalImm(b, insn); break;
-    case 'orr_imm': emitLogicalImm(b, insn); break;
-    case 'eor_imm': emitLogicalImm(b, insn); break;
+    case 'orr_reg': emitLogicalReg(b, insn, TMP0); break;
+    case 'eor_reg': emitLogicalReg(b, insn, TMP0); break;
+    case 'and_reg': emitLogicalReg(b, insn, TMP0); break;
+    case 'and_imm': emitLogicalImm(b, insn, TMP0); break;
+    case 'orr_imm': emitLogicalImm(b, insn, TMP0); break;
+    case 'eor_imm': emitLogicalImm(b, insn, TMP0); break;
     case 'movz': emitMovz(b, insn); break;
     case 'movk': emitMovk(b, insn); break;
     case 'movn': emitMovn(b, insn); break;
     case 'madd': emitMadd(b, insn); break;
     case 'msub': emitMsub(b, insn); break;
+    case 'smaddl': case 'smsubl': case 'umaddl': case 'umsubl':
+      emitMulLong(b, insn);
+      break;
     case 'sdiv': emitDiv(b, insn, true); break;
     case 'udiv': emitDiv(b, insn, false); break;
+    case 'smulh': {
+      emitGetReg(b, insn.rn, 1);
+      emitGetReg(b, insn.rm, 1);
+      b.call(helpers!.smulhIdx);
+      emitSetReg(b, insn.rd, 1);
+      break;
+    }
+    case 'umulh': {
+      emitGetReg(b, insn.rn, 1);
+      emitGetReg(b, insn.rm, 1);
+      b.call(helpers!.umulhIdx);
+      emitSetReg(b, insn.rd, 1);
+      break;
+    }
     case 'sbfm': emitBitfield(b, insn); break;
     case 'ubfm': emitBitfield(b, insn); break;
+    case 'bfm': emitBitfield(b, insn); break;
     case 'csel': emitCondSelect(b, insn); break;
     case 'ldr_imm': emitLdrImm(b, insn); break;
     case 'str_imm': emitStrImm(b, insn); break;
+    case 'ldrb_imm': emitSubwordLoadImm(b, insn, 1, false); break;
+    case 'strb_imm': emitSubwordStoreImm(b, insn, 1); break;
+    case 'ldrh_imm': emitSubwordLoadImm(b, insn, 2, false); break;
+    case 'strh_imm': emitSubwordStoreImm(b, insn, 2); break;
+    case 'ldrsb_imm': emitSubwordLoadImm(b, insn, 1, true); break;
+    case 'ldrsh_imm': emitSubwordLoadImm(b, insn, 2, true); break;
+    case 'ldrsw_imm': emitSubwordLoadImm(b, insn, 4, true); break;
+    case 'ldr_reg': emitLdrReg(b, insn); break;
+    case 'str_reg': emitStrReg(b, insn); break;
+    case 'ldp': emitLdp(b, insn); break;
+    case 'stp': emitStp(b, insn); break;
+    case 'adr': {
+      b.i64_const(BigInt(pc) + BigInt(insn.imm));
+      emitSetReg(b, insn.rd, 1);
+      break;
+    }
+    case 'adrp': {
+      b.i64_const(BigInt(pc & ~0xFFF) + BigInt(insn.imm));
+      emitSetReg(b, insn.rd, 1);
+      break;
+    }
+
+    // Sub-word register-offset loads/stores
+    case 'ldrb_reg': emitSubwordRegLoad(b, insn, 1, false); break;
+    case 'strb_reg': emitSubwordRegStore(b, insn, 1); break;
+    case 'ldrh_reg': emitSubwordRegLoad(b, insn, 2, false); break;
+    case 'strh_reg': emitSubwordRegStore(b, insn, 2); break;
+    case 'ldrsb_reg': emitSubwordRegLoad(b, insn, 1, true); break;
+    case 'ldrsh_reg': emitSubwordRegLoad(b, insn, 2, true); break;
+    case 'ldrsw_reg': emitSubwordRegLoad(b, insn, 4, true); break;
+
+    // Load literal (PC-relative)
+    case 'ldr_lit': {
+      const addr = pc + insn.offset;
+      emitGuestAddr(b, BigInt(addr));
+      if (insn.sf) {
+        b.i64_load(3, 0);
+      } else {
+        b.i64_load32_u(2, 0);
+      }
+      emitSetReg(b, insn.rt, 1);
+      break;
+    }
+    case 'ldrsw_lit': {
+      const addr = pc + insn.offset;
+      emitGuestAddr(b, BigInt(addr));
+      b.i64_load32_s(2, 0);
+      emitSetReg(b, insn.rt, 1);
+      break;
+    }
+
+    // CLZ: count leading zeros (native WASM)
+    case 'clz': {
+      emitGetReg(b, insn.rn, insn.sf);
+      if (insn.sf === 0) {
+        // 32-bit: clz of low 32 bits, but need to handle the 64-bit local
+        // Shift left 32, then clz gives 32-bit result
+        b.i64_const(32n);
+        b.i64_shl();
+        b.i64_clz();
+      } else {
+        b.i64_clz();
+      }
+      emitSetReg(b, insn.rd, insn.sf);
+      break;
+    }
+
+    // CLS: count leading sign bits = clz(x ^ (x >> 1)) - 1
+    case 'cls': {
+      emitGetReg(b, insn.rn, insn.sf);
+      if (insn.sf === 0) {
+        // sign-extend 32→64, then xor with arithmetic right shift
+        b.i64_const(32n);
+        b.i64_shl();
+        b.i64_const(32n);
+        b.i64_shr_s();
+        b.local_tee(TMP0);
+        b.i64_const(1n);
+        b.i64_shr_s();
+        b.local_get(TMP0);
+        b.i64_xor();
+        b.i64_const(32n);
+        b.i64_shl();
+        b.i64_clz();
+      } else {
+        b.local_tee(TMP0);
+        b.i64_const(1n);
+        b.i64_shr_s();
+        b.local_get(TMP0);
+        b.i64_xor();
+        b.i64_clz();
+      }
+      // CLS = CLZ(x ^ (x >> 1)) - 1, but CLZ already subtracted the sign bit count
+      // Actually CLS is just CLZ of the xored value minus 1
+      b.i64_const(1n);
+      b.i64_sub();
+      emitSetReg(b, insn.rd, insn.sf);
+      break;
+    }
+
+    // RBIT: reverse bits — use JS helper via shift/mask
+    case 'rbit': emitRbit(b, insn, TMP0); break;
+
+    // REV: reverse bytes
+    case 'rev': emitRev(b, insn, TMP0, TMP1); break;
+
+    // REV16: reverse bytes in each 16-bit halfword
+    case 'rev16': emitRev16(b, insn, TMP0, TMP1); break;
+
+    // REV32: reverse bytes in each 32-bit word (64-bit only)
+    case 'rev32': emitRev32(b, insn, TMP0, TMP1); break;
+
+    // EXTR: extract from pair of registers
+    case 'extr': emitExtr(b, insn); break;
+
+    // CCMP/CCMN: conditional compare
+    case 'ccmp': emitCcmpCcmn(b, insn, false, TMP0, TMP1, TMP2); break;
+    case 'ccmn': emitCcmpCcmn(b, insn, true, TMP0, TMP1, TMP2); break;
+
+    // Load/store exclusive (treated as plain load/store, single-threaded)
+    case 'ldxr': {
+      emitGetReg(b, insn.rn, 1);
+      emitAddGuestBase(b);
+      if (insn.sf) {
+        b.i64_load(3, 0);
+      } else {
+        b.i64_load32_u(2, 0);
+      }
+      emitSetReg(b, insn.rt, 1);
+      break;
+    }
+    case 'stxr': {
+      emitGetReg(b, insn.rn, 1);
+      emitAddGuestBase(b);
+      emitGetReg(b, insn.rt, insn.sf);
+      if (insn.sf) {
+        b.i64_store(3, 0);
+      } else {
+        b.i64_store32(2, 0);
+      }
+      // Rs = 0 (always succeed)
+      b.i64_const(0n);
+      emitSetReg(b, insn.rs, 0);
+      break;
+    }
+
+    // MRS: read system register
+    case 'mrs': emitMrs(b, insn); break;
+    // MSR: write system register
+    case 'msr': emitMsr(b, insn); break;
+
+    // Add/sub extended register
+    case 'add_ext': emitAddSubExt(b, insn, true, TMP0, TMP1, TMP2); break;
+    case 'sub_ext': emitAddSubExt(b, insn, false, TMP0, TMP1, TMP2); break;
 
     // Branch instructions (block terminators)
     // Store target PC to NEXT_PC_LOCAL instead of return_()
@@ -507,6 +1038,37 @@ function emitInsn(
       b.local_set(NEXT_PC_LOCAL);
       break;
     }
+    case 'tbz': {
+      b.local_get(regLocal(insn.rt));
+      b.i64_const(BigInt(insn.bit));
+      b.i64_shr_u();
+      b.i64_const(1n);
+      b.i64_and();
+      b.i64_eqz(); // tbz: branch if bit is zero
+      b.if_(ValType.I64);
+      b.i64_const(BigInt(pc + insn.offset));
+      b.else_();
+      b.i64_const(BigInt(pc + 4));
+      b.end();
+      b.local_set(NEXT_PC_LOCAL);
+      break;
+    }
+    case 'tbnz': {
+      b.local_get(regLocal(insn.rt));
+      b.i64_const(BigInt(insn.bit));
+      b.i64_shr_u();
+      b.i64_const(1n);
+      b.i64_and();
+      b.i64_const(0n);
+      b.i64_ne(); // tbnz: branch if bit is non-zero
+      b.if_(ValType.I64);
+      b.i64_const(BigInt(pc + insn.offset));
+      b.else_();
+      b.i64_const(BigInt(pc + 4));
+      b.end();
+      b.local_set(NEXT_PC_LOCAL);
+      break;
+    }
     case 'br': {
       b.local_get(regLocal(insn.rn));
       b.local_set(NEXT_PC_LOCAL);
@@ -525,8 +1087,169 @@ function emitInsn(
       break;
     }
     case 'svc': {
+      // Write current PC to PC_OFFSET so dispatcher knows where we stopped
+      b.i32_const(PC_OFFSET);
+      b.i64_const(BigInt(pc));
+      b.i64_store(3, 0);
+      b.i64_const(SVC_PC);
+      b.local_set(NEXT_PC_LOCAL);
+      break;
+    }
+    case 'brk': {
+      // BRK = debug breakpoint / abort — halt execution
       b.i64_const(HALT_PC);
       b.local_set(NEXT_PC_LOCAL);
+      break;
+    }
+    // Variable shifts
+    case 'lslv': case 'lsrv': case 'asrv': case 'rorv': {
+      if (insn.kind === 'asrv' && insn.sf === 0) {
+        // 32-bit ASR: sign-extend value to 64-bit first, then shift
+        emitGetReg(b, insn.rn, 0);
+        b.i64_const(32n);
+        b.i64_shl();
+        b.i64_const(32n);
+        b.i64_shr_s(); // sign-extended
+        emitGetReg(b, insn.rm, 0);
+        b.i64_const(31n);
+        b.i64_and();
+        b.i64_shr_s();
+        b.i64_const(0xFFFFFFFFn);
+        b.i64_and();
+      } else if (insn.kind === 'rorv' && insn.sf === 0) {
+        // 32-bit ROR: need to handle within 32-bit space
+        // ror32(x, n) = (x >> n) | (x << (32 - n)) masked to 32 bits
+        emitGetReg(b, insn.rn, 0);
+        b.local_tee(TMP0);
+        emitGetReg(b, insn.rm, 0);
+        b.i64_const(31n);
+        b.i64_and();
+        b.local_tee(TMP1);
+        b.i64_shr_u();
+        b.local_get(TMP0);
+        b.i64_const(32n);
+        b.local_get(TMP1);
+        b.i64_sub();
+        b.i64_shl();
+        b.i64_or();
+        b.i64_const(0xFFFFFFFFn);
+        b.i64_and();
+      } else {
+        emitGetReg(b, insn.rn, insn.sf);
+        emitGetReg(b, insn.rm, insn.sf);
+        b.i64_const(BigInt(insn.sf ? 63 : 31));
+        b.i64_and();
+        switch (insn.kind) {
+          case 'lslv': b.i64_shl(); break;
+          case 'lsrv': b.i64_shr_u(); break;
+          case 'asrv': b.i64_shr_s(); break;
+          case 'rorv': b.i64_rotr(); break;
+        }
+        if (insn.sf === 0) {
+          b.i64_const(0xFFFFFFFFn);
+          b.i64_and();
+        }
+      }
+      emitSetReg(b, insn.rd, insn.sf);
+      break;
+    }
+    // SIMD/FP load/store (Q = 128-bit)
+    case 'str_simd': {
+      if (insn.size === 16) {
+        emitSimdStore128(b, insn, TMP0);
+      } else {
+        emitSimdStoreSmall(b, insn, TMP0);
+      }
+      break;
+    }
+    case 'ldr_simd': {
+      if (insn.size === 16) {
+        emitSimdLoad128(b, insn, TMP0);
+      } else {
+        emitSimdLoadSmall(b, insn, TMP0);
+      }
+      break;
+    }
+    case 'stp_simd': {
+      if (insn.size === 16) {
+        emitSimdStorePair128(b, insn, TMP0);
+      } else {
+        emitSimdStorePairSmall(b, insn, TMP0);
+      }
+      break;
+    }
+    case 'ldp_simd': {
+      if (insn.size === 16) {
+        emitSimdLoadPair128(b, insn, TMP0);
+      } else {
+        emitSimdLoadPairSmall(b, insn, TMP0);
+      }
+      break;
+    }
+    // SIMD DUP from general register
+    case 'simd_dup_gpr': {
+      emitSimdDupGpr(b, insn);
+      break;
+    }
+    // SIMD DUP from element
+    case 'simd_dup_elem': {
+      emitSimdDupElem(b, insn, TMP0);
+      break;
+    }
+    // SIMD UMOV (extract to GPR)
+    case 'simd_umov': {
+      emitSimdUmov(b, insn);
+      break;
+    }
+    // SIMD MOVI (move immediate to vector)
+    case 'simd_movi': {
+      emitSimdMovi(b, insn);
+      break;
+    }
+    // SIMD INS from GPR
+    case 'simd_ins_gpr': {
+      emitSimdInsGpr(b, insn);
+      break;
+    }
+    // FMOV GPR → FP register
+    case 'fmov_to_fp': {
+      emitFmovToFp(b, insn);
+      break;
+    }
+    // FMOV FP register → GPR
+    case 'fmov_from_fp': {
+      emitFmovFromFp(b, insn);
+      break;
+    }
+    // FMOV between FP registers
+    case 'fmov_fp': {
+      emitFmovFp(b, insn);
+      break;
+    }
+    // FP <-> integer conversions
+    case 'scvtf_int': case 'ucvtf_int':
+    case 'fcvtzs_int': case 'fcvtzu_int': {
+      emitFpIntConv(b, insn, TMP0, helpers);
+      break;
+    }
+    // FP arithmetic (2-source)
+    case 'fmul': case 'fdiv': case 'fadd': case 'fsub': {
+      emitFpArith2(b, insn, TMP0, helpers);
+      break;
+    }
+    // FP misc (1-source)
+    case 'fabs': case 'fneg': {
+      emitFpMisc1(b, insn, TMP0, helpers);
+      break;
+    }
+    // FP precision conversion
+    case 'fcvt': {
+      emitFcvt(b, insn, TMP0, helpers);
+      break;
+    }
+    // SIMD shift by immediate
+    case 'simd_sshll': case 'simd_ushll': {
+      emitSimdShiftLong(b, insn, TMP0);
       break;
     }
     case 'nop':
@@ -598,6 +1321,7 @@ function emitAddSubImm(
 ): void {
   if (insn.setFlags) {
     // Save operands for flag computation
+    // For ADDS/SUBS, Rn=31 is still SP, but Rd=31 is XZR (CMP/CMN pattern)
     emitGetRegSP(b, insn.rn, insn.sf);
     b.local_tee(TMP0); // op1
     b.i64_const(BigInt(insn.imm));
@@ -605,7 +1329,7 @@ function emitAddSubImm(
     if (isAdd) b.i64_add(); else b.i64_sub();
     if (insn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
     b.local_tee(TMP2); // result
-    emitSetRegSP(b, insn.rd, insn.sf);
+    emitSetReg(b, insn.rd, insn.sf); // Rd=31 → XZR for ADDS/SUBS
     emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
   } else {
     emitGetRegSP(b, insn.rn, insn.sf);
@@ -627,7 +1351,7 @@ function emitAddSubReg(
     emitGetReg(b, insn.rn, insn.sf);
     b.local_tee(TMP0);
     emitGetReg(b, insn.rm, insn.sf);
-    emitShift(b, insn.shift, insn.amount);
+    emitShift(b, insn.shift, insn.amount, insn.sf);
     if (insn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
     b.local_tee(TMP1);
     if (isAdd) b.i64_add(); else b.i64_sub();
@@ -638,7 +1362,7 @@ function emitAddSubReg(
   } else {
     emitGetReg(b, insn.rn, insn.sf);
     emitGetReg(b, insn.rm, insn.sf);
-    emitShift(b, insn.shift, insn.amount);
+    emitShift(b, insn.shift, insn.amount, insn.sf);
     if (isAdd) b.i64_add(); else b.i64_sub();
     emitSetReg(b, insn.rd, insn.sf);
   }
@@ -646,8 +1370,38 @@ function emitAddSubReg(
 
 // ── Shift operand ────────────────────────────────────────────────────────────
 
-function emitShift(b: WasmModuleBuilder, shift: ShiftType, amount: number): void {
+function emitShift(b: WasmModuleBuilder, shift: ShiftType, amount: number, sf: 0|1 = 1): void {
   if (amount === 0) return;
+  if (sf === 0 && shift === 'asr') {
+    // 32-bit ASR: value on stack is zero-extended to 64 bits, so bit 63 is always 0.
+    // i64_shr_s would sign-extend from bit 63 (wrong). We need sign extension from bit 31.
+    // Fix: shift left 32 to put 32-bit value in upper half, then arithmetic shift right
+    // by (32 + amount). This sign-extends from the original bit 31 and shifts correctly.
+    b.i64_const(32n);
+    b.i64_shl();
+    b.i64_const(BigInt(32 + amount));
+    b.i64_shr_s();
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+    return;
+  }
+  if (sf === 0 && shift === 'ror') {
+    // 32-bit ROR: i64_rotr rotates within 64 bits, but we need 32-bit rotation.
+    // For a zero-extended 32-bit value, rotating 64-bit brings in zeros from upper 32.
+    // Fix: duplicate the 32-bit value into both halves, then rotr64 gives correct lower 32.
+    // stack: x (zero-extended 32-bit)
+    const TMP = REG_COUNT + 3; // Use TMP3 to avoid conflict with callers using TMP0
+    b.local_tee(TMP);
+    b.i64_const(32n);
+    b.i64_shl();
+    b.local_get(TMP);
+    b.i64_or();  // x | (x << 32) — both halves are the 32-bit value
+    b.i64_const(BigInt(amount));
+    b.i64_rotr();
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+    return;
+  }
   b.i64_const(BigInt(amount));
   switch (shift) {
     case 'lsl': b.i64_shl(); break;
@@ -662,10 +1416,11 @@ function emitShift(b: WasmModuleBuilder, shift: ShiftType, amount: number): void
 function emitLogicalReg(
   b: WasmModuleBuilder,
   insn: DecodedInsn & { kind: 'orr_reg' | 'eor_reg' | 'and_reg' },
+  TMP0: number,
 ): void {
   emitGetReg(b, insn.rn, insn.sf);
   emitGetReg(b, insn.rm, insn.sf);
-  emitShift(b, insn.shift, insn.amount);
+  emitShift(b, insn.shift, insn.amount, insn.sf);
   if (insn.invert) { b.i64_const(-1n); b.i64_xor(); }
 
   switch (insn.kind) {
@@ -673,7 +1428,37 @@ function emitLogicalReg(
     case 'eor_reg': b.i64_xor(); break;
     case 'and_reg': b.i64_and(); break;
   }
-  emitSetReg(b, insn.rd, insn.sf);
+
+  const isAnds = insn.kind === 'and_reg' && (insn as any).setFlags;
+  if (isAnds) {
+    // ANDS/BICS: compute flags (N, Z, C=0, V=0), Rd=31 is XZR
+    b.local_tee(TMP0);
+    emitSetReg(b, insn.rd, insn.sf);
+
+    const bits = insn.sf ? 64 : 32;
+    // N flag = sign bit of result
+    b.local_get(TMP0);
+    if (insn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
+    b.i64_const(BigInt(bits - 1));
+    b.i64_shr_u();
+    b.i64_const(1n);
+    b.i64_and();
+    b.i64_const(3n);
+    b.i64_shl(); // N << 3
+
+    // Z flag = result is zero
+    b.local_get(TMP0);
+    if (insn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
+    b.i64_eqz();
+    b.i64_extend_i32_u();
+    b.i64_const(2n);
+    b.i64_shl(); // Z << 2
+
+    b.i64_or(); // (N << 3) | (Z << 2), C=0, V=0
+    b.local_set(NZCV_LOCAL);
+  } else {
+    emitSetReg(b, insn.rd, insn.sf);
+  }
 }
 
 // ── Logical immediate ────────────────────────────────────────────────────────
@@ -681,15 +1466,48 @@ function emitLogicalReg(
 function emitLogicalImm(
   b: WasmModuleBuilder,
   insn: DecodedInsn & { kind: 'and_imm' | 'orr_imm' | 'eor_imm' },
+  TMP0: number,
 ): void {
-  emitGetReg(b, insn.rn, insn.sf);
+  // For logical immediates, Rn=31 is always SP
+  emitGetRegSP(b, insn.rn, insn.sf);
   b.i64_const(insn.imm);
   switch (insn.kind) {
     case 'and_imm': b.i64_and(); break;
     case 'orr_imm': b.i64_or(); break;
     case 'eor_imm': b.i64_xor(); break;
   }
-  emitSetReg(b, insn.rd, insn.sf);
+
+  const isAnds = insn.kind === 'and_imm' && (insn as any).setFlags;
+
+  if (isAnds) {
+    // ANDS: compute flags (N, Z, C=0, V=0), Rd=31 is XZR
+    b.local_tee(TMP0);
+    emitSetReg(b, insn.rd, insn.sf);
+
+    const bits = insn.sf ? 64 : 32;
+    // nzcv = (N << 3) | (Z << 2), C=0, V=0
+    b.local_get(TMP0);
+    if (insn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
+    b.i64_const(BigInt(bits - 1));
+    b.i64_shr_u();
+    b.i64_const(1n);
+    b.i64_and();
+    b.i64_const(3n);
+    b.i64_shl(); // N << 3
+
+    b.local_get(TMP0);
+    if (insn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
+    b.i64_eqz();
+    b.i64_extend_i32_u();
+    b.i64_const(2n);
+    b.i64_shl(); // Z << 2
+
+    b.i64_or(); // (N << 3) | (Z << 2)
+    b.local_set(NZCV_LOCAL);
+  } else {
+    // AND/ORR/EOR without flags: Rd=31 is SP
+    emitSetRegSP(b, insn.rd, insn.sf);
+  }
 }
 
 // ── Move wide ────────────────────────────────────────────────────────────────
@@ -740,6 +1558,55 @@ function emitMsub(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'msub' }): v
   emitSetReg(b, insn.rd, insn.sf);
 }
 
+// ── Multiply-Long (SMADDL, SMSUBL, UMADDL, UMSUBL) ────────────────────────
+
+function emitMulLong(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'smaddl' | 'smsubl' | 'umaddl' | 'umsubl' },
+): void {
+  const isSigned = insn.kind === 'smaddl' || insn.kind === 'smsubl';
+  const isSub = insn.kind === 'smsubl' || insn.kind === 'umsubl';
+
+  // Get Wn extended to 64-bit
+  emitGetReg(b, insn.rn, 0); // 32-bit read (zero-extended to i64)
+  if (isSigned) {
+    // Sign-extend from 32-bit: (val << 32) >> 32
+    b.i64_const(32n); b.i64_shl();
+    b.i64_const(32n); b.i64_shr_s();
+  } else {
+    b.i64_const(0xFFFFFFFFn); b.i64_and();
+  }
+
+  // Get Wm extended to 64-bit
+  emitGetReg(b, insn.rm, 0);
+  if (isSigned) {
+    b.i64_const(32n); b.i64_shl();
+    b.i64_const(32n); b.i64_shr_s();
+  } else {
+    b.i64_const(0xFFFFFFFFn); b.i64_and();
+  }
+
+  b.i64_mul();
+
+  // Add or subtract Ra
+  if (isSub) {
+    // Xd = Ra - product
+    emitGetReg(b, insn.ra, 1);
+    // Stack: [product, Ra] → need Ra - product
+    // Swap: use a temp approach
+    b.local_set(regLocal(insn.rd)); // temp store product
+    emitGetReg(b, insn.ra, 1);
+    b.local_get(regLocal(insn.rd));
+    b.i64_sub();
+  } else {
+    // Xd = product + Ra
+    emitGetReg(b, insn.ra, 1);
+    b.i64_add();
+  }
+
+  emitSetReg(b, insn.rd, 1);
+}
+
 // ── Division (with ARM64 div-by-zero = 0 semantics) ──────────────────────────
 
 function emitDiv(
@@ -777,10 +1644,15 @@ function emitBitfield(
         b.i64_shr_u();
       }
     } else if (insn.imms < insn.immr) {
-      // LSL: shift = regSize - immr, width = imms + 1
-      const shift = regSize - insn.immr;
+      // UBFIZ / LSL: extract low (imms+1) bits, shift left by (regSize - immr)
+      const width = insn.imms + 1;
+      const lsb = regSize - insn.immr;
       emitGetReg(b, insn.rn, insn.sf);
-      b.i64_const(BigInt(shift));
+      // Mask low 'width' bits (for LSL alias where width=immr this is a no-op effectively)
+      const mask = (1n << BigInt(width)) - 1n;
+      b.i64_const(mask);
+      b.i64_and();
+      b.i64_const(BigInt(lsb));
       b.i64_shl();
     } else {
       // UBFX: extract bitfield
@@ -818,8 +1690,24 @@ function emitBitfield(
       b.i64_shl();
       b.i64_const(shift);
       b.i64_shr_s();
+    } else if (insn.imms < insn.immr) {
+      // SBFIZ: sign-extend low (imms+1) bits, shift left by (regSize - immr)
+      const width = insn.imms + 1;
+      const lsb = regSize - insn.immr;
+      emitGetReg(b, insn.rn, insn.sf);
+      // Sign-extend low 'width' bits: shift left to bit 63, then arithmetic shift right
+      const signExtShift = BigInt(64 - width);
+      b.i64_const(signExtShift);
+      b.i64_shl();
+      b.i64_const(signExtShift);
+      b.i64_shr_s();
+      // Shift left by lsb
+      if (lsb > 0) {
+        b.i64_const(BigInt(lsb));
+        b.i64_shl();
+      }
     } else {
-      // General SBFX
+      // General SBFX: extract (width) bits from Rn at position immr, sign-extend
       emitGetReg(b, insn.rn, insn.sf);
       if (insn.immr > 0) {
         b.i64_const(BigInt(insn.immr));
@@ -833,8 +1721,39 @@ function emitBitfield(
       b.i64_shr_s();
     }
   } else {
-    // BFM: general bitfield move — complex, just zero for now
-    b.i64_const(0n);
+    // BFM: bitfield move — inserts a field from Rn into Rd
+    if (insn.imms < insn.immr) {
+      // BFI: insert low (imms+1) bits of Rn into Rd at position (regSize - immr)
+      const width = insn.imms + 1;
+      const lsb = regSize - insn.immr;
+      const mask = ((1n << BigInt(width)) - 1n) << BigInt(lsb);
+      // Rd = (Rd & ~mask) | ((Rn << lsb) & mask)
+      emitGetReg(b, insn.rd, insn.sf);
+      b.i64_const(~mask);
+      b.i64_and();
+      emitGetReg(b, insn.rn, insn.sf);
+      b.i64_const(BigInt(lsb));
+      b.i64_shl();
+      b.i64_const(mask);
+      b.i64_and();
+      b.i64_or();
+    } else {
+      // BFXIL: extract (width) bits from Rn at position immr, insert at bit 0 of Rd
+      const width = insn.imms - insn.immr + 1;
+      const mask = (1n << BigInt(width)) - 1n;
+      // Rd = (Rd & ~mask) | ((Rn >> immr) & mask)
+      emitGetReg(b, insn.rd, insn.sf);
+      b.i64_const(~mask);
+      b.i64_and();
+      emitGetReg(b, insn.rn, insn.sf);
+      if (insn.immr > 0) {
+        b.i64_const(BigInt(insn.immr));
+        b.i64_shr_u();
+      }
+      b.i64_const(mask);
+      b.i64_and();
+      b.i64_or();
+    }
   }
   emitSetReg(b, insn.rd, insn.sf);
 }
@@ -887,8 +1806,14 @@ function emitLdrImm(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'ldr_imm' 
     b.i64_const(BigInt(guestMemBase));
     b.i64_add();
     b.i32_wrap_i64();
+  } else if (insn.mode === 'post') {
+    // Post-index: load from base + GUEST_MEM_BASE (no offset for the load)
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
   } else {
-    // Compute address: base + offset + GUEST_MEM_BASE
+    // Unsigned offset: base + offset + GUEST_MEM_BASE
     emitGetRegSP(b, insn.rn, 1);
     b.i64_const(BigInt(insn.offset + guestMemBase));
     b.i64_add();
@@ -925,6 +1850,11 @@ function emitStrImm(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'str_imm' 
     b.i64_const(BigInt(guestMemBase));
     b.i64_add();
     b.i32_wrap_i64();
+  } else if (insn.mode === 'post') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
   } else {
     emitGetRegSP(b, insn.rn, 1);
     b.i64_const(BigInt(insn.offset + guestMemBase));
@@ -949,6 +1879,731 @@ function emitStrImm(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'str_imm' 
     b.i64_add();
     if (insn.rn === 31) b.local_set(SP_LOCAL);
     else b.local_set(regLocal(insn.rn));
+  }
+}
+
+// ── Sub-word load immediate ──────────────────────────────────────────────────
+
+function emitSubwordLoadImm(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { rt: number; rn: number; offset: number; mode: 'offset'|'pre'|'post' },
+  byteWidth: 1 | 2 | 4,
+  signExtend: boolean,
+): void {
+  const guestMemBase = 0x10000;
+
+  // Pre-index: update base first
+  if (insn.mode === 'pre') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    b.local_tee(insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn));
+    b.i64_const(BigInt(guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
+  } else if (insn.mode === 'post') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
+  } else {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset + guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
+  }
+
+  // Load with appropriate width
+  if (byteWidth === 1) {
+    if (signExtend) b.i64_load8_s(0, 0); else b.i64_load8_u(0, 0);
+  } else if (byteWidth === 2) {
+    if (signExtend) b.i64_load16_s(1, 0); else b.i64_load16_u(1, 0);
+  } else {
+    if (signExtend) b.i64_load32_s(2, 0); else b.i64_load32_u(2, 0);
+  }
+
+  // For signed loads that target W registers (sf=0), truncate to 32 bits
+  const sf = 'sf' in insn ? (insn as any).sf : 1;
+  if (sf === 0 && !signExtend) {
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+  const rt = insn.rt;
+  if (rt !== 31) b.local_set(regLocal(rt)); else b.drop();
+
+  // Post-index
+  if (insn.mode === 'post') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    if (insn.rn === 31) b.local_set(SP_LOCAL);
+    else b.local_set(regLocal(insn.rn));
+  }
+}
+
+// ── Sub-word store immediate ─────────────────────────────────────────────────
+
+function emitSubwordStoreImm(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { rt: number; rn: number; offset: number; mode: 'offset'|'pre'|'post' },
+  byteWidth: 1 | 2,
+): void {
+  const guestMemBase = 0x10000;
+
+  if (insn.mode === 'pre') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    b.local_tee(insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn));
+    b.i64_const(BigInt(guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
+  } else if (insn.mode === 'post') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
+  } else {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset + guestMemBase));
+    b.i64_add();
+    b.i32_wrap_i64();
+  }
+
+  // Value to store
+  if (insn.rt === 31) b.i64_const(0n);
+  else b.local_get(regLocal(insn.rt));
+
+  if (byteWidth === 1) b.i64_store8(0, 0);
+  else b.i64_store16(1, 0);
+
+  if (insn.mode === 'post') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    if (insn.rn === 31) b.local_set(SP_LOCAL);
+    else b.local_set(regLocal(insn.rn));
+  }
+}
+
+// ── Load/Store register offset ──────────────────────────────────────────────
+
+function emitExtendReg(b: WasmModuleBuilder, rm: number, extend: string, shift: number): void {
+  // Push the extended+shifted index register value onto the stack
+  if (rm === 31) {
+    b.i64_const(0n);
+  } else {
+    b.local_get(regLocal(rm));
+  }
+
+  switch (extend) {
+    case 'uxtw':
+      b.i64_const(0xFFFFFFFFn);
+      b.i64_and();
+      break;
+    case 'sxtw':
+      b.i64_const(32n);
+      b.i64_shl();
+      b.i64_const(32n);
+      b.i64_shr_s();
+      break;
+    case 'sxtx':
+      // Already 64-bit signed, nothing to do
+      break;
+    case 'lsl':
+    default:
+      // No extension needed
+      break;
+  }
+
+  if (shift > 0) {
+    b.i64_const(BigInt(shift));
+    b.i64_shl();
+  }
+}
+
+function emitLdrReg(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'ldr_reg' }): void {
+  const guestMemBase = 0x10000;
+  // Address = Rn + extend(Rm) << shift + GUEST_MEM_BASE
+  emitGetRegSP(b, insn.rn, 1);
+  emitExtendReg(b, insn.rm, insn.extend, insn.shift);
+  b.i64_add();
+  b.i64_const(BigInt(guestMemBase));
+  b.i64_add();
+  b.i32_wrap_i64();
+
+  if (insn.sf === 1) b.i64_load(3, 0);
+  else b.i64_load32_u(2, 0);
+  emitSetReg(b, insn.rt, insn.sf);
+}
+
+function emitStrReg(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'str_reg' }): void {
+  const guestMemBase = 0x10000;
+  emitGetRegSP(b, insn.rn, 1);
+  emitExtendReg(b, insn.rm, insn.extend, insn.shift);
+  b.i64_add();
+  b.i64_const(BigInt(guestMemBase));
+  b.i64_add();
+  b.i32_wrap_i64();
+
+  emitGetReg(b, insn.rt, insn.sf);
+  if (insn.sf === 1) b.i64_store(3, 0);
+  else b.i64_store32(2, 0);
+}
+
+// ── Load/Store pair ─────────────────────────────────────────────────────────
+
+function emitLdp(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'ldp' }): void {
+  const guestMemBase = 0x10000;
+  const regSize = insn.sf === 1 ? 8 : 4;
+  const TMP_BASE = REG_COUNT; // Borrow TMP0 for base address
+
+  // Check if Rt or Rt2 aliases the base register Rn (aliasing hazard)
+  const rnLocal = insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn);
+  const hasAlias = (insn.rt !== 31 && regLocal(insn.rt) === rnLocal) ||
+                   (insn.rt2 !== 31 && regLocal(insn.rt2) === rnLocal);
+
+  // Pre-index: update base first
+  if (insn.mode === 'pre') {
+    emitGetRegSP(b, insn.rn, 1);
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    if (insn.rn === 31) b.local_set(SP_LOCAL);
+    else b.local_set(regLocal(insn.rn));
+  }
+
+  // Save the base address to a temp if there's an aliasing hazard
+  if (hasAlias) {
+    emitGetRegSP(b, insn.rn, 1);
+    b.local_set(TMP_BASE);
+  }
+
+  // Compute effective address for loads
+  function emitEffAddr(extraOffset: number): void {
+    if (hasAlias) {
+      b.local_get(TMP_BASE);
+    } else {
+      emitGetRegSP(b, insn.rn, 1);
+    }
+    if (insn.mode === 'post') {
+      b.i64_const(BigInt(guestMemBase + extraOffset));
+    } else if (insn.mode === 'pre') {
+      b.i64_const(BigInt(guestMemBase + extraOffset));
+    } else {
+      b.i64_const(BigInt(insn.offset + guestMemBase + extraOffset));
+    }
+    b.i64_add();
+    b.i32_wrap_i64();
+  }
+
+  // Load first register
+  emitEffAddr(0);
+  if (insn.sf === 1) b.i64_load(3, 0);
+  else b.i64_load32_u(2, 0);
+  emitSetReg(b, insn.rt, insn.sf);
+
+  // Load second register
+  emitEffAddr(regSize);
+  if (insn.sf === 1) b.i64_load(3, 0);
+  else b.i64_load32_u(2, 0);
+  emitSetReg(b, insn.rt2, insn.sf);
+
+  // Post-index: update base
+  if (insn.mode === 'post') {
+    if (hasAlias) {
+      b.local_get(TMP_BASE);
+    } else {
+      emitGetRegSP(b, insn.rn, 1);
+    }
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    if (insn.rn === 31) b.local_set(SP_LOCAL);
+    else b.local_set(regLocal(insn.rn));
+  }
+}
+
+function emitStp(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'stp' }): void {
+  const guestMemBase = 0x10000;
+  const regSize = insn.sf === 1 ? 8 : 4;
+  const TMP_BASE = REG_COUNT; // Borrow TMP0 for base address
+
+  // Compute effective store address into TMP_BASE (avoids aliasing with Rt/Rt2)
+  emitGetRegSP(b, insn.rn, 1);
+  if (insn.mode !== 'post') {
+    // Pre-index and offset: address = Rn + offset
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+  }
+  b.local_set(TMP_BASE);
+
+  // Store first register (reads Rt BEFORE any writeback)
+  b.local_get(TMP_BASE);
+  b.i64_const(BigInt(guestMemBase));
+  b.i64_add();
+  b.i32_wrap_i64();
+  emitGetReg(b, insn.rt, insn.sf);
+  if (insn.sf === 1) b.i64_store(3, 0);
+  else b.i64_store32(2, 0);
+
+  // Store second register
+  b.local_get(TMP_BASE);
+  b.i64_const(BigInt(guestMemBase + regSize));
+  b.i64_add();
+  b.i32_wrap_i64();
+  emitGetReg(b, insn.rt2, insn.sf);
+  if (insn.sf === 1) b.i64_store(3, 0);
+  else b.i64_store32(2, 0);
+
+  // Writeback
+  if (insn.mode === 'pre') {
+    // TMP_BASE already holds Rn + offset
+    b.local_get(TMP_BASE);
+    if (insn.rn === 31) b.local_set(SP_LOCAL);
+    else b.local_set(regLocal(insn.rn));
+  } else if (insn.mode === 'post') {
+    // TMP_BASE holds original Rn; update to Rn + offset
+    b.local_get(TMP_BASE);
+    b.i64_const(BigInt(insn.offset));
+    b.i64_add();
+    if (insn.rn === 31) b.local_set(SP_LOCAL);
+    else b.local_set(regLocal(insn.rn));
+  }
+}
+
+// ── Address helpers ──────────────────────────────────────────────────────────
+
+/** Push guest address as i32 WASM address: i32(guestAddr + GUEST_MEM_BASE) */
+function emitGuestAddr(b: WasmModuleBuilder, guestAddr: bigint): void {
+  b.i32_const(Number(guestAddr) + GUEST_MEM_BASE);
+}
+
+/** Stack top has a 64-bit guest address; convert to WASM linear memory i32 address */
+function emitAddGuestBase(b: WasmModuleBuilder): void {
+  b.i64_const(BigInt(GUEST_MEM_BASE));
+  b.i64_add();
+  b.i32_wrap_i64();
+}
+
+// ── Sub-word register-offset loads/stores ────────────────────────────────────
+
+function emitSubwordRegLoad(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { rt: number; rn: number; rm: number; extend: string; shift: number },
+  byteWidth: number,
+  signExtend: boolean,
+): void {
+  // Address = Rn + extend(Rm) << shift + GUEST_MEM_BASE
+  emitGetRegSP(b, insn.rn, 1);
+  emitExtendReg(b, insn.rm, insn.extend, insn.shift);
+  b.i64_add();
+  b.i64_const(BigInt(GUEST_MEM_BASE));
+  b.i64_add();
+  b.i32_wrap_i64();
+
+  switch (byteWidth) {
+    case 1: signExtend ? b.i64_load8_s(0, 0) : b.i64_load8_u(0, 0); break;
+    case 2: signExtend ? b.i64_load16_s(1, 0) : b.i64_load16_u(1, 0); break;
+    case 4: b.i64_load32_s(2, 0); break; // ldrsw_reg always sign-extends
+  }
+
+  const sf = 'sf' in insn ? insn.sf : 1;
+  emitSetReg(b, insn.rt, sf as 0|1);
+}
+
+function emitSubwordRegStore(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { rt: number; rn: number; rm: number; extend: string; shift: number },
+  byteWidth: number,
+): void {
+  // Address = Rn + extend(Rm) << shift + GUEST_MEM_BASE
+  emitGetRegSP(b, insn.rn, 1);
+  emitExtendReg(b, insn.rm, insn.extend, insn.shift);
+  b.i64_add();
+  b.i64_const(BigInt(GUEST_MEM_BASE));
+  b.i64_add();
+  b.i32_wrap_i64();
+
+  emitGetReg(b, insn.rt, 1);
+  switch (byteWidth) {
+    case 1: b.i64_store8(0, 0); break;
+    case 2: b.i64_store16(1, 0); break;
+  }
+}
+
+// ── RBIT: reverse bits ──────────────────────────────────────────────────────
+
+function emitRbit(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'rbit'; sf: 0|1; rd: number; rn: number }, TMP0: number): void {
+  // RBIT implemented via shift/mask sequence
+  // result = 0; for each bit: result = (result << 1) | (val & 1); val >>= 1
+  // But that's 64 iterations. Instead use the parallel bit-swap approach:
+  // Swap adjacent bits, then pairs, then nibbles, then bytes, then words
+  const bits = insn.sf ? 64 : 32;
+  emitGetReg(b, insn.rn, insn.sf);
+
+  if (insn.sf === 0) {
+    // Zero-extend to 64 bits for uniform processing
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+
+  // Swap adjacent bits: ((x >> 1) & 0x5555...) | ((x & 0x5555...) << 1)
+  b.local_tee(TMP0);
+  b.i64_const(1n);
+  b.i64_shr_u();
+  b.i64_const(0x5555555555555555n);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x5555555555555555n);
+  b.i64_and();
+  b.i64_const(1n);
+  b.i64_shl();
+  b.i64_or();
+
+  // Swap adjacent pairs
+  b.local_tee(TMP0);
+  b.i64_const(2n);
+  b.i64_shr_u();
+  b.i64_const(0x3333333333333333n);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x3333333333333333n);
+  b.i64_and();
+  b.i64_const(2n);
+  b.i64_shl();
+  b.i64_or();
+
+  // Swap nibbles
+  b.local_tee(TMP0);
+  b.i64_const(4n);
+  b.i64_shr_u();
+  b.i64_const(0x0F0F0F0F0F0F0F0Fn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x0F0F0F0F0F0F0F0Fn);
+  b.i64_and();
+  b.i64_const(4n);
+  b.i64_shl();
+  b.i64_or();
+
+  // Now we have reversed within each byte. Reverse bytes using REV logic.
+  // Swap bytes within halfwords
+  b.local_tee(TMP0);
+  b.i64_const(8n);
+  b.i64_shr_u();
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.i64_const(8n);
+  b.i64_shl();
+  b.i64_or();
+
+  // Swap halfwords within words
+  b.local_tee(TMP0);
+  b.i64_const(16n);
+  b.i64_shr_u();
+  b.i64_const(0x0000FFFF0000FFFFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x0000FFFF0000FFFFn);
+  b.i64_and();
+  b.i64_const(16n);
+  b.i64_shl();
+  b.i64_or();
+
+  if (bits === 64) {
+    // Swap 32-bit halves
+    b.local_tee(TMP0);
+    b.i64_const(32n);
+    b.i64_shr_u();
+    b.local_get(TMP0);
+    b.i64_const(32n);
+    b.i64_shl();
+    b.i64_or();
+  }
+
+  emitSetReg(b, insn.rd, insn.sf);
+}
+
+// ── REV: reverse bytes ──────────────────────────────────────────────────────
+
+function emitRev(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'rev'; sf: 0|1; rd: number; rn: number }, TMP0: number, TMP1: number): void {
+  emitGetReg(b, insn.rn, insn.sf);
+
+  if (insn.sf === 0) {
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+
+  // Swap bytes within halfwords
+  b.local_tee(TMP0);
+  b.i64_const(8n);
+  b.i64_shr_u();
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.i64_const(8n);
+  b.i64_shl();
+  b.i64_or();
+
+  // Swap halfwords within words
+  b.local_tee(TMP0);
+  b.i64_const(16n);
+  b.i64_shr_u();
+  b.i64_const(0x0000FFFF0000FFFFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x0000FFFF0000FFFFn);
+  b.i64_and();
+  b.i64_const(16n);
+  b.i64_shl();
+  b.i64_or();
+
+  if (insn.sf === 1) {
+    // Swap 32-bit halves
+    b.local_tee(TMP0);
+    b.i64_const(32n);
+    b.i64_shr_u();
+    b.local_get(TMP0);
+    b.i64_const(32n);
+    b.i64_shl();
+    b.i64_or();
+  }
+
+  emitSetReg(b, insn.rd, insn.sf);
+}
+
+// ── REV16: reverse bytes in each 16-bit halfword ────────────────────────────
+
+function emitRev16(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'rev16'; sf: 0|1; rd: number; rn: number }, TMP0: number, _TMP1: number): void {
+  emitGetReg(b, insn.rn, insn.sf);
+
+  // Swap bytes within each 16-bit halfword
+  b.local_tee(TMP0);
+  b.i64_const(8n);
+  b.i64_shr_u();
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.i64_const(8n);
+  b.i64_shl();
+  b.i64_or();
+
+  emitSetReg(b, insn.rd, insn.sf);
+}
+
+// ── REV32: reverse bytes in each 32-bit word (64-bit only) ──────────────────
+
+function emitRev32(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'rev32'; rd: number; rn: number }, TMP0: number, _TMP1: number): void {
+  emitGetReg(b, insn.rn, 1);
+
+  // Swap bytes within halfwords
+  b.local_tee(TMP0);
+  b.i64_const(8n);
+  b.i64_shr_u();
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x00FF00FF00FF00FFn);
+  b.i64_and();
+  b.i64_const(8n);
+  b.i64_shl();
+  b.i64_or();
+
+  // Swap halfwords within words
+  b.local_tee(TMP0);
+  b.i64_const(16n);
+  b.i64_shr_u();
+  b.i64_const(0x0000FFFF0000FFFFn);
+  b.i64_and();
+  b.local_get(TMP0);
+  b.i64_const(0x0000FFFF0000FFFFn);
+  b.i64_and();
+  b.i64_const(16n);
+  b.i64_shl();
+  b.i64_or();
+
+  emitSetReg(b, insn.rd, 1);
+}
+
+// ── EXTR: extract from pair of registers ────────────────────────────────────
+
+function emitExtr(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'extr'; sf: 0|1; rd: number; rn: number; rm: number; imms: number }): void {
+  if (insn.imms === 0) {
+    // EXTR with imms=0 is just Rm
+    emitGetReg(b, insn.rm, insn.sf);
+  } else if (insn.rn === insn.rm) {
+    // ROR: rotate right by imms
+    emitGetReg(b, insn.rn, insn.sf);
+    b.i64_const(BigInt(insn.imms));
+    b.i64_rotr();
+  } else {
+    const regSize = insn.sf ? 64 : 32;
+    // Rd = (Rn << (regSize - imms)) | (Rm >> imms)
+    emitGetReg(b, insn.rn, insn.sf);
+    b.i64_const(BigInt(regSize - insn.imms));
+    b.i64_shl();
+    emitGetReg(b, insn.rm, insn.sf);
+    b.i64_const(BigInt(insn.imms));
+    b.i64_shr_u();
+    b.i64_or();
+  }
+  emitSetReg(b, insn.rd, insn.sf);
+}
+
+// ── CCMP/CCMN: conditional compare ──────────────────────────────────────────
+
+function emitCcmpCcmn(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'ccmp' | 'ccmn'; sf: 0|1; rn: number; rm_imm: number; nzcv: number; cond: number; isImm: boolean },
+  isAdd: boolean,
+  TMP0: number, TMP1: number, TMP2: number,
+): void {
+  // if (cond) { flags = compare(Rn, Op2) } else { flags = nzcv }
+  emitConditionTest(b, insn.cond, NZCV_LOCAL);
+
+  b.if_(BLOCKTYPE_VOID);
+  // Condition true: perform comparison
+  emitGetReg(b, insn.rn, insn.sf);
+  b.local_set(TMP0);
+
+  if (insn.isImm) {
+    b.i64_const(BigInt(insn.rm_imm));
+  } else {
+    emitGetReg(b, insn.rm_imm, insn.sf);
+  }
+  b.local_set(TMP1);
+
+  // Result = Rn +/- Op2
+  b.local_get(TMP0);
+  b.local_get(TMP1);
+  if (isAdd) {
+    b.i64_add();
+  } else {
+    b.i64_sub();
+  }
+  b.local_set(TMP2);
+
+  emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
+
+  b.else_();
+  // Condition false: set flags to immediate nzcv
+  b.i64_const(BigInt(insn.nzcv));
+  b.local_set(NZCV_LOCAL);
+
+  b.end();
+}
+
+// ── MRS/MSR: system register access ────────────────────────────────────────
+
+function emitMrs(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'mrs'; rt: number; sysreg: string }): void {
+  switch (insn.sysreg) {
+    case 'tpidr_el0':
+      b.i32_const(TPIDR_OFFSET);
+      b.i64_load(3, 0);
+      break;
+    case 'nzcv':
+      b.local_get(NZCV_LOCAL);
+      // NZCV is stored as 4 bits (N=3,Z=2,C=1,V=0), need to shift to bits [31:28]
+      b.i64_const(28n);
+      b.i64_shl();
+      break;
+    case 'fpcr':
+      b.i64_const(0n); // Not emulating FP control
+      break;
+    case 'cntfrq_el0':
+      b.i64_const(1000000n); // 1 MHz virtual counter
+      break;
+    case 'cntvct_el0':
+      // Return 0 for now; would need Date.now() import for real timing
+      b.i64_const(0n);
+      break;
+    default:
+      b.i64_const(0n); // Unknown sysreg: return 0
+      break;
+  }
+  emitSetReg(b, insn.rt, 1);
+}
+
+function emitMsr(b: WasmModuleBuilder, insn: DecodedInsn & { kind: 'msr'; rt: number; sysreg: string }): void {
+  switch (insn.sysreg) {
+    case 'tpidr_el0':
+      b.i32_const(TPIDR_OFFSET);
+      emitGetReg(b, insn.rt, 1);
+      b.i64_store(3, 0);
+      break;
+    case 'nzcv':
+      emitGetReg(b, insn.rt, 1);
+      b.i64_const(28n);
+      b.i64_shr_u();
+      b.i64_const(0xFn);
+      b.i64_and();
+      b.local_set(NZCV_LOCAL);
+      break;
+    default:
+      // Ignore writes to unknown/unimplemented system registers
+      break;
+  }
+}
+
+// ── ADD/SUB extended register ───────────────────────────────────────────────
+
+function emitAddSubExt(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'add_ext' | 'sub_ext'; sf: 0|1; rd: number; rn: number; rm: number; extend: string; amount: number; setFlags: boolean },
+  isAdd: boolean,
+  TMP0: number, TMP1: number, TMP2: number,
+): void {
+  emitGetRegSP(b, insn.rn, 1);
+  if (insn.setFlags) b.local_tee(TMP0);
+
+  // Extend Rm
+  emitGetReg(b, insn.rm, 1);
+  switch (insn.extend) {
+    case 'uxtb': b.i64_const(0xFFn); b.i64_and(); break;
+    case 'uxth': b.i64_const(0xFFFFn); b.i64_and(); break;
+    case 'uxtw': b.i64_const(0xFFFFFFFFn); b.i64_and(); break;
+    case 'uxtx': break; // no-op for 64-bit
+    case 'sxtb': b.i64_const(56n); b.i64_shl(); b.i64_const(56n); b.i64_shr_s(); break;
+    case 'sxth': b.i64_const(48n); b.i64_shl(); b.i64_const(48n); b.i64_shr_s(); break;
+    case 'sxtw': b.i64_const(32n); b.i64_shl(); b.i64_const(32n); b.i64_shr_s(); break;
+    case 'sxtx': break; // no-op for 64-bit
+  }
+  if (insn.amount > 0) {
+    b.i64_const(BigInt(insn.amount));
+    b.i64_shl();
+  }
+  if (insn.setFlags) b.local_tee(TMP1);
+
+  if (isAdd) {
+    b.i64_add();
+  } else {
+    b.i64_sub();
+  }
+
+  if (insn.setFlags) {
+    b.local_tee(TMP2);
+    emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
+  }
+
+  if (insn.sf === 0) {
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+
+  if (insn.rd === 31) {
+    if (insn.setFlags) {
+      b.drop(); // ADDS/SUBS to SP → discard result, keep flags
+    } else {
+      b.local_set(SP_LOCAL);
+    }
+  } else {
+    b.local_set(regLocal(insn.rd));
   }
 }
 
@@ -1166,6 +2821,7 @@ export function translateRegion(
 
   const b = new WasmModuleBuilder();
   b.addMemoryImport('env', 'memory', 256);
+  const helpers = setupHelperImports(b);
   const typeIdx = b.addFuncType([], [ValType.I64]); // () -> i64 (next PC)
   b.beginFunction(typeIdx);
 
@@ -1224,10 +2880,10 @@ export function translateRegion(
 
     if (block.isSelfLoop) {
       emitRegionSelfLoop(b, block, i, blockMap, dispatchDepth, exitDepth,
-        blockIdLocal, TMP0, TMP1, TMP2, TMP3);
+        blockIdLocal, TMP0, TMP1, TMP2, TMP3, helpers);
     } else {
       emitRegionLinearBlock(b, block, i, blockMap, dispatchDepth, exitDepth,
-        blockIdLocal, TMP0, TMP1, TMP2, TMP3);
+        blockIdLocal, TMP0, TMP1, TMP2, TMP3, helpers);
     }
   }
 
@@ -1249,7 +2905,7 @@ export function translateRegion(
 
   const bytes = b.finalize();
   const mod = new WebAssembly.Module(bytes);
-  const instance = new WebAssembly.Instance(mod, { env: { memory } });
+  const instance = new WebAssembly.Instance(mod, { env: { memory, ...helperFunctions } });
   const run = instance.exports.run as () => bigint;
 
   return {
@@ -1257,6 +2913,923 @@ export function translateRegion(
     entryPC: blocks[0].startPC,
     blockPCs: blocks.map(bl => bl.startPC),
   };
+}
+
+// ── SIMD/FP emit helpers ────────────────────────────────────────────────────
+
+const guestMemBase = GUEST_MEM_BASE;
+
+/** Compute effective address for a SIMD load/store with pre/post/offset mode */
+function emitSimdEffAddr(
+  b: WasmModuleBuilder,
+  rn: number, offset: number, mode: string,
+  TMP0: number,
+): void {
+  if (mode === 'pre') {
+    // Pre: compute addr = base + offset, update base
+    emitGetRegSP(b, rn, 1);
+    b.i64_const(BigInt(offset));
+    b.i64_add();
+    b.local_tee(TMP0);
+    emitSetRegSP(b, rn, 1);
+    b.local_get(TMP0);
+  } else if (mode === 'post') {
+    // Post: addr = base, then update base
+    emitGetRegSP(b, rn, 1);
+    b.local_tee(TMP0);
+    // Update base for writeback
+    b.local_get(TMP0);
+    b.i64_const(BigInt(offset));
+    b.i64_add();
+    emitSetRegSP(b, rn, 1);
+    b.local_get(TMP0);
+  } else {
+    // Offset: addr = base + offset
+    emitGetRegSP(b, rn, 1);
+    if (offset !== 0) {
+      b.i64_const(BigInt(offset));
+      b.i64_add();
+    }
+  }
+  // Add GUEST_MEM_BASE (keep as i64 — caller wraps to i32 at use sites)
+  b.i64_const(BigInt(guestMemBase));
+  b.i64_add();
+}
+
+/** STR Q: store 128-bit from V register to guest memory */
+function emitSimdStore128(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'str_simd' },
+  TMP0: number,
+): void {
+  const vOff = vregOffset(insn.rt);
+  // Compute address → TMP0 (i64)
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Store low 8 bytes
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(vOff);
+  b.i64_load(3, 0);
+  b.i64_store(3, 0);
+
+  // Store high 8 bytes
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(vOff + 8);
+  b.i64_load(3, 0);
+  b.i64_store(3, 8);
+}
+
+/** STR B/H/S/D: store 8/16/32/64-bit from V register to guest memory */
+function emitSimdStoreSmall(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'str_simd' },
+  TMP0: number,
+): void {
+  const vOff = vregOffset(insn.rt);
+  // Compute address → TMP0 (i64)
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Load value from V register (low bytes)
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(vOff);
+  b.i64_load(3, 0);
+
+  // Store appropriate size
+  switch (insn.size) {
+    case 1: // B (8-bit)
+      b.i64_store8(0, 0);
+      break;
+    case 2: // H (16-bit)
+      b.i64_store16(1, 0);
+      break;
+    case 4: // S (32-bit)
+      b.i64_store32(2, 0);
+      break;
+    case 8: // D (64-bit)
+      b.i64_store(3, 0);
+      break;
+  }
+}
+
+/** LDR B/H/S/D: load 8/16/32/64-bit from guest memory to V register */
+function emitSimdLoadSmall(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'ldr_simd' },
+  TMP0: number,
+): void {
+  const vOff = vregOffset(insn.rt);
+  // Compute address → TMP0 (i64)
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Load from memory into low qword of V register
+  b.i32_const(vOff);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  switch (insn.size) {
+    case 1: // B (8-bit)
+      b.i64_load8_u(0, 0);
+      break;
+    case 2: // H (16-bit)
+      b.i64_load16_u(1, 0);
+      break;
+    case 4: // S (32-bit)
+      b.i64_load32_u(2, 0);
+      break;
+    case 8: // D (64-bit)
+      b.i64_load(3, 0);
+      break;
+  }
+  b.i64_store(3, 0);
+
+  // Zero the high qword
+  b.i32_const(vOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+/** LDR Q: load 128-bit from guest memory to V register */
+function emitSimdLoad128(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'ldr_simd' },
+  TMP0: number,
+): void {
+  const vOff = vregOffset(insn.rt);
+  // Compute address → TMP0 (i64)
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Load low 8 bytes
+  b.i32_const(vOff);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i64_load(3, 0);
+  b.i64_store(3, 0);
+
+  // Load high 8 bytes
+  b.i32_const(vOff + 8);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i64_load(3, 8);
+  b.i64_store(3, 0);
+}
+
+/** STP Q: store pair of 128-bit V registers */
+function emitSimdStorePair128(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'stp_simd' },
+  TMP0: number,
+): void {
+  const v1Off = vregOffset(insn.rt);
+  const v2Off = vregOffset(insn.rt2);
+
+  // Compute base address → TMP0 (i64)
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Store first Q register (16 bytes)
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(v1Off);
+  b.i64_load(3, 0);
+  b.i64_store(3, 0);
+
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(v1Off + 8);
+  b.i64_load(3, 0);
+  b.i64_store(3, 8);
+
+  // Store second Q register (16 bytes at offset +16)
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(v2Off);
+  b.i64_load(3, 0);
+  b.i64_store(3, 16);
+
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(v2Off + 8);
+  b.i64_load(3, 0);
+  b.i64_store(3, 24);
+}
+
+/** LDP Q: load pair of 128-bit V registers */
+function emitSimdLoadPair128(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'ldp_simd' },
+  TMP0: number,
+): void {
+  const v1Off = vregOffset(insn.rt);
+  const v2Off = vregOffset(insn.rt2);
+
+  // Compute base address → TMP0 (i64)
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Load first Q register
+  b.i32_const(v1Off);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i64_load(3, 0);
+  b.i64_store(3, 0);
+
+  b.i32_const(v1Off + 8);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i64_load(3, 8);
+  b.i64_store(3, 0);
+
+  // Load second Q register
+  b.i32_const(v2Off);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i64_load(3, 16);
+  b.i64_store(3, 0);
+
+  b.i32_const(v2Off + 8);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i64_load(3, 24);
+  b.i64_store(3, 0);
+}
+
+/** STP S/D: store pair of 32/64-bit V registers */
+function emitSimdStorePairSmall(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'stp_simd' },
+  TMP0: number,
+): void {
+  const v1Off = vregOffset(insn.rt);
+  const v2Off = vregOffset(insn.rt2);
+  const size = insn.size; // 4 for S, 8 for D
+
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Store first register
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(v1Off);
+  b.i64_load(3, 0);
+  if (size === 4) {
+    b.i64_store32(2, 0);
+  } else {
+    b.i64_store(3, 0);
+  }
+
+  // Store second register at offset +size
+  b.local_get(TMP0); b.i32_wrap_i64();
+  b.i32_const(v2Off);
+  b.i64_load(3, 0);
+  if (size === 4) {
+    b.i64_store32(2, size);
+  } else {
+    b.i64_store(3, size);
+  }
+}
+
+/** LDP S/D: load pair of 32/64-bit V registers */
+function emitSimdLoadPairSmall(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'ldp_simd' },
+  TMP0: number,
+): void {
+  const v1Off = vregOffset(insn.rt);
+  const v2Off = vregOffset(insn.rt2);
+  const size = insn.size; // 4 for S, 8 for D
+
+  emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
+  b.local_set(TMP0);
+
+  // Load first register (zero-extended to 64-bit)
+  b.i32_const(v1Off);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  if (size === 4) {
+    b.i64_load32_u(2, 0);
+  } else {
+    b.i64_load(3, 0);
+  }
+  b.i64_store(3, 0);
+  // Zero high qword
+  b.i32_const(v1Off + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+
+  // Load second register at offset +size
+  b.i32_const(v2Off);
+  b.local_get(TMP0); b.i32_wrap_i64();
+  if (size === 4) {
+    b.i64_load32_u(2, size);
+  } else {
+    b.i64_load(3, size);
+  }
+  b.i64_store(3, 0);
+  // Zero high qword
+  b.i32_const(v2Off + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+/** DUP Vd.T, Wn/Xn — duplicate GPR to all lanes of vector */
+function emitSimdDupGpr(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'simd_dup_gpr' },
+): void {
+  const vOff = vregOffset(insn.rd);
+  const esize = insn.esize;
+  const TMP0 = REG_COUNT; // borrow TMP0
+
+  // Build a 64-bit qword with the value replicated across lanes
+  emitGetReg(b, insn.rn, esize >= 8 ? 1 : 0);
+
+  if (esize === 1) {
+    b.i64_const(0xFFn);
+    b.i64_and();
+    b.i64_const(0x0101010101010101n);
+    b.i64_mul();
+  } else if (esize === 2) {
+    b.i64_const(0xFFFFn);
+    b.i64_and();
+    b.i64_const(0x0001000100010001n);
+    b.i64_mul();
+  } else if (esize === 4) {
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+    b.i64_const(0x0000000100000001n);
+    b.i64_mul();
+  }
+  // esize === 8: value is already a full 64-bit qword
+
+  b.local_set(TMP0);
+
+  // Store to low half of V register
+  b.i32_const(vOff);
+  b.local_get(TMP0);
+  b.i64_store(3, 0);
+
+  // Store to high half (or zero if 64-bit vector)
+  b.i32_const(vOff + 8);
+  if (insn.Q) {
+    b.local_get(TMP0);
+  } else {
+    b.i64_const(0n);
+  }
+  b.i64_store(3, 0);
+}
+
+/** DUP Vd.T, Vn.Ts[index] — duplicate element to all lanes */
+function emitSimdDupElem(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'simd_dup_elem' },
+  TMP0: number,
+): void {
+  const srcOff = vregOffset(insn.rn);
+  const dstOff = vregOffset(insn.rd);
+  const esize = insn.esize;
+  const index = insn.index;
+
+  // Read the source element from the V register in memory
+  const bytePos = index * esize;
+  const qwordIdx = bytePos < 8 ? 0 : 1;
+  const bitPos = (bytePos % 8) * 8;
+  const mask = esize === 8 ? 0xFFFFFFFFFFFFFFFFn : (1n << BigInt(esize * 8)) - 1n;
+
+  // Load the source qword
+  b.i32_const(srcOff + qwordIdx * 8);
+  b.i64_load(3, 0);
+  if (bitPos > 0) {
+    b.i64_const(BigInt(bitPos));
+    b.i64_shr_u();
+  }
+  b.i64_const(mask);
+  b.i64_and();
+
+  // Now replicate element to fill 64-bit qword
+  if (esize === 1) {
+    b.i64_const(0x0101010101010101n);
+    b.i64_mul();
+  } else if (esize === 2) {
+    b.i64_const(0x0001000100010001n);
+    b.i64_mul();
+  } else if (esize === 4) {
+    b.i64_const(0x0000000100000001n);
+    b.i64_mul();
+  }
+  // esize === 8: already a full qword
+
+  b.local_set(TMP0);
+
+  // Store to both low and high halves of destination V register
+  b.i32_const(dstOff);
+  b.local_get(TMP0);
+  b.i64_store(3, 0);
+
+  if (insn.Q) {
+    b.i32_const(dstOff + 8);
+    b.local_get(TMP0);
+    b.i64_store(3, 0);
+  } else {
+    // 64-bit vector: zero the high half
+    b.i32_const(dstOff + 8);
+    b.i64_const(0n);
+    b.i64_store(3, 0);
+  }
+}
+
+/** UMOV Xd/Wd, Vn.Ts[index] — extract element to GPR */
+function emitSimdUmov(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'simd_umov' },
+): void {
+  const srcOff = vregOffset(insn.rn);
+  const esize = insn.esize;
+  const index = insn.index;
+  const bytePos = index * esize;
+  const qwordIdx = bytePos < 8 ? 0 : 1;
+  const bitPos = (bytePos % 8) * 8;
+
+  // Load the source qword
+  b.i32_const(srcOff + qwordIdx * 8);
+  b.i64_load(3, 0);
+
+  if (bitPos > 0) {
+    b.i64_const(BigInt(bitPos));
+    b.i64_shr_u();
+  }
+
+  // Mask to element size
+  if (esize < 8) {
+    const mask = (1n << BigInt(esize * 8)) - 1n;
+    b.i64_const(mask);
+    b.i64_and();
+  }
+
+  // Store to GPR (esize determines if we use 32-bit or 64-bit target)
+  emitSetReg(b, insn.rd, esize === 8 ? 1 : 0);
+}
+
+/** MOVI Vd.T, #imm — move immediate to vector */
+function emitSimdMovi(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'simd_movi' },
+): void {
+  const vOff = vregOffset(insn.rd);
+
+  // For cmode=0, op=0: MOVI Vd.xS, #imm8 (replicate byte to 32-bit lanes)
+  // For cmode=1110, op=0: MOVI Vd.8B/16B, #imm8 (byte to all lanes)
+  // For cmode=1110, op=1: MOVI Dd/FMOV (64-bit)
+  // Simplified: expand imm8 based on cmode to a 64-bit pattern
+  const pattern = expandSimdImm(insn.imm8, insn.cmode, insn.op);
+
+  b.i32_const(vOff);
+  b.i64_const(pattern);
+  b.i64_store(3, 0);
+
+  if (insn.Q) {
+    b.i32_const(vOff + 8);
+    b.i64_const(pattern);
+    b.i64_store(3, 0);
+  } else {
+    b.i32_const(vOff + 8);
+    b.i64_const(0n);
+    b.i64_store(3, 0);
+  }
+}
+
+function expandSimdImm(imm8: number, cmode: number, op: number): bigint {
+  // Simplified expansion for common cases
+  const cmodeH = cmode >> 1;
+  if (op === 0) {
+    switch (cmodeH) {
+      case 0: { // MOVI Vd.xS, #imm8 (no shift)
+        const val = BigInt(imm8);
+        return val | (val << 32n);
+      }
+      case 1: { // MOVI Vd.xS, #imm8, LSL #8
+        const val = BigInt(imm8) << 8n;
+        return val | (val << 32n);
+      }
+      case 2: { // MOVI Vd.xS, #imm8, LSL #16
+        const val = BigInt(imm8) << 16n;
+        return val | (val << 32n);
+      }
+      case 3: { // MOVI Vd.xS, #imm8, LSL #24
+        const val = BigInt(imm8) << 24n;
+        return val | (val << 32n);
+      }
+      case 4: { // MOVI Vd.xH, #imm8
+        const val = BigInt(imm8);
+        return val | (val << 16n) | (val << 32n) | (val << 48n);
+      }
+      case 5: { // MOVI Vd.xH, #imm8, LSL #8
+        const val = BigInt(imm8) << 8n;
+        return val | (val << 16n) | (val << 32n) | (val << 48n);
+      }
+      case 7: { // MOVI Vd.8B/16B, #imm8 (byte broadcast)
+        let val = BigInt(imm8);
+        val |= val << 8n;
+        val |= val << 16n;
+        val |= val << 32n;
+        return val;
+      }
+      default: {
+        // MSL variants and others — expand as byte broadcast for now
+        let val = BigInt(imm8);
+        val |= val << 8n;
+        val |= val << 16n;
+        val |= val << 32n;
+        return val;
+      }
+    }
+  } else {
+    // op=1: MVNI or FMOV variants
+    // For MVNI, invert the result
+    if (cmodeH <= 3) {
+      const base = expandSimdImm(imm8, cmode, 0);
+      return ~base & 0xFFFFFFFFFFFFFFFFn;
+    }
+    // FMOV — treat as zero for now
+    return 0n;
+  }
+}
+
+/** INS Vd.Ts[index], Wn/Xn — insert GPR into vector element */
+function emitSimdInsGpr(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'simd_ins_gpr' },
+): void {
+  const vOff = vregOffset(insn.rd);
+  const esize = insn.esize;
+  const index = insn.index;
+  const bytePos = index * esize;
+  const qwordIdx = bytePos < 8 ? 0 : 1;
+  const bitPos = (bytePos % 8) * 8;
+  const mask = esize === 8 ? 0xFFFFFFFFFFFFFFFFn : (1n << BigInt(esize * 8)) - 1n;
+
+  if (esize === 8) {
+    // Simple: just write the GPR value to the correct qword
+    b.i32_const(vOff + qwordIdx * 8);
+    emitGetReg(b, insn.rn, 1);
+    b.i64_store(3, 0);
+  } else {
+    // Read-modify-write: clear the element bits, OR in the new value
+    const addr = vOff + qwordIdx * 8;
+    b.i32_const(addr);
+
+    // Load existing qword
+    b.i32_const(addr);
+    b.i64_load(3, 0);
+    // Clear the element bits
+    b.i64_const(~(mask << BigInt(bitPos)) & 0xFFFFFFFFFFFFFFFFn);
+    b.i64_and();
+    // OR in the new value
+    emitGetReg(b, insn.rn, esize >= 4 ? 1 : 0);
+    b.i64_const(mask);
+    b.i64_and();
+    if (bitPos > 0) {
+      b.i64_const(BigInt(bitPos));
+      b.i64_shl();
+    }
+    b.i64_or();
+
+    b.i64_store(3, 0);
+  }
+}
+
+// ── FMOV: GPR → FP register ─────────────────────────────────────────────────
+
+function emitFmovToFp(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fmov_to_fp' },
+): void {
+  const vOff = vregOffset(insn.vd);
+  // Write GPR value to low qword of V register
+  b.i32_const(vOff);
+  emitGetReg(b, insn.rn, insn.sf);
+  if (insn.sf === 0) {
+    // 32-bit: mask to 32 bits
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+  b.i64_store(3, 0);
+  // Clear upper qword
+  b.i32_const(vOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── FMOV: FP register → GPR ─────────────────────────────────────────────────
+
+function emitFmovFromFp(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fmov_from_fp' },
+): void {
+  const vOff = vregOffset(insn.vn);
+  // Read low qword of V register → GPR
+  b.i32_const(vOff);
+  b.i64_load(3, 0);
+  if (insn.sf === 0) {
+    // 32-bit: mask to 32 bits
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+  emitSetReg(b, insn.rd, insn.sf);
+}
+
+// ── FMOV: FP register → FP register ────────────────────────────────────────
+
+function emitFmovFp(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fmov_fp' },
+): void {
+  const srcOff = vregOffset(insn.vn);
+  const dstOff = vregOffset(insn.vd);
+  // Copy low qword
+  b.i32_const(dstOff);
+  b.i32_const(srcOff);
+  b.i64_load(3, 0);
+  if (insn.ftype === 0) {
+    // Single precision: only copy 32 bits, zero the rest
+    b.i64_const(0xFFFFFFFFn);
+    b.i64_and();
+  }
+  b.i64_store(3, 0);
+  // Clear upper qword
+  b.i32_const(dstOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── FP <-> integer conversions ──────────────────────────────────────────────
+
+function emitFpIntConv(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'scvtf_int' | 'ucvtf_int' | 'fcvtzs_int' | 'fcvtzu_int' },
+  TMP0: number,
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  if (insn.kind === 'scvtf_int' || insn.kind === 'ucvtf_int') {
+    // Integer → FP: read GPR, convert, store to V register
+    emitGetReg(b, insn.rn, insn.sf);
+
+    // Call the appropriate conversion helper
+    if (insn.kind === 'scvtf_int') {
+      b.call(insn.sf ? helpers.f64_from_s64Idx : helpers.f64_from_s32Idx);
+    } else {
+      b.call(insn.sf ? helpers.f64_from_u64Idx : helpers.f64_from_u32Idx);
+    }
+    b.local_set(TMP0);
+
+    // If target is single precision, narrow f64 bits to f32 bits
+    const vOff = vregOffset(insn.vd);
+    b.i32_const(vOff);
+    if (insn.ftype === 0) {
+      // Single precision: convert f64 bits to f32 bits
+      b.local_get(TMP0);
+      b.call(helpers.f64_to_f32Idx);
+    } else {
+      b.local_get(TMP0);
+    }
+    b.i64_store(3, 0);
+    // Clear upper
+    b.i32_const(vOff + 8);
+    b.i64_const(0n);
+    b.i64_store(3, 0);
+  } else {
+    // FP → Integer: read V register, convert, store to GPR
+    const vOff = vregOffset(insn.vn);
+    b.i32_const(vOff);
+    b.i64_load(3, 0);
+
+    // If source is single precision, widen f32 bits to f64 bits
+    if (insn.ftype === 0) {
+      b.call(helpers.f32_to_f64Idx);
+    }
+
+    // Call the appropriate conversion helper
+    if (insn.kind === 'fcvtzs_int') {
+      b.call(insn.sf ? helpers.f64_to_s64Idx : helpers.f64_to_s32Idx);
+    } else {
+      b.call(insn.sf ? helpers.f64_to_u64Idx : helpers.f64_to_u32Idx);
+    }
+    emitSetReg(b, insn.rd, insn.sf);
+  }
+}
+
+// ── FP arithmetic (2-source) ────────────────────────────────────────────────
+
+function emitFpArith2(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fmul' | 'fdiv' | 'fadd' | 'fsub' },
+  TMP0: number,
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  const vnOff = vregOffset(insn.vn);
+  const vmOff = vregOffset(insn.vm);
+  const vdOff = vregOffset(insn.vd);
+
+  // Load operands from V registers
+  b.i32_const(vnOff);
+  b.i64_load(3, 0);
+  if (insn.ftype === 0) { b.call(helpers.f32_to_f64Idx); }
+
+  b.i32_const(vmOff);
+  b.i64_load(3, 0);
+  if (insn.ftype === 0) { b.call(helpers.f32_to_f64Idx); }
+
+  // Perform operation
+  switch (insn.kind) {
+    case 'fmul': b.call(helpers.f64_mulIdx); break;
+    case 'fdiv': b.call(helpers.f64_divIdx); break;
+    case 'fadd': b.call(helpers.f64_addIdx); break;
+    case 'fsub': b.call(helpers.f64_subIdx); break;
+  }
+  b.local_set(TMP0);
+
+  // Store result
+  b.i32_const(vdOff);
+  if (insn.ftype === 0) {
+    b.local_get(TMP0);
+    b.call(helpers.f64_to_f32Idx);
+  } else {
+    b.local_get(TMP0);
+  }
+  b.i64_store(3, 0);
+  // Clear upper
+  b.i32_const(vdOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── FP misc (1-source) ──────────────────────────────────────────────────────
+
+function emitFpMisc1(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fabs' | 'fneg' },
+  TMP0: number,
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  const vnOff = vregOffset(insn.vn);
+  const vdOff = vregOffset(insn.vd);
+
+  b.i32_const(vnOff);
+  b.i64_load(3, 0);
+  if (insn.ftype === 0) { b.call(helpers.f32_to_f64Idx); }
+
+  switch (insn.kind) {
+    case 'fabs': b.call(helpers.f64_absIdx); break;
+    case 'fneg': b.call(helpers.f64_negIdx); break;
+  }
+  b.local_set(TMP0);
+
+  b.i32_const(vdOff);
+  if (insn.ftype === 0) {
+    b.local_get(TMP0);
+    b.call(helpers.f64_to_f32Idx);
+  } else {
+    b.local_get(TMP0);
+  }
+  b.i64_store(3, 0);
+  b.i32_const(vdOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── FP precision conversion ─────────────────────────────────────────────────
+
+function emitFcvt(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fcvt' },
+  TMP0: number,
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  const vnOff = vregOffset(insn.vn);
+  const vdOff = vregOffset(insn.vd);
+
+  b.i32_const(vnOff);
+  b.i64_load(3, 0);
+
+  // Source ftype → f64 bits
+  if (insn.ftype === 0) {
+    b.call(helpers.f32_to_f64Idx);
+  }
+  b.local_set(TMP0);
+
+  // f64 bits → dest ftype
+  b.i32_const(vdOff);
+  if (insn.destFtype === 0) {
+    // Dest is f32
+    b.local_get(TMP0);
+    b.call(helpers.f64_to_f32Idx);
+  } else {
+    // Dest is f64
+    b.local_get(TMP0);
+  }
+  b.i64_store(3, 0);
+  b.i32_const(vdOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── SIMD shift long (SSHLL/USHLL) ───────────────────────────────────────────
+
+function emitSimdShiftLong(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'simd_sshll' | 'simd_ushll' },
+  TMP0: number,
+): void {
+  const srcOff = vregOffset(insn.rn);
+  const dstOff = vregOffset(insn.rd);
+  const esize = insn.esize;       // Source element size in bytes
+  const dstEsize = esize * 2;     // Destination element size (doubled)
+  const shift = insn.shift;
+  const signed = insn.kind === 'simd_sshll';
+  const srcBits = esize * 8;
+  const dstBits = dstEsize * 8;
+
+  // Q=0: process lower half (elements 0..n-1), Q=1: process upper half (elements n..2n-1)
+  const numElems = insn.Q === 0 ? (8 / esize) : (8 / esize);  // Always process 8 bytes of source
+  const srcBase = insn.Q === 0 ? 0 : 8;  // Source starts at byte 0 or 8
+
+  // Process elements. For widening, we go from smaller elements to larger.
+  // We need to be careful about overlapping src/dst — process in reverse if needed.
+  // Since dest is always 128-bit and source is 64-bit half, they may overlap if src==dst.
+  // Process from highest element to lowest to avoid clobbering.
+
+  for (let i = numElems - 1; i >= 0; i--) {
+    const srcBytePos = srcBase + i * esize;
+    const dstBytePos = i * dstEsize;
+    const srcQword = srcBytePos < 8 ? 0 : 1;
+    const srcBitPos = (srcBytePos % 8) * 8;
+    const dstQword = dstBytePos < 8 ? 0 : 1;
+    const dstBitPos = (dstBytePos % 8) * 8;
+
+    // Load source element
+    b.i32_const(srcOff + srcQword * 8);
+    b.i64_load(3, 0);
+    if (srcBitPos > 0) {
+      b.i64_const(BigInt(srcBitPos));
+      b.i64_shr_u();
+    }
+
+    // Mask to source element size
+    if (esize < 8) {
+      const mask = (1n << BigInt(srcBits)) - 1n;
+      b.i64_const(mask);
+      b.i64_and();
+    }
+
+    // Sign-extend if SSHLL
+    if (signed && esize < 8) {
+      // Sign-extend: shift left then arithmetic shift right
+      const extShift = BigInt(64 - srcBits);
+      b.i64_const(extShift);
+      b.i64_shl();
+      b.i64_const(extShift);
+      b.i64_shr_s();
+    }
+
+    // Apply shift
+    if (shift > 0) {
+      b.i64_const(BigInt(shift));
+      b.i64_shl();
+    }
+
+    // Mask to destination element size
+    if (dstEsize < 8) {
+      const dstMask = (1n << BigInt(dstBits)) - 1n;
+      b.i64_const(dstMask);
+      b.i64_and();
+    }
+
+    b.local_set(TMP0);
+
+    // Write to destination
+    if (dstBitPos === 0 && dstEsize >= 8) {
+      // Simple case: write full qword
+      b.i32_const(dstOff + dstQword * 8);
+      b.local_get(TMP0);
+      b.i64_store(3, 0);
+    } else {
+      // Read-modify-write the destination qword
+      const dstMask = (1n << BigInt(dstBits)) - 1n;
+      const addr = dstOff + dstQword * 8;
+      b.i32_const(addr);
+      // Load existing
+      b.i32_const(addr);
+      b.i64_load(3, 0);
+      // Clear element bits
+      b.i64_const(~(dstMask << BigInt(dstBitPos)) & 0xFFFFFFFFFFFFFFFFn);
+      b.i64_and();
+      // OR in new value
+      b.local_get(TMP0);
+      if (dstBitPos > 0) {
+        b.i64_const(BigInt(dstBitPos));
+        b.i64_shl();
+      }
+      b.i64_or();
+      b.i64_store(3, 0);
+    }
+  }
 }
 
 // ── Emit a linear block within a region ─────────────────────────────────────
@@ -1270,6 +3843,7 @@ function emitRegionLinearBlock(
   exitDepth: number,
   blockIdLocal: number,
   TMP0: number, TMP1: number, TMP2: number, TMP3: number,
+  helpers?: HelperImports,
 ): void {
   const startPC = Number(block.startPC);
   const insns = block.insns;
@@ -1277,7 +3851,7 @@ function emitRegionLinearBlock(
   // Emit all non-branch instructions
   for (let i = 0; i < insns.length - 1; i++) {
     const pc = startPC + i * 4;
-    emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3);
+    emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3, helpers);
   }
 
   // Handle the terminating instruction with region-aware branching
@@ -1298,6 +3872,7 @@ function emitRegionSelfLoop(
   exitDepth: number,
   blockIdLocal: number,
   TMP0: number, TMP1: number, TMP2: number, TMP3: number,
+  helpers?: HelperImports,
 ): void {
   const startPC = Number(block.startPC);
   const insns = block.insns;
@@ -1325,7 +3900,7 @@ function emitRegionSelfLoop(
   const skipLast = canFuse ? 2 : 1;
   for (let i = 0; i < insns.length - skipLast; i++) {
     const pc = startPC + i * 4;
-    emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3);
+    emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3, helpers);
   }
 
   // Handle the backward branch
@@ -1347,6 +3922,23 @@ function emitRegionSelfLoop(
     b.i64_const(0n);
     b.i64_ne();
     b.br_if(0);
+  } else if (lastInsn.kind === 'tbz') {
+    b.local_get(regLocal(lastInsn.rt));
+    b.i64_const(BigInt(lastInsn.bit));
+    b.i64_shr_u();
+    b.i64_const(1n);
+    b.i64_and();
+    b.i64_eqz(); // tbz: loop back if bit is zero
+    b.br_if(0);
+  } else if (lastInsn.kind === 'tbnz') {
+    b.local_get(regLocal(lastInsn.rt));
+    b.i64_const(BigInt(lastInsn.bit));
+    b.i64_shr_u();
+    b.i64_const(1n);
+    b.i64_and();
+    b.i64_const(0n);
+    b.i64_ne(); // tbnz: loop back if bit is non-zero
+    b.br_if(0);
   }
 
   // Fall through self-loop: determine where the fallthrough goes
@@ -1357,7 +3949,7 @@ function emitRegionSelfLoop(
       emitGetReg(b, cmpInsn.rn, cmpInsn.sf);
       b.local_tee(TMP0);
       emitGetReg(b, cmpInsn.rm, cmpInsn.sf);
-      emitShift(b, cmpInsn.shift, cmpInsn.amount);
+      emitShift(b, cmpInsn.shift, cmpInsn.amount, cmpInsn.sf);
       if (cmpInsn.sf === 0) { b.i64_const(0xFFFFFFFFn); b.i64_and(); }
       b.local_tee(TMP1);
       b.i64_sub();

@@ -64,6 +64,7 @@ export class WasmModuleBuilder {
   private types: number[][] = [];         // encoded function types
   private imports: number[] = [];         // encoded imports
   private importCount = 0;
+  private importedFuncCount = 0;          // function imports only (for func index space)
   private funcTypeIndices: number[] = [];  // type index per function
   private exports: number[] = [];
   private exportCount = 0;
@@ -112,8 +113,9 @@ export class WasmModuleBuilder {
       ...encodeULEB128(typeIndex),
     ];
     this.imports.push(...importData);
-    const funcIdx = this.importCount;
+    const funcIdx = this.importedFuncCount;
     this.importCount++;
+    this.importedFuncCount++;
     return funcIdx;
   }
 
@@ -140,7 +142,7 @@ export class WasmModuleBuilder {
   }
 
   exportFunction(name: string, funcIndex?: number): void {
-    const idx = funcIndex ?? this.funcTypeIndices.length - 1;
+    const idx = funcIndex ?? (this.importedFuncCount + this.funcTypeIndices.length - 1);
     this.exports.push(
       ...encodeString(name),
       0x00, // export kind: function

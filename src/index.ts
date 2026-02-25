@@ -1,11 +1,35 @@
-import { Emulator } from './dispatch.js';
+import { Emulator, IOManager } from './dispatch.js';
 import {
   FIB_CODE, FIB_START_PC, setupFib,
   SUM_CODE, SUM_START_PC, setupSum,
   SUMSQ_CODE, SUMSQ_START_PC, setupSumSq,
 } from './benchmark.js';
 import { detectRegion } from './block.js';
-import { GUEST_MEM_BASE } from './types.js';
+import { GUEST_MEM_BASE, TPIDR_OFFSET } from './types.js';
+import { loadElf, setupStack } from './elf.js';
+import { SyscallHandler } from './syscall.js';
+import { InMemoryVFS } from './vfs.js';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+
+/** Translate bare \n to \r\n for xterm.js (raw mode terminal has no line discipline) */
+function translateNewlines(data: Uint8Array): Uint8Array {
+  let extra = 0;
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] === 0x0A && (i === 0 || data[i - 1] !== 0x0D)) extra++;
+  }
+  if (extra === 0) return data;
+
+  const out = new Uint8Array(data.length + extra);
+  let j = 0;
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] === 0x0A && (i === 0 || data[i - 1] !== 0x0D)) {
+      out[j++] = 0x0D;
+    }
+    out[j++] = data[i];
+  }
+  return out;
+}
 
 const output = document.getElementById('output')!;
 
@@ -260,4 +284,134 @@ function logBenchResult(result: BenchResult) {
 log('jitter v0.1.0 — ARM64 dynamic recompiler');
 log('Translates ARM64 basic blocks to WASM, JIT-compiled via WebAssembly.Module()');
 log('');
-log('Click a benchmark to run.');
+log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
+
+// ── Shell boot ──────────────────────────────────────────────────────────────
+
+(window as any).bootShell = async () => {
+  const btn = document.getElementById('btn-shell') as HTMLButtonElement;
+  btn.disabled = true;
+  btn.textContent = 'Loading...';
+
+  try {
+    // Fetch busybox binary
+    const resp = await fetch('busybox-aarch64');
+    if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
+    const elfBytes = new Uint8Array(await resp.arrayBuffer());
+
+    // Hide benchmark panel
+    document.getElementById('bench-panel')!.style.display = 'none';
+
+    // Setup terminal
+    const termContainer = document.getElementById('terminal-container')!;
+    termContainer.classList.add('active');
+
+    const term = new Terminal({
+      theme: {
+        background: '#0a0a0a',
+        foreground: '#00ff41',
+        cursor: '#00ff41',
+      },
+      fontFamily: "'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace",
+      fontSize: 14,
+      cursorBlink: true,
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termContainer);
+    fitAddon.fit();
+
+    // Resize handler
+    window.addEventListener('resize', () => fitAddon.fit());
+
+    // Setup IO manager
+    const io = new IOManager();
+
+    // Terminal input → IO manager
+    term.onData((data: string) => {
+      io.pushStdin(new TextEncoder().encode(data));
+    });
+
+    // Create emulator with enough memory (1024 pages = 64MB)
+    const emu = new Emulator(1024);
+    emu.singleBlockMode = true;
+
+    // Setup VFS
+    const vfs = new InMemoryVFS();
+    vfs.loadBinary(elfBytes);
+
+    // Load ELF
+    const elfInfo = loadElf(elfBytes, emu.memory);
+
+    // Setup stack
+    const sp = setupStack(
+      emu.memory,
+      elfInfo,
+      ['sh'],
+      ['HOME=/root', 'TERM=xterm-256color', 'PATH=/bin', 'PWD=/'],
+    );
+    emu.cpu.setSP(sp);
+
+    // Allocate TLS area for TPIDR_EL0
+    const tlsArea = 0x900000;
+    const tlsView = new DataView(emu.memory.buffer);
+    tlsView.setBigUint64(TPIDR_OFFSET, BigInt(tlsArea), true);
+
+    // Setup syscall handler
+    const syscalls = new SyscallHandler(
+      elfInfo.brkStart,
+      {
+        writeStdout: (data: Uint8Array) => {
+          term.write(translateNewlines(data));
+        },
+        writeStderr: (data: Uint8Array) => {
+          term.write(translateNewlines(data));
+        },
+        readStdin: (count: number) => {
+          return io.readStdin(count);
+        },
+      },
+      vfs,
+    );
+
+    // Update terminal size for ioctl
+    syscalls.setTermSize(term.cols, term.rows);
+    term.onResize(({ cols, rows }) => {
+      syscalls.setTermSize(cols, rows);
+    });
+
+    emu.syscallHandler = (cpu, memory) => syscalls.handle(cpu, memory);
+    emu.syscallHandlerInstance = syscalls;
+    emu.elfBytes = elfBytes;
+
+    // Status bar
+    const statusBar = document.getElementById('status-bar')!;
+    statusBar.classList.add('active');
+
+    // Hide other buttons
+    setButtons(false);
+    btn.style.display = 'none';
+
+    statusBar.textContent = 'Booting...';
+
+    // Run async
+    const result = await emu.runAsync(
+      elfInfo.entry,
+      async () => {
+        await io.waitForStdin();
+      },
+      (code) => {
+        term.write(`\r\n[Process exited with code ${code}]\r\n`);
+        statusBar.textContent = `Exited (code ${code})`;
+      },
+    );
+
+    statusBar.textContent = `Shell exited — ${result.insns.toLocaleString()} instructions executed`;
+  } catch (err: any) {
+    console.error('Boot failed:', err);
+    const output = document.getElementById('output')!;
+    output.textContent = `Boot failed: ${err.message}\n\nMake sure busybox-aarch64 is in the dist/ directory.`;
+    btn.disabled = false;
+    btn.textContent = 'Boot Shell';
+  }
+};

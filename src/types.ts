@@ -29,6 +29,10 @@ export type DecodedInsn =
   | { kind: 'bfm';       sf: 0|1; rd: number; rn: number; immr: number; imms: number }
   | { kind: 'madd';      sf: 0|1; rd: number; rn: number; rm: number; ra: number }
   | { kind: 'msub';      sf: 0|1; rd: number; rn: number; rm: number; ra: number }
+  | { kind: 'smaddl';    rd: number; rn: number; rm: number; ra: number }
+  | { kind: 'smsubl';    rd: number; rn: number; rm: number; ra: number }
+  | { kind: 'umaddl';    rd: number; rn: number; rm: number; ra: number }
+  | { kind: 'umsubl';    rd: number; rn: number; rm: number; ra: number }
   | { kind: 'sdiv';      sf: 0|1; rd: number; rn: number; rm: number }
   | { kind: 'udiv';      sf: 0|1; rd: number; rn: number; rm: number }
   | { kind: 'smulh';     rd: number; rn: number; rm: number }
@@ -60,6 +64,73 @@ export type DecodedInsn =
   | { kind: 'blr';       rn: number }
   | { kind: 'ret';       rn: number }
   | { kind: 'svc';       imm16: number }
+  | { kind: 'brk';       imm16: number }
+  | { kind: 'mrs';       rt: number; sysreg: string }
+  | { kind: 'msr';       rt: number; sysreg: string }
+  | { kind: 'clz';       sf: 0|1; rd: number; rn: number }
+  | { kind: 'cls';       sf: 0|1; rd: number; rn: number }
+  | { kind: 'rbit';      sf: 0|1; rd: number; rn: number }
+  | { kind: 'rev';       sf: 0|1; rd: number; rn: number }
+  | { kind: 'rev16';     sf: 0|1; rd: number; rn: number }
+  | { kind: 'rev32';     rd: number; rn: number }
+  | { kind: 'extr';      sf: 0|1; rd: number; rn: number; rm: number; imms: number }
+  | { kind: 'ccmp';      sf: 0|1; rn: number; rm_imm: number; nzcv: number; cond: number; isImm: boolean }
+  | { kind: 'ccmn';      sf: 0|1; rn: number; rm_imm: number; nzcv: number; cond: number; isImm: boolean }
+  | { kind: 'ldr_lit';   sf: 0|1; rt: number; offset: number }
+  | { kind: 'ldrsw_lit'; rt: number; offset: number }
+  | { kind: 'ldrb_reg';  rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'strb_reg';  rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'ldrh_reg';  rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'strh_reg';  rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'ldrsb_reg'; sf: 0|1; rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'ldrsh_reg'; sf: 0|1; rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'ldrsw_reg'; rt: number; rn: number; rm: number; extend: string; shift: number }
+  | { kind: 'ldxr';      sf: 0|1; rt: number; rn: number }
+  | { kind: 'stxr';      sf: 0|1; rt: number; rn: number; rs: number }
+  | { kind: 'add_ext';   sf: 0|1; rd: number; rn: number; rm: number; extend: string; amount: number; setFlags: boolean }
+  | { kind: 'sub_ext';   sf: 0|1; rd: number; rn: number; rm: number; extend: string; amount: number; setFlags: boolean }
+  // Variable shifts
+  | { kind: 'lslv';      sf: 0|1; rd: number; rn: number; rm: number }
+  | { kind: 'lsrv';      sf: 0|1; rd: number; rn: number; rm: number }
+  | { kind: 'asrv';      sf: 0|1; rd: number; rn: number; rm: number }
+  | { kind: 'rorv';      sf: 0|1; rd: number; rn: number; rm: number }
+  // SIMD/FP load/store
+  | { kind: 'str_simd';  size: number; rt: number; rn: number; offset: number; mode: 'offset'|'pre'|'post' }
+  | { kind: 'ldr_simd';  size: number; rt: number; rn: number; offset: number; mode: 'offset'|'pre'|'post' }
+  | { kind: 'stp_simd';  size: number; rt: number; rt2: number; rn: number; offset: number; mode: 'offset'|'pre'|'post' }
+  | { kind: 'ldp_simd';  size: number; rt: number; rt2: number; rn: number; offset: number; mode: 'offset'|'pre'|'post' }
+  // SIMD data processing
+  | { kind: 'simd_dup_elem'; Q: number; rd: number; rn: number; esize: number; index: number }
+  | { kind: 'simd_dup_gpr';  Q: number; rd: number; rn: number; esize: number }
+  | { kind: 'simd_umov';     Q: number; rd: number; rn: number; esize: number; index: number }
+  | { kind: 'simd_movi';     Q: number; rd: number; imm8: number; cmode: number; op: number }
+  | { kind: 'simd_ins_gpr';  rd: number; rn: number; esize: number; index: number }
+  // FMOV between GPR and FP registers
+  | { kind: 'fmov_to_fp';    vd: number; rn: number; sf: 0|1 }  // FMOV Sn/Dn, Wm/Xm
+  | { kind: 'fmov_from_fp';  rd: number; vn: number; sf: 0|1 }  // FMOV Wn/Xn, Sm/Dm
+  | { kind: 'fmov_fp';       vd: number; vn: number; ftype: number }  // FMOV between FP regs
+  // FP <-> integer conversions
+  | { kind: 'scvtf_int';     vd: number; rn: number; sf: 0|1; ftype: number }
+  | { kind: 'ucvtf_int';     vd: number; rn: number; sf: 0|1; ftype: number }
+  | { kind: 'fcvtzs_int';    rd: number; vn: number; sf: 0|1; ftype: number }
+  | { kind: 'fcvtzu_int';    rd: number; vn: number; sf: 0|1; ftype: number }
+  // FP arithmetic
+  | { kind: 'fmul';   vd: number; vn: number; vm: number; ftype: number }
+  | { kind: 'fdiv';   vd: number; vn: number; vm: number; ftype: number }
+  | { kind: 'fadd';   vd: number; vn: number; vm: number; ftype: number }
+  | { kind: 'fsub';   vd: number; vn: number; vm: number; ftype: number }
+  // FP misc
+  | { kind: 'fabs';   vd: number; vn: number; ftype: number }
+  | { kind: 'fneg';   vd: number; vn: number; ftype: number }
+  | { kind: 'fcvt';   vd: number; vn: number; ftype: number; destFtype: number }
+  // SIMD shift by immediate
+  | { kind: 'simd_sshll';  Q: number; rd: number; rn: number; esize: number; shift: number }  // SSHLL/SXTL
+  | { kind: 'simd_ushll';  Q: number; rd: number; rn: number; esize: number; shift: number }  // USHLL/UXTL
+  // SIMD scalar/vector FP conversions
+  | { kind: 'simd_scvtf';  Q: number; rd: number; rn: number; esize: number }  // SCVTF (vector)
+  | { kind: 'simd_ucvtf';  Q: number; rd: number; rn: number; esize: number }  // UCVTF (vector)
+  | { kind: 'simd_fcvtzs';  Q: number; rd: number; rn: number; esize: number }  // FCVTZS (vector)
+  | { kind: 'simd_fcvtzu';  Q: number; rd: number; rn: number; esize: number }  // FCVTZU (vector)
   | { kind: 'nop' }
   | { kind: 'unknown';   raw: number };
 
@@ -68,7 +139,7 @@ export function isBranch(insn: DecodedInsn): boolean {
   switch (insn.kind) {
     case 'b': case 'bl': case 'b_cond': case 'cbz': case 'cbnz':
     case 'tbz': case 'tbnz': case 'br': case 'blr': case 'ret':
-    case 'svc':
+    case 'svc': case 'brk':
       return true;
     default:
       return false;
@@ -81,12 +152,18 @@ export const SP_OFFSET = 0xF8;        // 248
 export const PC_OFFSET = 0x100;       // 256
 export const NZCV_OFFSET = 0x108;     // 264
 export const ITER_OFFSET = 0x110;     // 272 — self-loop iteration count
-export const STATE_SIZE = 0x200;      // 512 bytes reserved for CPU state
+export const TPIDR_OFFSET = 0x118;    // 280 — TLS base pointer (TPIDR_EL0)
+export const V_OFFSET = 0x200;        // V0-V31 SIMD registers (32 × 16 bytes = 512 bytes)
+export const STATE_SIZE = 0x400;      // 1024 bytes reserved for CPU state (GPR + SIMD)
 export const GUEST_MEM_BASE = 0x10000; // guest memory starts at 64KB
 
 export function regOffset(r: number): number {
   if (r === 31) return SP_OFFSET;
   return REG_OFFSET + r * 8;
+}
+
+export function vregOffset(r: number): number {
+  return V_OFFSET + r * 16;
 }
 
 // ── WASM value types ─────────────────────────────────────────────────────────
@@ -201,6 +278,7 @@ export const BLOCKTYPE_I64 = ValType.I64;
 
 // ── Halt sentinel ────────────────────────────────────────────────────────────
 export const HALT_PC = 0xDEAD_0000n;
+export const SVC_PC  = 0xDEAD_0001n;
 
 // ── Compiled block ───────────────────────────────────────────────────────────
 export interface CompiledBlock {

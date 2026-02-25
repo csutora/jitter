@@ -29,7 +29,7 @@
     }
     button:hover { background: #00ff41; color: #0a0a0a; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    #output {
+    #bench-panel #output {
       background: #111;
       border: 1px solid #333;
       padding: 1em;
@@ -42,6 +42,22 @@
     .error { color: #ff4141; }
     .dim { color: #666; }
     .highlight { color: #ffff41; }
+    #terminal-container {
+      display: none;
+      margin-top: 1em;
+    }
+    #terminal-container.active {
+      display: block;
+    }
+    #status-bar {
+      display: none;
+      margin-top: 0.5em;
+      font-size: 0.8em;
+      color: #666;
+    }
+    #status-bar.active {
+      display: block;
+    }
   </style>
 </head>
 <body>
@@ -52,8 +68,13 @@
     <button id="btn-fib-large" onclick="window.runFibLarge()">Fib(10M)</button>
     <button id="btn-sum" onclick="window.runSum()">Sum 1..100M</button>
     <button id="btn-sumsq" onclick="window.runSumSq()">Sum&sup2; 1..10M</button>
+    <button id="btn-shell" onclick="window.bootShell()">Boot Shell</button>
   </div>
-  <pre id="output">Ready.\n</pre>
+  <div id="bench-panel">
+    <pre id="output">Ready.\n</pre>
+  </div>
+  <div id="terminal-container"></div>
+  <div id="status-bar"></div>
   <script type="module">/* BUNDLE */</script>
 </body>
 </html>
