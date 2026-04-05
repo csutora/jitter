@@ -44,7 +44,12 @@ interface OpenDir {
   pos: number;        // index into entries (how many have been read)
 }
 
-type OpenFd = OpenFile | OpenDir;
+interface OpenCharDev {
+  type: 'chardev';
+  node: VFSCharDev;
+}
+
+type OpenFd = OpenFile | OpenDir | OpenCharDev;
 
 // ── Error constants ─────────────────────────────────────────────────────────
 
@@ -93,10 +98,10 @@ export class InMemoryVFS implements VFS {
     this.mkdirp('/root');
     this.mkdirp('/bin');
 
-    this.addCharDev('/dev/null', 1);
-    this.addCharDev('/dev/zero', 5);
-    this.addCharDev('/dev/tty', 5);
-    this.addCharDev('/dev/urandom', 1);
+    this.addCharDev('/dev/null', 1);    // devno 1: reads return EOF, writes discard
+    this.addCharDev('/dev/zero', 2);    // devno 2: reads return zeroes
+    this.addCharDev('/dev/tty', 3);     // devno 3: terminal
+    this.addCharDev('/dev/urandom', 4); // devno 4: random bytes
 
     this.addFile('/etc/passwd', 'root:x:0:0:root:/root:/bin/sh\n');
     this.addFile('/etc/group', 'root:x:0:\n');
@@ -271,7 +276,9 @@ export class InMemoryVFS implements VFS {
       return fd;
     }
     if (node.type === 'chardev') {
-      return this.nextFd++;
+      const fd = this.nextFd++;
+      this.openFds.set(fd, { type: 'chardev', node });
+      return fd;
     }
     if (node.type !== 'file') return -ENOENT;
 
@@ -294,9 +301,43 @@ export class InMemoryVFS implements VFS {
     return 0;
   }
 
+  /** Duplicate a VFS fd — new fd shares the same file node but has independent position */
+  dup(fd: number): number {
+    const entry = this.openFds.get(fd);
+    if (!entry) return -EBADF;
+    const newFd = this.nextFd++;
+    if (entry.type === 'file') {
+      this.openFds.set(newFd, { type: 'file', node: entry.node, pos: entry.pos, flags: entry.flags });
+    } else if (entry.type === 'dir') {
+      this.openFds.set(newFd, { type: 'dir', node: entry.node, entries: [...entry.entries], pos: entry.pos });
+    } else if (entry.type === 'chardev') {
+      this.openFds.set(newFd, { type: 'chardev', node: entry.node });
+    }
+    return newFd;
+  }
+
   read(fd: number, buf: number, count: number, memory: DataView): number {
     const entry = this.openFds.get(fd);
-    if (!entry || entry.type !== 'file') return -EBADF;
+    if (!entry) return -EBADF;
+
+    if (entry.type === 'chardev') {
+      const bytes = new Uint8Array(memory.buffer);
+      switch (entry.node.devno) {
+        case 1: return 0; // /dev/null → EOF
+        case 2: // /dev/zero → fill with zeroes
+          bytes.fill(0, buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
+          return count;
+        case 3: return 0; // /dev/tty → EOF (actual I/O goes through stdio fds)
+        case 4: // /dev/urandom → random bytes
+          for (let i = 0; i < count; i++) {
+            bytes[buf + GUEST_MEM_BASE + i] = (Math.random() * 256) | 0;
+          }
+          return count;
+        default: return 0;
+      }
+    }
+
+    if (entry.type !== 'file') return -EBADF;
 
     const available = entry.node.data.length - entry.pos;
     const toRead = Math.min(count, available);
@@ -310,7 +351,14 @@ export class InMemoryVFS implements VFS {
 
   write(fd: number, buf: number, count: number, memory: DataView): number {
     const entry = this.openFds.get(fd);
-    if (!entry || entry.type !== 'file') return -EBADF;
+    if (!entry) return -EBADF;
+
+    if (entry.type === 'chardev') {
+      // /dev/null: discard all writes
+      return count;
+    }
+
+    if (entry.type !== 'file') return -EBADF;
 
     if (count === 0) return 0;
 
@@ -356,6 +404,8 @@ export class InMemoryVFS implements VFS {
     if (!entry) return -EBADF;
     if (entry.type === 'dir') {
       writeDirStat(memory, statBuf, entry.node.mode);
+    } else if (entry.type === 'chardev') {
+      writeCharStat(memory, statBuf, entry.node.mode);
     } else {
       writeFileStat(memory, statBuf, entry.node.data.length, entry.node.mode);
     }

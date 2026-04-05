@@ -6,6 +6,7 @@ import { translateRegion, translateBlock } from './translate.js';
 import { ProcessManager } from './process.js';
 import type { SyscallResult } from './syscall.js';
 import { SyscallHandler as SyscallHandlerClass } from './syscall.js';
+import type { NativeBridge } from './bridge.js';
 
 export interface RunResult {
   insns: number;
@@ -26,6 +27,8 @@ export class Emulator {
   processManager = new ProcessManager();
   /** ELF bytes for execve (busybox binary) */
   elfBytes?: Uint8Array;
+  /** Native bridge for Swift filesystem calls */
+  bridge?: NativeBridge;
 
   constructor(memoryPages = 256) { // 256 pages = 16MB
     this.memory = new WebAssembly.Memory({ initial: memoryPages });
@@ -158,6 +161,9 @@ export class Emulator {
     };
   }
 
+  /** Optional IOManager reference for interrupt checking */
+  io?: IOManager;
+
   /** Async run loop for shell execution — yields on blocked reads and periodically for UI */
   async runAsync(
     startPC: bigint,
@@ -245,6 +251,12 @@ export class Emulator {
             pc = svcPC + 4n;
             continue;
           }
+          if (result.status === 'bridge' && this.bridge) {
+            const resp = await this.bridge.call(result.method, result.args);
+            result.apply(resp);
+            pc = svcPC + 4n;
+            continue;
+          }
         }
         pc = svcPC + 4n;
         continue;
@@ -255,6 +267,21 @@ export class Emulator {
       if (now - lastYield > 5) {
         await new Promise<void>(r => setTimeout(r, 0));
         lastYield = performance.now();
+        // Check for ctrl+c interrupt
+        if (this.io?.interrupted) {
+          this.io.interrupted = false;
+          if (this.processManager.depth > 0) {
+            // Force-exit child process with code 130 (128 + SIGINT=2)
+            const restored = this.processManager.exit(this.memory, this.cpu, 130);
+            if (restored && this.syscallHandlerInstance) {
+              this.syscallHandlerInstance.lastWaitStatus = 130;
+              this.syscallHandlerInstance.lastWaitPid = restored.childPid;
+              this.syscallHandlerInstance.restoreState(restored.syscallState);
+              pc = restored.resumePC;
+              continue;
+            }
+          }
+        }
       }
     }
 
@@ -278,6 +305,7 @@ export class Emulator {
 export class IOManager {
   private stdinBuffer: Uint8Array[] = [];
   private stdinWaiters: (() => void)[] = [];
+  interrupted = false;
 
   /** Push data from terminal (xterm.js onData) */
   pushStdin(data: Uint8Array): void {

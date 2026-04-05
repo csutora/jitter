@@ -255,6 +255,14 @@ describe('busybox boot', () => {
     expect(r.stdout).toContain('/bin/sh');
   });
 
+  it('runs shell redirection (echo > file, cat file)', () => {
+    const result = bootShell('echo hello > /tmp/test.txt\ncat /tmp/test.txt\n');
+    if (!result) { console.log('busybox not found, skipping'); return; }
+    console.log(`redirect: ${result.totalInsns.toLocaleString()} insns`);
+    console.log(`Output: ${JSON.stringify(result.stdout.slice(0, 500))}`);
+    expect(result.stdout).toContain('hello');
+  });
+
   it('runs many echo commands', () => {
     const elfBytes = loadBusybox();
     if (!elfBytes) { console.log('busybox not found, skipping'); return; }
@@ -316,5 +324,23 @@ describe('busybox boot', () => {
     console.log(`\nTotal: ${totalInsns.toLocaleString()} insns, ${blockCount} blocks`);
     console.log(`Output: ${JSON.stringify(stdout.slice(0, 500))}`);
     expect(stdout).toContain('1');
+  });
+
+  it('runs seq 1 5 directly', () => {
+    const result = runBusybox(['seq', '1', '5']);
+    if (!result) { console.log('busybox not found, skipping'); return; }
+    console.log(`seq direct: ${result.totalInsns.toLocaleString()} insns, exit=${result.exitCode}`);
+    console.log(`Output: ${JSON.stringify(result.stdout.slice(0, 500))}`);
+    if (result.haltInfo) console.log(result.haltInfo);
+    expect(result.stdout).toContain('1\n2\n3\n4\n5');
+  });
+
+  it('runs seq 1 5 via shell (fork+exec)', () => {
+    const result = bootShell('seq 1 5\nexit\n');
+    if (!result) { console.log('busybox not found, skipping'); return; }
+    console.log(`seq via shell: ${result.totalInsns.toLocaleString()} insns`);
+    console.log(`Output: ${JSON.stringify(result.stdout.slice(0, 500))}`);
+    expect(result.stdout).toContain('1\n2\n3\n4\n5');
+    expect(result.stdout).not.toContain('Bad file descriptor');
   });
 });

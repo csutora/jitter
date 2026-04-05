@@ -33,6 +33,8 @@ export type DecodedInsn =
   | { kind: 'smsubl';    rd: number; rn: number; rm: number; ra: number }
   | { kind: 'umaddl';    rd: number; rn: number; rm: number; ra: number }
   | { kind: 'umsubl';    rd: number; rn: number; rm: number; ra: number }
+  | { kind: 'adc';       sf: 0|1; rd: number; rn: number; rm: number; setFlags: boolean }
+  | { kind: 'sbc';       sf: 0|1; rd: number; rn: number; rm: number; setFlags: boolean }
   | { kind: 'sdiv';      sf: 0|1; rd: number; rn: number; rm: number }
   | { kind: 'udiv';      sf: 0|1; rd: number; rn: number; rm: number }
   | { kind: 'smulh';     rd: number; rn: number; rm: number }
@@ -105,9 +107,12 @@ export type DecodedInsn =
   | { kind: 'simd_umov';     Q: number; rd: number; rn: number; esize: number; index: number }
   | { kind: 'simd_movi';     Q: number; rd: number; imm8: number; cmode: number; op: number }
   | { kind: 'simd_ins_gpr';  rd: number; rn: number; esize: number; index: number }
+  | { kind: 'simd_orr_reg';  Q: number; rd: number; rn: number; rm: number }  // ORR/MOV (vector)
   // FMOV between GPR and FP registers
   | { kind: 'fmov_to_fp';    vd: number; rn: number; sf: 0|1 }  // FMOV Sn/Dn, Wm/Xm
   | { kind: 'fmov_from_fp';  rd: number; vn: number; sf: 0|1 }  // FMOV Wn/Xn, Sm/Dm
+  | { kind: 'fmov_top_to_fp';   vd: number; rn: number }  // FMOV Vd.D[1], Xn
+  | { kind: 'fmov_top_from_fp'; rd: number; vn: number }  // FMOV Xd, Vn.D[1]
   | { kind: 'fmov_fp';       vd: number; vn: number; ftype: number }  // FMOV between FP regs
   // FP <-> integer conversions
   | { kind: 'scvtf_int';     vd: number; rn: number; sf: 0|1; ftype: number }
@@ -123,6 +128,15 @@ export type DecodedInsn =
   | { kind: 'fabs';   vd: number; vn: number; ftype: number }
   | { kind: 'fneg';   vd: number; vn: number; ftype: number }
   | { kind: 'fcvt';   vd: number; vn: number; ftype: number; destFtype: number }
+  // FP immediate
+  | { kind: 'fmov_imm';  vd: number; ftype: number; bits: bigint }  // FMOV Dd, #imm
+  // FP compare
+  | { kind: 'fcmp';   vn: number; vm: number; ftype: number; withZero: boolean }  // FCMP/FCMPE
+  // FP fused multiply-add/subtract (3-source)
+  | { kind: 'fmadd';  vd: number; vn: number; vm: number; va: number; ftype: number }
+  | { kind: 'fmsub';  vd: number; vn: number; vm: number; va: number; ftype: number }
+  | { kind: 'fnmadd'; vd: number; vn: number; vm: number; va: number; ftype: number }
+  | { kind: 'fnmsub'; vd: number; vn: number; vm: number; va: number; ftype: number }
   // SIMD shift by immediate
   | { kind: 'simd_sshll';  Q: number; rd: number; rn: number; esize: number; shift: number }  // SSHLL/SXTL
   | { kind: 'simd_ushll';  Q: number; rd: number; rn: number; esize: number; shift: number }  // USHLL/UXTL

@@ -9,6 +9,7 @@ import { GUEST_MEM_BASE, TPIDR_OFFSET } from './types.js';
 import { loadElf, setupStack } from './elf.js';
 import { SyscallHandler } from './syscall.js';
 import { InMemoryVFS } from './vfs.js';
+import { NativeBridge } from './bridge.js';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 
@@ -294,10 +295,25 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
   btn.textContent = 'Loading...';
 
   try {
-    // Fetch busybox binary
-    const resp = await fetch('busybox-aarch64');
-    if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
-    const elfBytes = new Uint8Array(await resp.arrayBuffer());
+    // Setup native bridge (active only in WKWebView)
+    const bridge = new NativeBridge();
+    if (bridge.isNative) {
+      console.log('[jitter] Native bridge detected — filesystem calls will route to Swift');
+    }
+
+    // Load busybox binary — via bridge in native app, via fetch in browser
+    let elfBytes: Uint8Array;
+    if (bridge.isNative) {
+      const resp = await bridge.call('load_bundle_file', { name: 'busybox-aarch64' });
+      if (resp.error) throw new Error(`Failed to load busybox via bridge: ${resp.error}`);
+      const binary = atob(resp.data as string);
+      elfBytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) elfBytes[i] = binary.charCodeAt(i);
+    } else {
+      const resp = await fetch('busybox-aarch64');
+      if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
+      elfBytes = new Uint8Array(await resp.arrayBuffer());
+    }
 
     // Hide benchmark panel
     document.getElementById('bench-panel')!.style.display = 'none';
@@ -321,6 +337,15 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
     term.open(termContainer);
     fitAddon.fit();
 
+    // Suppress iOS native text input decorations on xterm's hidden textarea
+    const xtermTextarea = termContainer.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null;
+    if (xtermTextarea) {
+      xtermTextarea.setAttribute('autocorrect', 'off');
+      xtermTextarea.setAttribute('autocomplete', 'off');
+      xtermTextarea.setAttribute('autocapitalize', 'none');
+      xtermTextarea.setAttribute('spellcheck', 'false');
+    }
+
     // Resize handler
     window.addEventListener('resize', () => fitAddon.fit());
 
@@ -329,12 +354,18 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
 
     // Terminal input → IO manager
     term.onData((data: string) => {
+      if (data === '\x03') {
+        // Ctrl+C: set interrupt flag and echo ^C
+        io.interrupted = true;
+        term.write('^C\r\n');
+      }
       io.pushStdin(new TextEncoder().encode(data));
     });
 
     // Create emulator with enough memory (1024 pages = 64MB)
     const emu = new Emulator(1024);
     emu.singleBlockMode = true;
+    emu.io = io;
 
     // Setup VFS
     const vfs = new InMemoryVFS();
@@ -372,6 +403,7 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
         },
       },
       vfs,
+      bridge,
     );
 
     // Update terminal size for ioctl
@@ -383,6 +415,7 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
     emu.syscallHandler = (cpu, memory) => syscalls.handle(cpu, memory);
     emu.syscallHandlerInstance = syscalls;
     emu.elfBytes = elfBytes;
+    emu.bridge = bridge;
 
     // Status bar
     const statusBar = document.getElementById('status-bar')!;
@@ -395,9 +428,14 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
     statusBar.textContent = 'Booting...';
 
     // Run async
+    let booted = false;
     const result = await emu.runAsync(
       elfInfo.entry,
       async () => {
+        if (!booted) {
+          booted = true;
+          statusBar.textContent = 'Running';
+        }
         await io.waitForStdin();
       },
       (code) => {

@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>jitter - ARM64 Dynamic Recompiler</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -57,6 +57,13 @@
     }
     #status-bar.active {
       display: block;
+    }
+    /* Suppress iOS native text input UI for xterm.js */
+    .xterm-helper-textarea {
+      caret-color: transparent !important;
+      -webkit-user-select: none !important;
+      -webkit-text-size-adjust: none !important;
+      font-size: 16px !important; /* prevents iOS zoom on focus */
     }
   </style>
 </head>

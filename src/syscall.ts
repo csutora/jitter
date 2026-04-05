@@ -1,5 +1,6 @@
 import { CpuState } from './cpu.js';
 import { GUEST_MEM_BASE, TPIDR_OFFSET, PC_OFFSET } from './types.js';
+import type { NativeBridge } from './bridge.js';
 
 // ── Syscall result type ─────────────────────────────────────────────────────
 
@@ -8,7 +9,8 @@ export type SyscallResult =
   | { status: 'exit'; code: number }
   | { status: 'blocked_read'; fd: number }
   | { status: 'fork'; resumePC: bigint }
-  | { status: 'execve'; path: string; argv: string[]; envp: string[] };
+  | { status: 'execve'; path: string; argv: string[]; envp: string[] }
+  | { status: 'bridge'; method: string; args: Record<string, any>; apply: (resp: any) => void };
 
 // ── Error constants ─────────────────────────────────────────────────────────
 
@@ -19,6 +21,7 @@ const ENOENT = 2;
 const EPERM  = 1;
 const ENOTDIR = 20;
 const ECHILD = 10;
+const ESPIPE = 29;
 
 // ── ioctl constants ─────────────────────────────────────────────────────────
 
@@ -29,16 +32,19 @@ const TIOCSWINSZ = 0x5414;
 
 // ── fcntl constants ─────────────────────────────────────────────────────────
 
-const F_GETFL = 3;
-const F_SETFL = 4;
+const F_DUPFD = 0;
 const F_GETFD = 1;
 const F_SETFD = 2;
+const F_GETFL = 3;
+const F_SETFL = 4;
+const F_DUPFD_CLOEXEC = 1030;
 
 // ── VFS interface ───────────────────────────────────────────────────────────
 
 export interface VFS {
   open(path: string, flags: number, mode: number): number;
   close(fd: number): number;
+  dup(fd: number): number;
   read(fd: number, buf: number, count: number, memory: DataView): number;
   write(fd: number, buf: number, count: number, memory: DataView): number;
   lseek(fd: number, offset: bigint, whence: number): bigint;
@@ -75,7 +81,8 @@ type FdEntry =
   | { type: 'stdio'; fd: number }  // 0=stdin, 1=stdout, 2=stderr
   | { type: 'vfs'; fd: number }    // VFS file descriptor
   | { type: 'pipe_read'; pipe: PipeBuffer }
-  | { type: 'pipe_write'; pipe: PipeBuffer };
+  | { type: 'pipe_write'; pipe: PipeBuffer }
+  | { type: 'native'; nativeFd: number; path: string };  // Native Swift fd (via bridge)
 
 export class SyscallHandler {
   private brk: bigint;
@@ -86,8 +93,10 @@ export class SyscallHandler {
   private termRows = 24;
   private vfs?: VFS;
   private io: IOInterface;
+  private bridge?: NativeBridge;
   private fdFlags = new Map<number, number>(); // fd -> flags
   private fdTable = new Map<number, FdEntry>(); // unified fd table
+  private nativeRefs = new Map<number, number>(); // nativeFd -> refcount
   private nextFd = 3; // next available fd (0-2 are stdio)
   lastWaitStatus?: number;  // exit code from last child (set by dispatch loop)
   lastWaitPid?: number;     // PID of last exited child
@@ -96,10 +105,34 @@ export class SyscallHandler {
     brkStart: bigint,
     io: IOInterface,
     vfs?: VFS,
+    bridge?: NativeBridge,
   ) {
     this.brk = brkStart;
     this.io = io;
     this.vfs = vfs;
+    this.bridge = bridge;
+  }
+
+  /**
+   * Check if a guest path should be routed to the native Swift filesystem.
+   * Returns the resolved absolute path if bridging, or null if staying in JS.
+   *
+   * JS VFS handles: /proc, /dev, /tmp (virtual/ephemeral), /bin, /etc, /usr (busybox + config)
+   * Native Swift handles: /root, /home, /var (persistent user storage)
+   */
+  private bridgePath(path: string): string | null {
+    if (!this.bridge?.isNative) return null;
+    // Resolve relative paths using cwd
+    let resolved = path;
+    if (!path.startsWith('/')) {
+      const cwd = this.vfs?.getcwd() ?? this.cwd;
+      resolved = cwd === '/' ? '/' + path : cwd + '/' + path;
+    }
+    // Only route known persistent-storage paths to native
+    if (resolved.startsWith('/root') || resolved.startsWith('/home') || resolved.startsWith('/var')) {
+      return resolved;
+    }
+    return null;
   }
 
   setTermSize(cols: number, rows: number): void {
@@ -115,12 +148,13 @@ export class SyscallHandler {
       cwd: this.vfs ? this.vfs.getcwd() : this.cwd,
       fdFlags: new Map(this.fdFlags),
       fdTable: new Map(this.fdTable),
+      nativeRefs: new Map(this.nativeRefs),
       nextFd: this.nextFd,
     };
   }
 
   /** Restore state from process snapshot */
-  restoreState(state: { brk: bigint; mmapBase: bigint; cwd: string; fdFlags: Map<number, number>; fdTable?: Map<number, FdEntry>; nextFd?: number }): void {
+  restoreState(state: { brk: bigint; mmapBase: bigint; cwd: string; fdFlags: Map<number, number>; fdTable?: Map<number, FdEntry>; nativeRefs?: Map<number, number>; nextFd?: number }): void {
     this.brk = state.brk;
     this.mmapBase = state.mmapBase;
     if (this.vfs) {
@@ -130,6 +164,7 @@ export class SyscallHandler {
     }
     this.fdFlags = new Map(state.fdFlags);
     if (state.fdTable) this.fdTable = new Map(state.fdTable);
+    if (state.nativeRefs) this.nativeRefs = new Map(state.nativeRefs);
     if (state.nextFd !== undefined) this.nextFd = state.nextFd;
   }
 
@@ -282,6 +317,23 @@ export class SyscallHandler {
             ret = this.vfs ? BigInt(this.vfs.read(readEntry.fd, buf, count, view)) : -BigInt(EBADF);
             break;
           }
+          if (readEntry.type === 'native') {
+            return {
+              status: 'bridge', method: 'fs_read',
+              args: { fd: readEntry.nativeFd, count },
+              apply: (resp: any) => {
+                if (resp.ret < 0) {
+                  cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                } else if (resp.data) {
+                  const decoded = Uint8Array.from(atob(resp.data), c => c.charCodeAt(0));
+                  bytes.set(decoded, buf + GUEST_MEM_BASE);
+                  cpu.setReg(0, BigInt(decoded.length));
+                } else {
+                  cpu.setReg(0, BigInt(resp.ret)); // EOF or 0
+                }
+              },
+            };
+          }
           ret = -BigInt(EBADF);
           break;
         }
@@ -325,6 +377,21 @@ export class SyscallHandler {
             ret = this.vfs ? BigInt(this.vfs.write(writeEntry.fd, buf, count, view)) : -BigInt(EBADF);
             break;
           }
+          if (writeEntry.type === 'native') {
+            const writeData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
+            const b64 = btoa(String.fromCharCode(...writeData));
+            return {
+              status: 'bridge', method: 'fs_write',
+              args: { fd: writeEntry.nativeFd, data: b64 },
+              apply: (resp: any) => {
+                if (resp.ret < 0) {
+                  cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                } else {
+                  cpu.setReg(0, BigInt(resp.ret));
+                }
+              },
+            };
+          }
           ret = -BigInt(EBADF);
           break;
         }
@@ -354,6 +421,35 @@ export class SyscallHandler {
 
         // Resolve fd via fd table
         const writevEntry = this.getFdEntry(fd);
+
+        // Native fd: gather all iov data and send as one bridge write
+        if (writevEntry?.type === 'native') {
+          let totalLen = 0;
+          for (let i = 0; i < iovcnt; i++) {
+            totalLen += Number(view.getBigUint64(iovBase + i * 16 + 8 + GUEST_MEM_BASE, true));
+          }
+          const combined = new Uint8Array(totalLen);
+          let off = 0;
+          for (let i = 0; i < iovcnt; i++) {
+            const base = Number(view.getBigUint64(iovBase + i * 16 + GUEST_MEM_BASE, true));
+            const len = Number(view.getBigUint64(iovBase + i * 16 + 8 + GUEST_MEM_BASE, true));
+            if (len === 0) continue;
+            combined.set(bytes.slice(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
+            off += len;
+          }
+          const b64 = btoa(String.fromCharCode(...combined));
+          return {
+            status: 'bridge', method: 'fs_write',
+            args: { fd: writevEntry.nativeFd, data: b64 },
+            apply: (resp: any) => {
+              if (resp.ret < 0) {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              } else {
+                cpu.setReg(0, BigInt(resp.ret));
+              }
+            },
+          };
+        }
 
         for (let i = 0; i < iovcnt; i++) {
           const base = Number(view.getBigUint64(iovBase + i * 16 + GUEST_MEM_BASE, true));
@@ -404,12 +500,28 @@ export class SyscallHandler {
         const oldEntry = this.fdTable.get(oldfd);
         if (oldEntry) {
           const newfd = this.allocFd();
-          this.fdTable.set(newfd, { ...oldEntry });
+          if (oldEntry.type === 'vfs' && this.vfs) {
+            // Duplicate the underlying VFS fd so it has its own lifetime
+            const vfsFd = this.vfs.dup(oldEntry.fd);
+            if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
+            this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+          } else if (oldEntry.type === 'native') {
+            this.fdTable.set(newfd, { ...oldEntry });
+            this.nativeRefs.set(oldEntry.nativeFd, (this.nativeRefs.get(oldEntry.nativeFd) ?? 1) + 1);
+          } else {
+            this.fdTable.set(newfd, { ...oldEntry });
+          }
           ret = BigInt(newfd);
         } else if (oldfd <= 2) {
-          // Dup stdio
           const newfd = this.allocFd();
           this.fdTable.set(newfd, { type: 'stdio', fd: oldfd });
+          ret = BigInt(newfd);
+        } else if (this.vfs) {
+          // oldfd is a VFS fd not in our table — dup it in VFS
+          const vfsFd = this.vfs.dup(oldfd);
+          if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
+          const newfd = this.allocFd();
+          this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
           ret = BigInt(newfd);
         } else {
           ret = -BigInt(EBADF);
@@ -425,15 +537,37 @@ export class SyscallHandler {
         if (existingEntry) {
           if (existingEntry.type === 'pipe_write') existingEntry.pipe.writeClosed = true;
           if (existingEntry.type === 'pipe_read') existingEntry.pipe.readClosed = true;
+          if (existingEntry.type === 'vfs' && this.vfs) this.vfs.close(existingEntry.fd);
+          if (existingEntry.type === 'native') {
+            const refs = (this.nativeRefs.get(existingEntry.nativeFd) ?? 1) - 1;
+            if (refs <= 0) this.nativeRefs.delete(existingEntry.nativeFd);
+            else this.nativeRefs.set(existingEntry.nativeFd, refs);
+            // Note: we skip bridge close here for simplicity — the fd will be reused
+          }
           this.fdTable.delete(newfd);
         }
         // Duplicate oldfd to newfd
         const srcEntry = this.fdTable.get(oldfd);
         if (srcEntry) {
-          this.fdTable.set(newfd, { ...srcEntry });
+          if (srcEntry.type === 'vfs' && this.vfs) {
+            const vfsFd = this.vfs.dup(srcEntry.fd);
+            if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
+            this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+          } else if (srcEntry.type === 'native') {
+            this.fdTable.set(newfd, { ...srcEntry });
+            this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
+          } else {
+            this.fdTable.set(newfd, { ...srcEntry });
+          }
           ret = BigInt(newfd);
         } else if (oldfd <= 2) {
           this.fdTable.set(newfd, { type: 'stdio', fd: oldfd });
+          ret = BigInt(newfd);
+        } else if (this.vfs) {
+          // oldfd is a VFS fd not in our table — dup it in VFS
+          const vfsFd = this.vfs.dup(oldfd);
+          if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
+          this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
           ret = BigInt(newfd);
         } else {
           ret = -BigInt(EBADF);
@@ -444,8 +578,28 @@ export class SyscallHandler {
       // ── File operations ──
       case 56: { // openat(dirfd, path, flags, mode)
         const path = readGuestString(bytes, Number(a1));
+        const flags56 = Number(a2);
+        const mode56 = Number(a3);
+        const bp56 = this.bridgePath(path);
+        if (bp56 !== null) {
+          const guestFd = this.allocFd();
+          return {
+            status: 'bridge', method: 'fs_open',
+            args: { path: bp56, flags: flags56, mode: mode56 },
+            apply: (resp: any) => {
+              if (resp.ret < 0) {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                this.nextFd--; // reclaim
+              } else {
+                this.fdTable.set(guestFd, { type: 'native', nativeFd: resp.ret, path: bp56 });
+                this.nativeRefs.set(resp.ret, 1);
+                cpu.setReg(0, BigInt(guestFd));
+              }
+            },
+          };
+        }
         if (this.vfs) {
-          ret = BigInt(this.vfs.open(path, Number(a2), Number(a3)));
+          ret = BigInt(this.vfs.open(path, flags56, mode56));
         } else {
           ret = -BigInt(ENOENT);
         }
@@ -458,6 +612,23 @@ export class SyscallHandler {
         if (closeEntry) {
           if (closeEntry.type === 'pipe_write') closeEntry.pipe.writeClosed = true;
           if (closeEntry.type === 'pipe_read') closeEntry.pipe.readClosed = true;
+          if (closeEntry.type === 'vfs' && this.vfs) this.vfs.close(closeEntry.fd);
+          if (closeEntry.type === 'native') {
+            this.fdTable.delete(fd);
+            const nfd = closeEntry.nativeFd;
+            const refs = (this.nativeRefs.get(nfd) ?? 1) - 1;
+            if (refs <= 0) {
+              this.nativeRefs.delete(nfd);
+              return {
+                status: 'bridge', method: 'fs_close',
+                args: { fd: nfd },
+                apply: (resp: any) => { cpu.setReg(0, BigInt(resp.ret ?? 0)); },
+              };
+            }
+            this.nativeRefs.set(nfd, refs);
+            ret = 0n;
+            break;
+          }
           this.fdTable.delete(fd);
           ret = 0n;
         } else if (fd <= 2) {
@@ -471,8 +642,34 @@ export class SyscallHandler {
       }
 
       case 62: { // lseek(fd, offset, whence)
+        const lseekFd = Number(a0);
+        const lseekEntry = this.getFdEntry(lseekFd);
+        // Stdio and pipes are not seekable — return ESPIPE
+        if (lseekFd <= 2 && !lseekEntry) {
+          ret = -BigInt(ESPIPE);
+          break;
+        }
+        if (lseekEntry) {
+          if (lseekEntry.type === 'stdio' || lseekEntry.type === 'pipe_read' || lseekEntry.type === 'pipe_write') {
+            ret = -BigInt(ESPIPE);
+            break;
+          }
+          if (lseekEntry.type === 'native') {
+            return {
+              status: 'bridge', method: 'fs_lseek',
+              args: { fd: lseekEntry.nativeFd, offset: Number(a1), whence: Number(a2) },
+              apply: (resp: any) => {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              },
+            };
+          }
+          if (lseekEntry.type === 'vfs') {
+            ret = this.vfs ? this.vfs.lseek(lseekEntry.fd, a1, Number(a2)) : -BigInt(EBADF);
+            break;
+          }
+        }
         if (this.vfs) {
-          ret = this.vfs.lseek(Number(a0), a1, Number(a2));
+          ret = this.vfs.lseek(lseekFd, a1, Number(a2));
         } else {
           ret = -BigInt(EBADF);
         }
@@ -490,6 +687,19 @@ export class SyscallHandler {
           if (fstatEntry.type === 'stdio' || fstatEntry.type === 'pipe_read' || fstatEntry.type === 'pipe_write') {
             writeChardevStat(view, statBuf);
             ret = 0n;
+          } else if (fstatEntry.type === 'native') {
+            return {
+              status: 'bridge', method: 'fs_stat',
+              args: { path: fstatEntry.path },
+              apply: (resp: any) => {
+                if (resp.ret < 0) {
+                  cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                } else {
+                  writeBridgeStat(view, statBuf, resp);
+                  cpu.setReg(0, 0n);
+                }
+              },
+            };
           } else if (fstatEntry.type === 'vfs' && this.vfs) {
             ret = BigInt(this.vfs.fstat(fstatEntry.fd, statBuf, view));
           } else {
@@ -508,8 +718,24 @@ export class SyscallHandler {
 
       case 79: { // fstatat(dirfd, path, statbuf, flags)
         const path = readGuestString(bytes, Number(a1));
+        const statBuf79 = Number(a2);
+        const bp79 = this.bridgePath(path);
+        if (bp79 !== null) {
+          return {
+            status: 'bridge', method: 'fs_stat',
+            args: { path: bp79 },
+            apply: (resp: any) => {
+              if (resp.ret < 0) {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              } else {
+                writeBridgeStat(view, statBuf79, resp);
+                cpu.setReg(0, 0n);
+              }
+            },
+          };
+        }
         if (this.vfs) {
-          ret = BigInt(this.vfs.fstatat(Number(a0), path, Number(a2), Number(a3), view));
+          ret = BigInt(this.vfs.fstatat(Number(a0), path, statBuf79, Number(a3), view));
         } else {
           ret = -BigInt(ENOENT);
         }
@@ -521,6 +747,37 @@ export class SyscallHandler {
         const dirp = Number(a1);
         const count = Number(a2);
 
+        const gdEntry = this.getFdEntry(fd);
+        if (gdEntry?.type === 'native') {
+          return {
+            status: 'bridge', method: 'fs_getdents',
+            args: { fd: gdEntry.nativeFd },
+            apply: (resp: any) => {
+              if (resp.ret <= 0) {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                return;
+              }
+              // Write linux_dirent64 structs to guest memory
+              // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
+              const entries: { name: string; type: number }[] = resp.entries ?? [];
+              let offset = 0;
+              for (const entry of entries) {
+                const nameBytes = new TextEncoder().encode(entry.name);
+                const reclen = (19 + nameBytes.length + 1 + 7) & ~7; // align to 8
+                if (offset + reclen > count) break;
+                const base = dirp + offset + GUEST_MEM_BASE;
+                view.setBigUint64(base, 1n, true);          // d_ino (fake)
+                view.setBigInt64(base + 8, 0n, true);        // d_off
+                view.setUint16(base + 16, reclen, true);     // d_reclen
+                bytes[base + 18] = entry.type;                // d_type
+                bytes.set(nameBytes, base + 19);              // d_name
+                bytes[base + 19 + nameBytes.length] = 0;     // null terminator
+                offset += reclen;
+              }
+              cpu.setReg(0, BigInt(offset));
+            },
+          };
+        }
         if (this.vfs) {
           ret = BigInt(this.vfs.getdents64(fd, dirp, count, view));
         } else {
@@ -531,6 +788,16 @@ export class SyscallHandler {
 
       case 34: { // mkdirat(dirfd, path, mode)
         const path = readGuestString(bytes, Number(a1));
+        const bp34 = this.bridgePath(path);
+        if (bp34 !== null) {
+          return {
+            status: 'bridge', method: 'fs_mkdir',
+            args: { path: bp34, mode: Number(a2) },
+            apply: (resp: any) => {
+              cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+            },
+          };
+        }
         if (this.vfs) {
           ret = BigInt(this.vfs.mkdirat(path, Number(a2)));
         } else {
@@ -541,6 +808,16 @@ export class SyscallHandler {
 
       case 35: { // unlinkat(dirfd, path, flags)
         const path = readGuestString(bytes, Number(a1));
+        const bp35 = this.bridgePath(path);
+        if (bp35 !== null) {
+          return {
+            status: 'bridge', method: 'fs_unlink',
+            args: { path: bp35 },
+            apply: (resp: any) => {
+              cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+            },
+          };
+        }
         if (this.vfs) {
           ret = BigInt(this.vfs.unlinkat(path, Number(a2)));
         } else {
@@ -571,6 +848,17 @@ export class SyscallHandler {
 
       case 48: { // faccessat(dirfd, path, mode, flags)
         const path = readGuestString(bytes, Number(a1));
+        const bp48 = this.bridgePath(path);
+        if (bp48 !== null) {
+          // Use stat to check existence/access on the native side
+          return {
+            status: 'bridge', method: 'fs_stat',
+            args: { path: bp48 },
+            apply: (resp: any) => {
+              cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret < 0 ? resp.ret : 0)));
+            },
+          };
+        }
         if (this.vfs) {
           ret = BigInt(this.vfs.faccessat(Number(a0), path, Number(a2), Number(a3)));
         } else {
@@ -806,6 +1094,41 @@ export class SyscallHandler {
         const fd = Number(a0);
         const cmd = Number(a1);
         switch (cmd) {
+          case F_DUPFD:
+          case F_DUPFD_CLOEXEC: {
+            const minfd = Number(a2);
+            // Find lowest available fd >= minfd
+            let newfd = minfd;
+            while (this.fdTable.has(newfd)) newfd++;
+            // Duplicate the source fd entry
+            const srcEntry = this.fdTable.get(fd);
+            if (srcEntry) {
+              if (srcEntry.type === 'vfs' && this.vfs) {
+                const vfsFd = this.vfs.dup(srcEntry.fd);
+                if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
+                this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+              } else if (srcEntry.type === 'native') {
+                this.fdTable.set(newfd, { ...srcEntry });
+                this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
+              } else {
+                this.fdTable.set(newfd, { ...srcEntry });
+              }
+            } else if (fd <= 2) {
+              this.fdTable.set(newfd, { type: 'stdio', fd });
+            } else if (this.vfs) {
+              // fd is a VFS fd not in our table — dup it in VFS
+              const vfsFd = this.vfs.dup(fd);
+              if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
+              this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+            } else {
+              ret = -BigInt(EBADF);
+              break;
+            }
+            // Keep nextFd above any manually allocated fd
+            if (newfd >= this.nextFd) this.nextFd = newfd + 1;
+            ret = BigInt(newfd);
+            break;
+          }
           case F_GETFL:
             ret = BigInt(this.fdFlags.get(fd) ?? 0);
             break;
@@ -900,4 +1223,20 @@ function writeChardevStat(view: DataView, guestAddr: number): void {
   view.setUint32(base + 16, 0x21B6, true);
   // st_nlink = 1
   view.setUint32(base + 20, 1, true);
+}
+
+/** Write a stat struct from a bridge response (fs_stat returns mode, size, nlink, mtime) */
+function writeBridgeStat(view: DataView, guestAddr: number, resp: any): void {
+  const base = guestAddr + GUEST_MEM_BASE;
+  // Zero the whole struct (128 bytes)
+  for (let i = 0; i < 128; i += 8) {
+    view.setBigUint64(base + i, 0n, true);
+  }
+  // struct stat (aarch64 Linux):
+  // 0: st_dev (8), 8: st_ino (8), 16: st_mode (4), 20: st_nlink (4)
+  // 48: st_size (8), 88: st_mtime (8)
+  view.setUint32(base + 16, resp.mode ?? 0o100644, true);
+  view.setUint32(base + 20, resp.nlink ?? 1, true);
+  view.setBigUint64(base + 48, BigInt(resp.size ?? 0), true);
+  view.setBigUint64(base + 88, BigInt(resp.mtime ?? 0), true);
 }

@@ -600,6 +600,17 @@ function decodeDataProcReg(insn: number): DecodedInsn {
     return decodeAddSubExtReg(insn);
   }
 
+  // Add/subtract with carry: bits [28:21] = 11010000
+  if (bits(insn, 28, 21) === 0b11010000) {
+    const sf = bit(insn, 31) as 0 | 1;
+    const op = bit(insn, 30);    // 0=ADC, 1=SBC
+    const S = bit(insn, 29);     // 0=no flags, 1=set flags
+    const rm = bits(insn, 20, 16);
+    const rn = bits(insn, 9, 5);
+    const rd = bits(insn, 4, 0);
+    return { kind: op ? 'sbc' : 'adc', sf, rd, rn, rm, setFlags: S === 1 };
+  }
+
   // Conditional select: bits [28:21] = 11010100
   if (bits(insn, 28, 21) === 0b11010100) {
     return decodeCondSelect(insn);
@@ -896,6 +907,22 @@ function decodeSimdLoadStorePair(insn: number): DecodedInsn {
 // ── SIMD/FP data processing ─────────────────────────────────────────────────
 
 function decodeSimdFp(insn: number): DecodedInsn {
+  // Advanced SIMD three same: 0|Q|U|01110|size|1|Rm|opcode|1|Rn|Rd
+  if (bits(insn, 28, 24) === 0b01110 && bit(insn, 21) === 1 && bit(insn, 10) === 1) {
+    const Q = bit(insn, 30);
+    const U = bit(insn, 29);
+    const size = bits(insn, 23, 22);
+    const rm = bits(insn, 20, 16);
+    const opcode = bits(insn, 15, 11);
+    const rn = bits(insn, 9, 5);
+    const rd = bits(insn, 4, 0);
+
+    // ORR (vector, register): U=0, size=10, opcode=00011
+    if (U === 0 && size === 0b10 && opcode === 0b00011) {
+      return { kind: 'simd_orr_reg', Q, rd, rn, rm };
+    }
+  }
+
   // Advanced SIMD copy: 0|Q|op|01110000|imm5|0|imm4|1|Rn|Rd
   if (bits(insn, 28, 21) === 0b01110000 && bit(insn, 10) === 1 && bit(insn, 15) === 0) {
     return decodeSimdCopy(insn);
@@ -924,6 +951,23 @@ function decodeSimdFp(insn: number): DecodedInsn {
   // Floating-point data processing (1-source): sf=0|0|S|11110|ftype|1|0000|opcode|10000|Rn|Rd
   if (bits(insn, 28, 24) === 0b11110 && bit(insn, 21) === 1 && bits(insn, 14, 10) === 0b10000) {
     return decodeFpDataProc1(insn);
+  }
+
+  // Floating-point immediate: 0|0|0|11110|ftype|1|imm8|100|00000|Rd
+  if (bits(insn, 28, 24) === 0b11110 && bit(insn, 21) === 1 &&
+      bits(insn, 12, 10) === 0b100 && bits(insn, 9, 5) === 0) {
+    return decodeFpImm(insn);
+  }
+
+  // Floating-point compare: M|0|S|11110|ftype|1|Rm|op|1000|Rn|opcode2
+  if (bits(insn, 28, 24) === 0b11110 && bit(insn, 21) === 1 &&
+      bit(insn, 15) === 0 && bits(insn, 13, 10) === 0b1000) {
+    return decodeFpCmp(insn);
+  }
+
+  // Floating-point data processing (3-source): M|0|S|11111|ftype|o1|Rm|o0|Ra|Rn|Rd
+  if (bits(insn, 28, 24) === 0b11111) {
+    return decodeFpDataProc3(insn);
   }
 
   return { kind: 'unknown', raw: insn };
@@ -986,6 +1030,14 @@ function decodeFpIntConv(insn: number): DecodedInsn {
     // sf=1, ftype=01 → FMOV Xd, Dn  (64-bit)
     return { kind: 'fmov_from_fp', rd, vn: rn, sf };
   }
+  // FMOV to top half of 128-bit register: FMOV Vd.D[1], Xn
+  if (rmode === 0b01 && opcode === 0b111 && sf === 1 && ftype === 0b10) {
+    return { kind: 'fmov_top_to_fp', vd: rd, rn };
+  }
+  // FMOV from top half: FMOV Xd, Vn.D[1]
+  if (rmode === 0b01 && opcode === 0b110 && sf === 1 && ftype === 0b10) {
+    return { kind: 'fmov_top_from_fp', rd, vn: rn };
+  }
 
   // SCVTF: signed integer to FP
   if (rmode === 0b00 && opcode === 0b010) {
@@ -1042,6 +1094,73 @@ function decodeFpDataProc1(insn: number): DecodedInsn {
       return { kind: 'fcvt', vd: rd, vn: rn, ftype, destFtype: bits(insn, 16, 15) };
   }
 
+  return { kind: 'unknown', raw: insn };
+}
+
+// ── Floating-point immediate ────────────────────────────────────────────────
+
+function vfpExpandImm(imm8: number, ftype: number): bigint {
+  const sign = (imm8 >> 7) & 1;
+  const b = (imm8 >> 6) & 1;
+  const bcd = (imm8 >> 4) & 3;
+  const efgh = imm8 & 0xf;
+
+  if (ftype === 1) {
+    // Double precision: 64-bit
+    const exp = ((1 - b) << 10) | (b ? 0x3FC : 0) | bcd; // NOT(b):Replicate(b,8):cd
+    const frac = efgh << 48; // efgh:Zeros(48)
+    // Build the 64-bit pattern
+    return (BigInt(sign) << 63n) | (BigInt(exp) << 52n) | BigInt(frac);
+  } else {
+    // Single precision: 32-bit
+    const exp = ((1 - b) << 7) | (b ? 0x7C : 0) | bcd; // NOT(b):Replicate(b,5):cd
+    const frac = efgh << 19; // efgh:Zeros(19)
+    return BigInt(((sign << 31) | (exp << 23) | frac) >>> 0);
+  }
+}
+
+function decodeFpImm(insn: number): DecodedInsn {
+  const ftype = bits(insn, 23, 22);
+  const imm8 = bits(insn, 20, 13);
+  const rd = bits(insn, 4, 0);
+
+  const fpBits = vfpExpandImm(imm8, ftype);
+  return { kind: 'fmov_imm', vd: rd, ftype, bits: fpBits };
+}
+
+// ── Floating-point compare ──────────────────────────────────────────────────
+
+function decodeFpCmp(insn: number): DecodedInsn {
+  const ftype = bits(insn, 23, 22);
+  const rm = bits(insn, 20, 16);
+  const rn = bits(insn, 9, 5);
+  const opcode2 = bits(insn, 4, 0);
+
+  // opcode2[3] distinguishes compare with register vs #0.0
+  const withZero = (opcode2 & 0b01000) !== 0;
+  // opcode2[4] distinguishes FCMP vs FCMPE (we treat them the same — no FP exceptions)
+  return { kind: 'fcmp', vn: rn, vm: rm, ftype, withZero };
+}
+
+// ── Floating-point data processing (3-source) ──────────────────────────────
+
+function decodeFpDataProc3(insn: number): DecodedInsn {
+  const ftype = bits(insn, 23, 22);
+  const o1 = bit(insn, 21);
+  const rm = bits(insn, 20, 16);
+  const o0 = bit(insn, 15);
+  const ra = bits(insn, 14, 10);
+  const rn = bits(insn, 9, 5);
+  const rd = bits(insn, 4, 0);
+
+  // o1=0,o0=0: FMADD; o1=0,o0=1: FMSUB; o1=1,o0=0: FNMADD; o1=1,o0=1: FNMSUB
+  const variant = (o1 << 1) | o0;
+  switch (variant) {
+    case 0: return { kind: 'fmadd',  vd: rd, vn: rn, vm: rm, va: ra, ftype };
+    case 1: return { kind: 'fmsub',  vd: rd, vn: rn, vm: rm, va: ra, ftype };
+    case 2: return { kind: 'fnmadd', vd: rd, vn: rn, vm: rm, va: ra, ftype };
+    case 3: return { kind: 'fnmsub', vd: rd, vn: rn, vm: rm, va: ra, ftype };
+  }
   return { kind: 'unknown', raw: insn };
 }
 

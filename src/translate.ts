@@ -48,6 +48,12 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
         addWrite(writes, insn.rd);
         if (insn.setFlags) writes.add(NZCV_LOCAL);
         break;
+      case 'adc': case 'sbc':
+        addRead(reads, insn.rn); addRead(reads, insn.rm);
+        reads.add(NZCV_LOCAL);  // reads carry flag
+        addWrite(writes, insn.rd);
+        if (insn.setFlags) writes.add(NZCV_LOCAL);
+        break;
       case 'orr_reg':
         addRead(reads, insn.rn); addRead(reads, insn.rm);
         addWrite(writes, insn.rd);
@@ -289,19 +295,25 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
         // V registers are in linear memory, no GPR involvement
         break;
       // FMOV GPR → FP: reads GPR
-      case 'fmov_to_fp':
+      case 'fmov_to_fp': case 'fmov_top_to_fp':
         addRead(reads, insn.rn);
         break;
       // FMOV FP → GPR: writes GPR
-      case 'fmov_from_fp':
+      case 'fmov_from_fp': case 'fmov_top_from_fp':
         addWrite(writes, insn.rd);
         break;
       // FP-only / SIMD-only: no GPR involvement
       case 'fmov_fp': case 'fmul': case 'fdiv': case 'fadd': case 'fsub':
-      case 'fabs': case 'fneg': case 'fcvt':
+      case 'fabs': case 'fneg': case 'fcvt': case 'fmov_imm':
+      case 'fmadd': case 'fmsub': case 'fnmadd': case 'fnmsub':
+      case 'simd_orr_reg':
       case 'simd_sshll': case 'simd_ushll':
       case 'simd_scvtf': case 'simd_ucvtf':
       case 'simd_fcvtzs': case 'simd_fcvtzu':
+        break;
+      // FP compare: writes NZCV
+      case 'fcmp':
+        writes.add(NZCV_LOCAL);
         break;
       // FP int conversions: read/write GPRs
       case 'scvtf_int': case 'ucvtf_int':
@@ -348,6 +360,7 @@ interface HelperImports {
   f64_to_u32Idx: number;
   f32_to_f64Idx: number;
   f64_to_f32Idx: number;
+  f64_cmpIdx: number;
 }
 
 function setupHelperImports(b: WasmModuleBuilder): HelperImports {
@@ -382,6 +395,9 @@ function setupHelperImports(b: WasmModuleBuilder): HelperImports {
   const f32_to_f64Idx = b.addFunctionImport('env', 'f32_to_f64', unaryType);
   const f64_to_f32Idx = b.addFunctionImport('env', 'f64_to_f32', unaryType);
 
+  // FP compare: (i64, i64) -> i64 (returns NZCV bits)
+  const f64_cmpIdx = b.addFunctionImport('env', 'f64_cmp', helperType);
+
   return {
     smulhIdx, umulhIdx,
     f64_mulIdx, f64_divIdx, f64_addIdx, f64_subIdx,
@@ -389,6 +405,7 @@ function setupHelperImports(b: WasmModuleBuilder): HelperImports {
     f64_from_s64Idx, f64_from_u64Idx, f64_from_s32Idx, f64_from_u32Idx,
     f64_to_s64Idx, f64_to_u64Idx, f64_to_s32Idx, f64_to_u32Idx,
     f32_to_f64Idx, f64_to_f32Idx,
+    f64_cmpIdx,
   };
 }
 
@@ -457,6 +474,15 @@ const helperFunctions: Record<string, Function> = {
     // a has f64 bits; narrow to f32 bits
     const f = f64FromBits(a);
     return BigInt(f32ToBits(Math.fround(f)));
+  },
+  // FP compare: returns ARM NZCV bits (N=bit3, Z=bit2, C=bit1, V=bit0)
+  f64_cmp(a: bigint, b: bigint): bigint {
+    const fa = f64FromBits(a);
+    const fb = f64FromBits(b);
+    if (isNaN(fa) || isNaN(fb)) return 3n;  // Unordered: C=1, V=1
+    if (fa === fb) return 6n;                // Equal:     Z=1, C=1
+    if (fa < fb) return 8n;                  // Less:      N=1
+    return 2n;                               // Greater:   C=1
   },
 };
 
@@ -797,6 +823,7 @@ function emitInsn(
     case 'sub_imm': emitAddSubImm(b, insn, false, TMP0, TMP1, TMP2); break;
     case 'add_reg': emitAddSubReg(b, insn, true, TMP0, TMP1, TMP2); break;
     case 'sub_reg': emitAddSubReg(b, insn, false, TMP0, TMP1, TMP2); break;
+    case 'adc': case 'sbc': emitAdcSbc(b, insn, TMP0); break;
     case 'orr_reg': emitLogicalReg(b, insn, TMP0); break;
     case 'eor_reg': emitLogicalReg(b, insn, TMP0); break;
     case 'and_reg': emitLogicalReg(b, insn, TMP0); break;
@@ -1221,6 +1248,22 @@ function emitInsn(
       emitFmovFromFp(b, insn);
       break;
     }
+    // FMOV GPR → top half of 128-bit FP register
+    case 'fmov_top_to_fp': {
+      const vdOff = vregOffset(insn.vd);
+      b.i32_const(vdOff + 8);  // upper qword
+      emitGetReg(b, insn.rn, 1);
+      b.i64_store(3, 0);
+      break;
+    }
+    // FMOV top half of 128-bit FP register → GPR
+    case 'fmov_top_from_fp': {
+      const vnOff = vregOffset(insn.vn);
+      b.i32_const(vnOff + 8);  // upper qword
+      b.i64_load(3, 0);
+      emitSetReg(b, insn.rd, 1);
+      break;
+    }
     // FMOV between FP registers
     case 'fmov_fp': {
       emitFmovFp(b, insn);
@@ -1245,6 +1288,47 @@ function emitInsn(
     // FP precision conversion
     case 'fcvt': {
       emitFcvt(b, insn, TMP0, helpers);
+      break;
+    }
+    // FP immediate
+    case 'fmov_imm': {
+      emitFmovImm(b, insn);
+      break;
+    }
+    // FP compare
+    case 'fcmp': {
+      emitFpCmp(b, insn, helpers);
+      break;
+    }
+    // FP fused multiply-add/subtract (3-source)
+    case 'fmadd': case 'fmsub': case 'fnmadd': case 'fnmsub': {
+      emitFpMulAdd(b, insn, TMP0, helpers);
+      break;
+    }
+    // SIMD ORR (vector, register) / MOV (vector)
+    case 'simd_orr_reg': {
+      const rnOff = vregOffset(insn.rn);
+      const rmOff = vregOffset(insn.rm);
+      const rdOff = vregOffset(insn.rd);
+      // Low qword: Vn | Vm
+      b.i32_const(rdOff);
+      b.i32_const(rnOff); b.i64_load(3, 0);
+      b.i32_const(rmOff); b.i64_load(3, 0);
+      b.i64_or();
+      b.i64_store(3, 0);
+      if (insn.Q) {
+        // High qword
+        b.i32_const(rdOff + 8);
+        b.i32_const(rnOff + 8); b.i64_load(3, 0);
+        b.i32_const(rmOff + 8); b.i64_load(3, 0);
+        b.i64_or();
+        b.i64_store(3, 0);
+      } else {
+        // Q=0: clear high qword
+        b.i32_const(rdOff + 8);
+        b.i64_const(0n);
+        b.i64_store(3, 0);
+      }
       break;
     }
     // SIMD shift by immediate
@@ -1366,6 +1450,43 @@ function emitAddSubReg(
     if (isAdd) b.i64_add(); else b.i64_sub();
     emitSetReg(b, insn.rd, insn.sf);
   }
+}
+
+// ── Add/subtract with carry ──────────────────────────────────────────────────
+
+function emitAdcSbc(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'adc' | 'sbc' },
+  TMP0: number,
+): void {
+  const isSbc = insn.kind === 'sbc';
+  const mask = insn.sf ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+
+  // Extract carry: C = (NZCV >> 1) & 1
+  b.local_get(NZCV_LOCAL);
+  b.i64_const(1n);
+  b.i64_shr_u();
+  b.i64_const(1n);
+  b.i64_and();
+  b.local_set(TMP0); // TMP0 = carry
+
+  // ADC: Rd = Rn + Rm + C
+  // SBC: Rd = Rn + NOT(Rm) + C
+  emitGetReg(b, insn.rn, insn.sf);
+  emitGetReg(b, insn.rm, insn.sf);
+  if (isSbc) {
+    b.i64_const(-1n);
+    b.i64_xor(); // NOT(Rm)
+    if (insn.sf === 0) { b.i64_const(mask); b.i64_and(); }
+  }
+  b.i64_add();
+  b.local_get(TMP0); // + carry
+  b.i64_add();
+  if (insn.sf === 0) { b.i64_const(mask); b.i64_and(); }
+  emitSetReg(b, insn.rd, insn.sf);
+
+  // ADCS/SBCS: set flags — not needed for seq (only ADC/SBC without S)
+  // If setFlags were needed, we'd compute NZCV here
 }
 
 // ── Shift operand ────────────────────────────────────────────────────────────
@@ -3725,6 +3846,122 @@ function emitFcvt(
     b.local_get(TMP0);
   }
   b.i64_store(3, 0);
+  b.i32_const(vdOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── FMOV immediate ──────────────────────────────────────────────────────────
+
+function emitFmovImm(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fmov_imm' },
+): void {
+  const vdOff = vregOffset(insn.vd);
+  b.i32_const(vdOff);
+  b.i64_const(insn.bits);
+  b.i64_store(3, 0);
+  // Clear upper qword
+  b.i32_const(vdOff + 8);
+  b.i64_const(0n);
+  b.i64_store(3, 0);
+}
+
+// ── FP compare ──────────────────────────────────────────────────────────────
+
+function emitFpCmp(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fcmp' },
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  const vnOff = vregOffset(insn.vn);
+
+  // Load Vn
+  b.i32_const(vnOff);
+  b.i64_load(3, 0);
+  if (insn.ftype === 0) { b.call(helpers.f32_to_f64Idx); }
+
+  if (insn.withZero) {
+    // Compare with #0.0 (0n is +0.0 in f64 bits)
+    b.i64_const(0n);
+  } else {
+    // Load Vm
+    const vmOff = vregOffset(insn.vm);
+    b.i32_const(vmOff);
+    b.i64_load(3, 0);
+    if (insn.ftype === 0) { b.call(helpers.f32_to_f64Idx); }
+  }
+
+  b.call(helpers.f64_cmpIdx);
+  b.local_set(NZCV_LOCAL);
+}
+
+// ── FP fused multiply-add/subtract (3-source) ──────────────────────────────
+
+function emitFpMulAdd(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: 'fmadd' | 'fmsub' | 'fnmadd' | 'fnmsub' },
+  TMP0: number,
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  const vnOff = vregOffset(insn.vn);
+  const vmOff = vregOffset(insn.vm);
+  const vaOff = vregOffset(insn.va);
+  const vdOff = vregOffset(insn.vd);
+  const isF32 = insn.ftype === 0;
+
+  // FMADD:  Rd = Ra + Rn * Rm
+  // FMSUB:  Rd = Ra - Rn * Rm
+  // FNMADD: Rd = -(Ra + Rn * Rm)
+  // FNMSUB: Rd = Rn * Rm - Ra
+
+  if (insn.kind === 'fnmsub') {
+    // Rd = product - Ra: push Rn, Rm, mul, push Ra, sub
+    b.i32_const(vnOff); b.i64_load(3, 0);
+    if (isF32) { b.call(helpers.f32_to_f64Idx); }
+    b.i32_const(vmOff); b.i64_load(3, 0);
+    if (isF32) { b.call(helpers.f32_to_f64Idx); }
+    b.call(helpers.f64_mulIdx);
+    b.i32_const(vaOff); b.i64_load(3, 0);
+    if (isF32) { b.call(helpers.f32_to_f64Idx); }
+    b.call(helpers.f64_subIdx);
+  } else {
+    // All others start with Ra, then compute Rn*Rm
+    b.i32_const(vaOff); b.i64_load(3, 0);
+    if (isF32) { b.call(helpers.f32_to_f64Idx); }
+    b.i32_const(vnOff); b.i64_load(3, 0);
+    if (isF32) { b.call(helpers.f32_to_f64Idx); }
+    b.i32_const(vmOff); b.i64_load(3, 0);
+    if (isF32) { b.call(helpers.f32_to_f64Idx); }
+    b.call(helpers.f64_mulIdx);
+
+    if (insn.kind === 'fmadd' || insn.kind === 'fnmadd') {
+      b.call(helpers.f64_addIdx);    // Ra + product
+    } else {
+      b.call(helpers.f64_subIdx);    // Ra - product (FMSUB)
+    }
+
+    if (insn.kind === 'fnmadd') {
+      b.call(helpers.f64_negIdx);    // negate result
+    }
+  }
+
+  b.local_set(TMP0);
+
+  // Store result
+  b.i32_const(vdOff);
+  if (isF32) {
+    b.local_get(TMP0);
+    b.call(helpers.f64_to_f32Idx);
+  } else {
+    b.local_get(TMP0);
+  }
+  b.i64_store(3, 0);
+  // Clear upper
   b.i32_const(vdOff + 8);
   b.i64_const(0n);
   b.i64_store(3, 0);

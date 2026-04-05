@@ -1,4 +1,4 @@
-import { regOffset, SP_OFFSET, PC_OFFSET, NZCV_OFFSET } from './types.js';
+import { regOffset, SP_OFFSET, PC_OFFSET, NZCV_OFFSET, V_OFFSET } from './types.js';
 
 export class CpuState {
   readonly memory: WebAssembly.Memory;
@@ -60,5 +60,9 @@ export class CpuState {
     this.setSP(0n);
     this.setPC(0n);
     this.setNZCV(0n);
+    // Zero SIMD registers V0-V31 (32 × 16 bytes = 512 bytes)
+    for (let i = 0; i < 32 * 16; i += 8) {
+      this.view.setBigUint64(V_OFFSET + i, 0n, true);
+    }
   }
 }
