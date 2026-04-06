@@ -109,6 +109,16 @@ export class InMemoryVFS implements VFS {
     this.addFile('/etc/shells', '/bin/sh\n');
 
     this.addSymlink('/proc/self/exe', '/bin/busybox');
+
+    // Synthetic /proc files needed by LTP and other tools
+    this.addFile('/proc/meminfo',
+      'MemTotal:       1048576 kB\nMemFree:         524288 kB\nMemAvailable:    786432 kB\n' +
+      'Buffers:          65536 kB\nCached:          131072 kB\nSwapTotal:            0 kB\n' +
+      'SwapFree:             0 kB\n');
+    this.addFile('/proc/cpuinfo',
+      'processor\t: 0\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd aes sha1 sha2 crc32\n' +
+      'CPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0x000\n');
+    this.mkdirp('/proc/self/fd');
   }
 
   /** Load the busybox binary into /bin/busybox and create applet symlinks */
@@ -297,6 +307,7 @@ export class InMemoryVFS implements VFS {
   }
 
   close(fd: number): number {
+    if (!this.openFds.has(fd)) return -EBADF;
     this.openFds.delete(fd);
     return 0;
   }
@@ -397,6 +408,20 @@ export class InMemoryVFS implements VFS {
     if (newPos < 0) return BigInt(-EINVAL);
     entry.pos = newPos;
     return BigInt(newPos);
+  }
+
+  ftruncate(fd: number, length: number): number {
+    const entry = this.openFds.get(fd);
+    if (!entry || entry.type !== 'file') return -EBADF;
+    const node = entry.node;
+    if (length < node.data.length) {
+      node.data = node.data.slice(0, length);
+    } else if (length > node.data.length) {
+      const newData = new Uint8Array(length);
+      newData.set(node.data);
+      node.data = newData;
+    }
+    return 0;
   }
 
   fstat(fd: number, statBuf: number, memory: DataView): number {

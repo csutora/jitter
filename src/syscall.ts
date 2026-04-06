@@ -641,6 +641,26 @@ export class SyscallHandler {
         break;
       }
 
+      case 46: { // ftruncate(fd, length)
+        const ftFd = Number(a0);
+        const ftLen = Number(a1);
+        const ftEntry = this.getFdEntry(ftFd);
+        if (ftEntry && ftEntry.type === 'vfs' && this.vfs) {
+          ret = BigInt(this.vfs.ftruncate(ftEntry.fd, ftLen));
+        } else if (ftEntry && ftEntry.type === 'native') {
+          return {
+            status: 'bridge', method: 'fs_ftruncate',
+            args: { fd: ftEntry.nativeFd, length: ftLen },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+          };
+        } else if (this.vfs) {
+          ret = BigInt(this.vfs.ftruncate(ftFd, ftLen));
+        } else {
+          ret = -BigInt(EBADF);
+        }
+        break;
+      }
+
       case 62: { // lseek(fd, offset, whence)
         const lseekFd = Number(a0);
         const lseekEntry = this.getFdEntry(lseekFd);
@@ -864,6 +884,41 @@ export class SyscallHandler {
         } else {
           ret = -BigInt(ENOENT);
         }
+        break;
+      }
+
+      // ── chmod/chown (stubs — we run as root, permissions are a no-op) ──
+      case 53:   // fchmod(fd, mode)
+      case 54: { // fchmodat(dirfd, path, mode, flags)
+        ret = 0n;
+        break;
+      }
+      case 55: { // fchownat(dirfd, path, owner, group, flags)
+        ret = 0n;
+        break;
+      }
+
+      // ── statfs/fstatfs — return a plausible tmpfs-like result ──
+      case 43:   // statfs(path, buf)
+      case 44: { // fstatfs(fd, buf)
+        const statfsBuf = Number(nr === 43 ? a1 : a1);
+        // struct statfs on aarch64 is 120 bytes
+        // f_type = 0x01021994 (TMPFS_MAGIC)
+        const sv = new DataView(memory.buffer);
+        const base = statfsBuf + GUEST_MEM_BASE;
+        sv.setBigUint64(base + 0, 0x01021994n, true);   // f_type
+        sv.setBigUint64(base + 8, 4096n, true);          // f_bsize
+        sv.setBigUint64(base + 16, 1048576n, true);      // f_blocks
+        sv.setBigUint64(base + 24, 524288n, true);       // f_bfree
+        sv.setBigUint64(base + 32, 524288n, true);       // f_bavail
+        sv.setBigUint64(base + 40, 1048576n, true);      // f_files
+        sv.setBigUint64(base + 48, 524288n, true);       // f_ffree
+        sv.setBigUint64(base + 56, 0n, true);            // f_fsid (low)
+        sv.setBigUint64(base + 64, 255n, true);          // f_namelen
+        sv.setBigUint64(base + 72, 4096n, true);         // f_frsize
+        sv.setBigUint64(base + 80, 0n, true);            // f_flags
+        // remaining padding zeroed
+        ret = 0n;
         break;
       }
 
@@ -1167,6 +1222,22 @@ export class SyscallHandler {
       case 131: // tgkill
         ret = 0n;
         break;
+
+      case 103: // sched_setscheduler — stub
+      case 122: // sched_setaffinity — stub
+      case 123: // sched_getaffinity — stub
+        ret = 0n;
+        break;
+
+      case 115: // sched_getscheduler
+        ret = 0n; // SCHED_OTHER
+        break;
+
+      case 227: { // clock_nanosleep
+        // Just return immediately (no actual sleeping in emulator)
+        ret = 0n;
+        break;
+      }
 
       case 261: // prlimit64 — stub, return 0
         ret = 0n;

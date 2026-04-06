@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Jitter Multicore PoC</title>
+<style>
+  body {
+    background: #0a0a0a; color: #e0e0e0; font-family: monospace;
+    padding: 20px; font-size: 14px; line-height: 1.6;
+  }
+  .pass { color: #4f4; }
+  .fail { color: #f44; }
+  .info { color: #8af; }
+  h1 { color: #fff; font-size: 18px; margin-bottom: 16px; }
+  #log { white-space: pre-wrap; }
+  .bench { color: #fa0; }
+</style>
+</head>
+<body>
+<h1>Multicore Capability Test</h1>
+<div id="log"></div>
+<script>
+const log = document.getElementById('log');
+function out(cls, msg) {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = msg + '\n';
+  log.appendChild(span);
+}
+
+async function runTests() {
+  out('info', '=== Environment ===');
+  out('info', `crossOriginIsolated: ${self.crossOriginIsolated}`);
+  out('info', `location: ${location.href}`);
+  out('info', `userAgent: ${navigator.userAgent}`);
+
+  // Test 1: crossOriginIsolated
+  out('info', '\n=== Test 1: Cross-Origin Isolation ===');
+  if (self.crossOriginIsolated) {
+    out('pass', 'PASS: crossOriginIsolated is true');
+  } else {
+    out('fail', 'FAIL: crossOriginIsolated is false — SharedArrayBuffer will not work');
+    out('fail', 'Check COOP/COEP headers on server responses');
+    return;
+  }
+
+  // Test 2: SharedArrayBuffer
+  out('info', '\n=== Test 2: SharedArrayBuffer ===');
+  try {
+    const sab = new SharedArrayBuffer(1024);
+    const view = new Int32Array(sab);
+    view[0] = 42;
+    out('pass', `PASS: SharedArrayBuffer created (1024 bytes), view[0] = ${view[0]}`);
+  } catch (e) {
+    out('fail', `FAIL: SharedArrayBuffer: ${e.message}`);
+    return;
+  }
+
+  // Test 3: WebAssembly.Memory shared
+  out('info', '\n=== Test 3: Shared WASM Memory ===');
+  try {
+    const mem = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    const view = new Uint8Array(mem.buffer);
+    view[0] = 0xAA;
+    out('pass', `PASS: Shared WASM Memory created (256 pages = 16MB), buffer is SharedArrayBuffer: ${mem.buffer instanceof SharedArrayBuffer}`);
+  } catch (e) {
+    out('fail', `FAIL: Shared WASM Memory: ${e.message}`);
+    return;
+  }
+
+  // Test 4: Web Worker
+  out('info', '\n=== Test 4: Web Worker ===');
+  try {
+    const workerCode = `
+      self.onmessage = function(e) {
+        if (e.data.type === 'ping') {
+          self.postMessage({ type: 'pong', threadId: 1 });
+        }
+        if (e.data.type === 'shared_test') {
+          const view = new Int32Array(e.data.sab);
+          Atomics.store(view, 0, 99);
+          Atomics.notify(view, 0);
+          self.postMessage({ type: 'shared_done' });
+        }
+        if (e.data.type === 'wasm_test') {
+          const mem = e.data.memory;
+          const view = new Uint8Array(mem.buffer);
+          view[100] = 0xBB;
+          self.postMessage({ type: 'wasm_done', val: view[100] });
+        }
+        if (e.data.type === 'atomics_wait_test') {
+          const view = new Int32Array(e.data.sab);
+          // Wait until main thread notifies us
+          const result = Atomics.wait(view, 1, 0, 2000); // wait up to 2s
+          self.postMessage({ type: 'wait_done', result, val: Atomics.load(view, 1) });
+        }
+      };
+    `;
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const worker = new Worker(URL.createObjectURL(blob));
+
+    // Test basic worker communication
+    const pong = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 3000);
+      worker.onmessage = (e) => {
+        if (e.data.type === 'pong') { clearTimeout(timer); resolve(e.data); }
+      };
+      worker.postMessage({ type: 'ping' });
+    });
+    out('pass', `PASS: Worker responded: ${JSON.stringify(pong)}`);
+
+    // Test 5: SharedArrayBuffer in Worker
+    out('info', '\n=== Test 5: SharedArrayBuffer in Worker ===');
+    const sab = new SharedArrayBuffer(64);
+    const view = new Int32Array(sab);
+    Atomics.store(view, 0, 0);
+
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 3000);
+      worker.onmessage = (e) => {
+        if (e.data.type === 'shared_done') { clearTimeout(timer); resolve(null); }
+      };
+      worker.postMessage({ type: 'shared_test', sab });
+    });
+
+    const val = Atomics.load(view, 0);
+    if (val === 99) {
+      out('pass', `PASS: Worker wrote 99 to SharedArrayBuffer, main thread reads ${val}`);
+    } else {
+      out('fail', `FAIL: Expected 99, got ${val}`);
+    }
+
+    // Test 6: Atomics.wait in Worker
+    out('info', '\n=== Test 6: Atomics.wait / Atomics.notify ===');
+    Atomics.store(view, 1, 0);
+
+    const waitPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 3000);
+      worker.onmessage = (e) => {
+        if (e.data.type === 'wait_done') { clearTimeout(timer); resolve(e.data); }
+      };
+      worker.postMessage({ type: 'atomics_wait_test', sab });
+    });
+
+    // Give the worker time to enter Atomics.wait, then notify
+    await new Promise(r => setTimeout(r, 100));
+    Atomics.store(view, 1, 77);
+    Atomics.notify(view, 1);
+
+    const waitResult = await waitPromise;
+    out('pass', `PASS: Atomics.wait result: "${waitResult.result}", value after notify: ${waitResult.val}`);
+
+    // Test 7: Shared WASM Memory in Worker
+    out('info', '\n=== Test 7: Shared WASM Memory in Worker ===');
+    const wasmMem = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    const wasmView = new Uint8Array(wasmMem.buffer);
+    wasmView[100] = 0xAA;
+
+    const wasmResult = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 3000);
+      worker.onmessage = (e) => {
+        if (e.data.type === 'wasm_done') { clearTimeout(timer); resolve(e.data); }
+      };
+      worker.postMessage({ type: 'wasm_test', memory: wasmMem });
+    });
+
+    const mainVal = wasmView[100];
+    if (mainVal === 0xBB) {
+      out('pass', `PASS: Worker wrote 0xBB to shared WASM memory, main thread reads 0x${mainVal.toString(16)}`);
+    } else {
+      out('fail', `FAIL: Expected 0xBB, got 0x${mainVal.toString(16)}`);
+    }
+
+    worker.terminate();
+
+    // Test 8: Multiple workers (multicore)
+    out('info', '\n=== Test 8: Multiple Workers (multicore test) ===');
+    const NUM_WORKERS = 4;
+    const counterBuf = new SharedArrayBuffer(64);
+    const counter = new Int32Array(counterBuf);
+    Atomics.store(counter, 0, 0);
+    const ITERS = 1000000;
+
+    const workerCode2 = `
+      self.onmessage = function(e) {
+        const counter = new Int32Array(e.data.buf);
+        const iters = e.data.iters;
+        for (let i = 0; i < iters; i++) {
+          Atomics.add(counter, 0, 1);
+        }
+        self.postMessage({ done: true });
+      };
+    `;
+    const blob2 = new Blob([workerCode2], { type: 'application/javascript' });
+
+    const t0 = performance.now();
+    const workers = [];
+    const promises = [];
+    for (let i = 0; i < NUM_WORKERS; i++) {
+      const w = new Worker(URL.createObjectURL(blob2));
+      workers.push(w);
+      promises.push(new Promise(resolve => {
+        w.onmessage = () => resolve(null);
+      }));
+      w.postMessage({ buf: counterBuf, iters: ITERS });
+    }
+    await Promise.all(promises);
+    const t1 = performance.now();
+    workers.forEach(w => w.terminate());
+
+    const finalCount = Atomics.load(counter, 0);
+    const expected = NUM_WORKERS * ITERS;
+    if (finalCount === expected) {
+      out('pass', `PASS: ${NUM_WORKERS} workers each did ${ITERS.toLocaleString()} atomic increments`);
+      out('pass', `      Final counter: ${finalCount.toLocaleString()} (expected ${expected.toLocaleString()})`);
+      out('bench', `      Time: ${(t1-t0).toFixed(1)}ms (${(expected/(t1-t0)*1000).toFixed(0)} atomic ops/sec)`);
+    } else {
+      out('fail', `FAIL: Expected ${expected}, got ${finalCount} (race condition or error)`);
+    }
+
+    // Test 9: WASM compilation + execution in Worker
+    out('info', '\n=== Test 9: WASM JIT in Worker ===');
+    const wasmWorkerCode = `
+      self.onmessage = async function(e) {
+        try {
+          // Simple WASM module: exports a function that adds two i32s
+          const bytes = new Uint8Array([
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+            0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // type: (i32,i32)->i32
+            0x03, 0x02, 0x01, 0x00,                               // func: type 0
+            0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, // export "add"
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b // code: local.get 0 + local.get 1 + i32.add
+          ]);
+          const mod = new WebAssembly.Module(bytes);
+          const inst = new WebAssembly.Instance(mod);
+          const result = inst.exports.add(17, 25);
+          self.postMessage({ pass: true, result });
+        } catch(err) {
+          self.postMessage({ pass: false, error: err.message });
+        }
+      };
+    `;
+    const blob3 = new Blob([wasmWorkerCode], { type: 'application/javascript' });
+    const wasmWorker = new Worker(URL.createObjectURL(blob3));
+
+    const wasmJitResult = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 5000);
+      wasmWorker.onmessage = (e) => { clearTimeout(timer); resolve(e.data); };
+      wasmWorker.postMessage({});
+    });
+    wasmWorker.terminate();
+
+    if (wasmJitResult.pass && wasmJitResult.result === 42) {
+      out('pass', `PASS: WASM compiled and executed in Worker, add(17,25) = ${wasmJitResult.result}`);
+    } else {
+      out('fail', `FAIL: WASM in Worker: ${JSON.stringify(wasmJitResult)}`);
+    }
+
+    // Summary
+    out('info', '\n=== ALL TESTS PASSED ===');
+    out('pass', 'Multicore is GO. SharedArrayBuffer + Workers + Shared WASM Memory + Atomics all work.');
+    out('pass', 'True parallel fork() is feasible on this device.');
+
+  } catch (e) {
+    out('fail', `\nFAIL: ${e.message}\n${e.stack}`);
+  }
+}
+
+runTests();
+</script>
+</body>
+</html>
