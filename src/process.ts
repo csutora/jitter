@@ -59,6 +59,10 @@ export class ProcessManager {
     return this.processStack.length;
   }
 
+  getLastChildPid(): number {
+    return this.nextPid - 1;
+  }
+
   /**
    * Fork: save parent state, continue as child.
    * Returns the child PID (which will be set as parent's X0 on restore).
@@ -141,7 +145,7 @@ export class ProcessManager {
     memory: WebAssembly.Memory,
     cpu: CpuState,
     code: number,
-  ): { resumePC: bigint; childPid: number; syscallState: SyscallState } | null {
+  ): { resumePC: bigint; childPid: number; parentPid: number; syscallState: SyscallState } | null {
     if (this.processStack.length === 0) return null;
 
     const parent = this.processStack.pop()!;
@@ -162,6 +166,7 @@ export class ProcessManager {
     return {
       resumePC: parent.resumePC,
       childPid: parent.childPid,
+      parentPid: parent.pid,
       syscallState: parent.syscallState,
     };
   }

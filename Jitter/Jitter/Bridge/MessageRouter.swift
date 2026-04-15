@@ -19,6 +19,126 @@ class MessageRouter: NSObject, WKScriptMessageHandler {
     private func setupHandlers() {
         let fs = NativeFS()
         self.nativeFS = fs
+        let net = NetworkBridge()
+
+        // ── Network bridge ──
+
+        handlers["net_socket"] = { [weak self] id, args in
+            guard let domain = args["domain"] as? Int,
+                  let type = args["type"] as? Int,
+                  let proto = args["protocol"] as? Int else {
+                self?.respond(id: id, result: ["ret": -22])
+                return
+            }
+            let result = net.socket(domain: domain, type: type, protocol: proto)
+            self?.respond(id: id, result: result)
+        }
+
+        handlers["net_connect"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let family = args["family"] as? Int,
+                  let host = args["host"] as? String,
+                  let port = args["port"] as? Int else {
+                self?.respond(id: id, result: ["ret": -22])
+                return
+            }
+            net.connect(socketId: socketId, family: family, host: host, port: port) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_bind"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let family = args["family"] as? Int,
+                  let host = args["host"] as? String,
+                  let port = args["port"] as? Int else {
+                self?.respond(id: id, result: ["ret": -22])
+                return
+            }
+            net.bind(socketId: socketId, family: family, host: host, port: port) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_listen"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let backlog = args["backlog"] as? Int else {
+                self?.respond(id: id, result: ["ret": -22])
+                return
+            }
+            net.listen(socketId: socketId, backlog: backlog) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_accept"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int else {
+                self?.respond(id: id, result: ["ret": -9])
+                return
+            }
+            net.accept(socketId: socketId) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_read"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let count = args["count"] as? Int else {
+                self?.respond(id: id, result: ["ret": -9])
+                return
+            }
+            net.read(socketId: socketId, count: count) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_write"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let data = args["data"] as? String else {
+                self?.respond(id: id, result: ["ret": -22])
+                return
+            }
+            net.write(socketId: socketId, data: data) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_close"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int else {
+                self?.respond(id: id, result: ["ret": -9])
+                return
+            }
+            let result = net.close(socketId: socketId)
+            self?.respond(id: id, result: result)
+        }
+
+        handlers["net_poll"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let timeoutMs = args["timeoutMs"] as? Int else {
+                self?.respond(id: id, result: ["ret": 0])
+                return
+            }
+            net.poll(socketId: socketId, timeoutMs: timeoutMs) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_sendto"] = { [weak self] id, args in
+            guard let socketId = args["socketId"] as? Int,
+                  let data = args["data"] as? String,
+                  let host = args["host"] as? String,
+                  let port = args["port"] as? Int else {
+                self?.respond(id: id, result: ["ret": -22])
+                return
+            }
+            net.sendto(socketId: socketId, data: data, host: host, port: port) { result in
+                self?.respond(id: id, result: result)
+            }
+        }
+
+        handlers["net_sockopt"] = { [weak self] id, _ in
+            self?.respond(id: id, result: ["ret": 0])
+        }
 
         handlers["ping"] = { [weak self] id, _ in
             self?.respond(id: id, result: ["pong": true])

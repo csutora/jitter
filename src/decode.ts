@@ -907,6 +907,61 @@ function decodeSimdLoadStorePair(insn: number): DecodedInsn {
 // ── SIMD/FP data processing ─────────────────────────────────────────────────
 
 function decodeSimdFp(insn: number): DecodedInsn {
+  // Advanced SIMD table lookup (TBL/TBX): 0|Q|001110|op2|0|Rm|0|len|op|0|Rn|Rd
+  if (bits(insn, 28, 24) === 0b01110 && bit(insn, 29) === 0 && bit(insn, 21) === 0 &&
+      bit(insn, 15) === 0 && bit(insn, 10) === 0) {
+    const Q = bit(insn, 30);
+    const rm = bits(insn, 20, 16);
+    const len = bits(insn, 14, 13); // 0 = 1 register, 1 = 2 registers, etc.
+    const op = bit(insn, 12); // 0 = TBL, 1 = TBX
+    const rn = bits(insn, 9, 5);
+    const rd = bits(insn, 4, 0);
+    return { kind: 'simd_tbl', Q, rd, rn, rm, len, op };
+  }
+
+  // Advanced SIMD permute (ZIP1/ZIP2/UZP1/UZP2/TRN1/TRN2): 0|Q|001110|size|0|Rm|0|opcode|10|Rn|Rd
+  if (bits(insn, 28, 24) === 0b01110 && bit(insn, 21) === 0 && bits(insn, 11, 10) === 0b10) {
+    const Q = bit(insn, 30);
+    const size = bits(insn, 23, 22);
+    const rm = bits(insn, 20, 16);
+    const opcode = bits(insn, 14, 12);
+    const rn = bits(insn, 9, 5);
+    const rd = bits(insn, 4, 0);
+    switch (opcode) {
+      case 0b001: return { kind: 'simd_uzp1', Q, rd, rn, rm, size };
+      case 0b010: return { kind: 'simd_trn1', Q, rd, rn, rm, size };
+      case 0b011: return { kind: 'simd_zip1', Q, rd, rn, rm, size };
+      case 0b101: return { kind: 'simd_uzp2', Q, rd, rn, rm, size };
+      case 0b110: return { kind: 'simd_trn2', Q, rd, rn, rm, size };
+      case 0b111: return { kind: 'simd_zip2', Q, rd, rn, rm, size };
+    }
+  }
+
+  // Advanced SIMD two-reg misc: 0|Q|U|01110|size|10000|opcode|10|Rn|Rd
+  // bit[21]=1, bits[20:17]=0000, bits[11:10]=10
+  if (bits(insn, 28, 24) === 0b01110 && bit(insn, 21) === 1 &&
+      bits(insn, 20, 17) === 0b0000 && bits(insn, 11, 10) === 0b10) {
+    const Q = bit(insn, 30);
+    const U = bit(insn, 29);
+    const size = bits(insn, 23, 22);
+    const opcode = bits(insn, 16, 12);
+    const rn = bits(insn, 9, 5);
+    const rd = bits(insn, 4, 0);
+
+    // NOT (bitwise): U=1, size=00, opcode=00101
+    if (U === 1 && opcode === 0b00101) return { kind: 'simd_not', Q, rd, rn };
+    // NEG: U=1, opcode=01011
+    if (U === 1 && opcode === 0b01011) return { kind: 'simd_neg', Q, rd, rn, size };
+    // ABS: U=0, opcode=01011
+    if (U === 0 && opcode === 0b01011) return { kind: 'simd_abs', Q, rd, rn, size };
+    // CNT: U=0, size=00, opcode=00101
+    if (U === 0 && size === 0 && opcode === 0b00101) return { kind: 'simd_cnt', Q, rd, rn };
+    // CLS: U=0, opcode=00100
+    if (U === 0 && opcode === 0b00100) return { kind: 'simd_cls_vec', Q, rd, rn, size };
+    // CLZ: U=1, opcode=00100
+    if (U === 1 && opcode === 0b00100) return { kind: 'simd_clz_vec', Q, rd, rn, size };
+  }
+
   // Advanced SIMD three same: 0|Q|U|01110|size|1|Rm|opcode|1|Rn|Rd
   if (bits(insn, 28, 24) === 0b01110 && bit(insn, 21) === 1 && bit(insn, 10) === 1) {
     const Q = bit(insn, 30);
@@ -917,10 +972,34 @@ function decodeSimdFp(insn: number): DecodedInsn {
     const rn = bits(insn, 9, 5);
     const rd = bits(insn, 4, 0);
 
-    // ORR (vector, register): U=0, size=10, opcode=00011
-    if (U === 0 && size === 0b10 && opcode === 0b00011) {
-      return { kind: 'simd_orr_reg', Q, rd, rn, rm };
+    // Bitwise: ORR, AND, BIC, EOR (size=00-11 encodes the operation, not element size)
+    if (opcode === 0b00011) {
+      if (U === 0 && size === 0b10) return { kind: 'simd_orr_reg', Q, rd, rn, rm };
+      if (U === 0 && size === 0b00) return { kind: 'simd_and_reg', Q, rd, rn, rm };
+      if (U === 0 && size === 0b01) return { kind: 'simd_bic_reg', Q, rd, rn, rm };
+      if (U === 1 && size === 0b10) return { kind: 'simd_eor_reg', Q, rd, rn, rm };
     }
+
+    // ADD/SUB (integer vector)
+    if (U === 0 && opcode === 0b10000) return { kind: 'simd_add', Q, rd, rn, rm, size };
+    if (U === 1 && opcode === 0b10000) return { kind: 'simd_sub', Q, rd, rn, rm, size };
+
+    // CMEQ (register): U=1, opcode=10001
+    if (U === 1 && opcode === 0b10001) return { kind: 'simd_cmeq_reg', Q, rd, rn, rm, size };
+
+    // CMGT (signed greater): U=0, opcode=00110
+    if (U === 0 && opcode === 0b00110) return { kind: 'simd_cmgt_reg', Q, rd, rn, rm, size };
+    // CMHI (unsigned higher): U=1, opcode=00110
+    if (U === 1 && opcode === 0b00110) return { kind: 'simd_cmhi_reg', Q, rd, rn, rm, size };
+    // CMGE (signed >=): U=0, opcode=00111
+    if (U === 0 && opcode === 0b00111) return { kind: 'simd_cmge_reg', Q, rd, rn, rm, size };
+    // CMHS (unsigned >=): U=1, opcode=00111
+    if (U === 1 && opcode === 0b00111) return { kind: 'simd_cmhs_reg', Q, rd, rn, rm, size };
+
+    // UMAXP (unsigned max pairwise): U=1, size=XX, opcode=10100
+    if (U === 1 && opcode === 0b10100) return { kind: 'simd_umaxp', Q, rd, rn, rm, size };
+    // ADDP (add pairwise): U=0, opcode=10111
+    if (U === 0 && opcode === 0b10111) return { kind: 'simd_addp', Q, rd, rn, rm, size };
   }
 
   // Advanced SIMD copy: 0|Q|op|01110000|imm5|0|imm4|1|Rn|Rd

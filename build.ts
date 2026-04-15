@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync } from
 
 mkdirSync('dist', { recursive: true });
 
+// Bundle main entry point
 const result = await esbuild.build({
   entryPoints: ['src/index.ts'],
   bundle: true,
@@ -13,6 +14,18 @@ const result = await esbuild.build({
 });
 
 const js = result.outputFiles![0].text;
+
+// Bundle worker entry point (separate file — Workers can't be inlined)
+// Safari/WebKit doesn't support module Workers, so use IIFE format
+await esbuild.build({
+  entryPoints: ['src/worker.ts'],
+  bundle: true,
+  format: 'iife',
+  target: 'es2022',
+  minify: false,
+  outfile: 'dist/worker.js',
+});
+console.log('Built dist/worker.js');
 
 // Read xterm.js CSS
 let xtermCss = '';

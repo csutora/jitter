@@ -4,41 +4,40 @@ struct ContentView: View {
     @State private var messageRouter = MessageRouter()
     @State private var server: LocalServer?
 
-    // Set to true to run the multicore capability test instead of the emulator
-    private let multicoreTest = true
-
     var body: some View {
         Group {
-            if multicoreTest, let server = server {
-                MulticoreTestView(server: server)
+            if let server = server {
+                EmulatorWebView(messageRouter: messageRouter, baseURL: server.baseURL)
             } else {
-                EmulatorWebView(messageRouter: messageRouter)
+                ProgressView("Starting server...")
+                    .foregroundStyle(.white)
             }
         }
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
         .onAppear {
-            if multicoreTest {
-                startServer()
-            }
+            startServer()
         }
     }
 
     private func startServer() {
-        // Serve from the app bundle's Resources directory
         let fm = FileManager.default
         let webDir = fm.temporaryDirectory.appendingPathComponent("jitter-web", isDirectory: true)
         try? fm.createDirectory(at: webDir, withIntermediateDirectories: true)
 
-        // Copy test page + any other resources to the serving directory
-        let filesToCopy = ["multicore-test.html", "index.html", "busybox-aarch64"]
-        for name in filesToCopy {
+        // Copy all resources to the serving directory
+        let filesToCopy = [
+            ("index", "html"),
+            ("busybox-aarch64", nil),
+            ("worker", "js"),
+            ("multicore-test", "html"),
+        ]
+        for (base, ext) in filesToCopy {
+            let name = ext != nil ? "\(base).\(ext!)" : base
             let dest = webDir.appendingPathComponent(name)
             try? fm.removeItem(at: dest)
-            let ext = (name as NSString).pathExtension
-            let base = (name as NSString).deletingPathExtension
-            if let src = Bundle.main.url(forResource: base, withExtension: ext.isEmpty ? nil : ext) {
+            if let src = Bundle.main.url(forResource: base, withExtension: ext) {
                 try? fm.copyItem(at: src, to: dest)
             }
         }

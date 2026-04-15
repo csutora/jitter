@@ -10,6 +10,7 @@ import { loadElf, setupStack } from './elf.js';
 import { SyscallHandler } from './syscall.js';
 import { InMemoryVFS } from './vfs.js';
 import { NativeBridge } from './bridge.js';
+import { Kernel } from './kernel.js';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 
@@ -349,13 +350,61 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
     // Resize handler
     window.addEventListener('resize', () => fitAddon.fit());
 
+    // Status bar
+    const statusBar = document.getElementById('status-bar')!;
+    statusBar.classList.add('active');
+
+    // Hide other buttons
+    setButtons(false);
+    btn.style.display = 'none';
+
+    statusBar.textContent = 'Booting...';
+
+    // ── Multicore path: use Kernel + Web Workers when cross-origin isolated ──
+    const useMulticore = self.crossOriginIsolated;
+
+    if (useMulticore) {
+      console.log('[jitter] Multicore mode: crossOriginIsolated=true, using Web Workers');
+      statusBar.textContent = 'Booting (multicore)...';
+
+      const kernel = new Kernel({
+        elfBytes,
+        workerURL: 'worker.js',
+        onOutput: (data: Uint8Array) => {
+          term.write(translateNewlines(data));
+        },
+        bridge: bridge.isNative ? bridge : undefined,
+      });
+
+      // Terminal input → kernel stdin
+      term.onData((data: string) => {
+        if (data === '\x03') {
+          kernel.sendInterrupt();
+          term.write('^C\r\n');
+          return;
+        }
+        kernel.pushStdin(new TextEncoder().encode(data));
+      });
+
+      // Boot the shell in a Worker
+      kernel.boot(
+        ['sh'],
+        ['HOME=/root', 'TERM=xterm-256color', 'PATH=/bin', 'PWD=/'],
+      );
+
+      statusBar.textContent = 'Running (multicore)';
+      return;
+    }
+
+    // ── Single-thread fallback: use Emulator on main thread ──
+    console.log('[jitter] Single-thread mode: crossOriginIsolated=false, using main thread emulator');
+
     // Setup IO manager
     const io = new IOManager();
 
     // Terminal input → IO manager
     term.onData((data: string) => {
       if (data === '\x03') {
-        // Ctrl+C: set interrupt flag and echo ^C
         io.interrupted = true;
         term.write('^C\r\n');
       }
@@ -416,16 +465,6 @@ log('Click a benchmark to run, or Boot Shell to launch busybox sh.');
     emu.syscallHandlerInstance = syscalls;
     emu.elfBytes = elfBytes;
     emu.bridge = bridge;
-
-    // Status bar
-    const statusBar = document.getElementById('status-bar')!;
-    statusBar.classList.add('active');
-
-    // Hide other buttons
-    setButtons(false);
-    btn.style.display = 'none';
-
-    statusBar.textContent = 'Booting...';
 
     // Run async
     let booted = false;

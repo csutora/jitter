@@ -3,15 +3,15 @@ import WebKit
 import ObjectiveC
 
 /// UIViewRepresentable wrapping a WKWebView that loads the jitter emulator.
+/// Content is served via a local HTTP server with COOP/COEP headers to enable
+/// SharedArrayBuffer, Web Workers, and Atomics for multicore process execution.
 struct EmulatorWebView: UIViewRepresentable {
     let messageRouter: MessageRouter
+    let baseURL: URL
 
     func makeUIView(context: Context) -> JitterWebView {
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
-
-        // Allow file:// access for fetch('busybox-aarch64')
-        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
 
         // Register JS→Swift bridge
         let contentController = WKUserContentController()
@@ -19,6 +19,7 @@ struct EmulatorWebView: UIViewRepresentable {
         config.userContentController = contentController
 
         let webView = JitterWebView(frame: .zero, configuration: config)
+        webView.isInspectable = true  // Enable Safari Web Inspector
         webView.isOpaque = false
         webView.backgroundColor = UIColor(red: 10/255, green: 10/255, blue: 10/255, alpha: 1)
         webView.scrollView.backgroundColor = webView.backgroundColor
@@ -27,24 +28,9 @@ struct EmulatorWebView: UIViewRepresentable {
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
 
-        // Copy bundle assets to tmp so WKWebView can fetch() them without sandbox issues
-        let fm = FileManager.default
-        let webDir = fm.temporaryDirectory.appendingPathComponent("jitter-web", isDirectory: true)
-        try? fm.createDirectory(at: webDir, withIntermediateDirectories: true)
-
-        let filesToCopy = ["index.html", "busybox-aarch64"]
-        for name in filesToCopy {
-            let dest = webDir.appendingPathComponent(name)
-            // Always overwrite to pick up new builds
-            try? fm.removeItem(at: dest)
-            if let src = Bundle.main.url(forResource: name == "index.html" ? "index" : "busybox-aarch64",
-                                         withExtension: name == "index.html" ? "html" : nil) {
-                try? fm.copyItem(at: src, to: dest)
-            }
-        }
-
-        let htmlURL = webDir.appendingPathComponent("index.html")
-        webView.loadFileURL(htmlURL, allowingReadAccessTo: webDir)
+        // Load from local HTTP server (not file:// — we need COOP/COEP headers for SharedArrayBuffer)
+        let indexURL = baseURL.appendingPathComponent("index.html")
+        webView.load(URLRequest(url: indexURL))
 
         // Keep a reference so MessageRouter can call evaluateJavaScript
         messageRouter.webView = webView
@@ -55,12 +41,7 @@ struct EmulatorWebView: UIViewRepresentable {
     func updateUIView(_ webView: JitterWebView, context: Context) {}
 }
 
-/// WKWebView subclass that suppresses iOS keyboard chrome (accessory bar, assistant pill, etc.)
-///
-/// WKWebView delegates text input to an internal WKContentView. We use the ObjC runtime to
-/// create a subclass of WKContentView that overrides inputAccessoryView (the bar above the
-/// keyboard) and various text input traits. We also strip the inputAssistantItem bar button
-/// groups (the floating language/dictate/arrow pill on iPadOS).
+/// WKWebView subclass that suppresses iOS keyboard chrome.
 class JitterWebView: WKWebView {
     override var inputAccessoryView: UIView? { nil }
 
@@ -83,7 +64,6 @@ class JitterWebView: WKWebView {
             String(describing: type(of: $0)).hasPrefix("WKContent")
         }) else { return }
 
-        // --- 1. Swizzle the class to override inputAccessoryView ---
         let className = "JitterWKContentView_NoAccessory"
         var cls: AnyClass? = NSClassFromString(className)
 
@@ -92,7 +72,6 @@ class JitterWebView: WKWebView {
            let cName = className.cString(using: .ascii) {
             cls = objc_allocateClassPair(parentClass, cName, 0)
 
-            // inputAccessoryView → nil
             let nilHelper = NilReturner.self
             if let m = class_getInstanceMethod(nilHelper, #selector(getter: NilReturner.inputAccessoryView)) {
                 class_addMethod(cls, #selector(getter: UIResponder.inputAccessoryView),
@@ -106,7 +85,6 @@ class JitterWebView: WKWebView {
             object_setClass(contentView, cls)
         }
 
-        // --- 2. Strip the keyboard assistant item (floating pill on iPadOS) ---
         if let responder = contentView as? UIResponder {
             let item = responder.inputAssistantItem
             item.leadingBarButtonGroups = []
@@ -117,7 +95,6 @@ class JitterWebView: WKWebView {
     }
 }
 
-/// ObjC helper: returns nil for inputAccessoryView.
 private class NilReturner: NSObject {
     @objc var inputAccessoryView: AnyObject? { nil }
 }

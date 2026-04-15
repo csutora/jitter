@@ -131,7 +131,7 @@ function runElf(elfPath: string, argv: string[], stdinText = ''): ElfResult | nu
       continue;
     }
 
-    if (totalInsns >= 100_000_000 || blockCount >= 2_000_000) {
+    if (totalInsns >= 10_000_000 || blockCount >= 1_000_000) {
       console.warn(`Limit reached: ${totalInsns} insns, ${blockCount} blocks`);
       break;
     }
@@ -151,6 +151,8 @@ function runElf(elfPath: string, argv: string[], stdinText = ''): ElfResult | nu
 // ── Auto-discover and run conformance test binaries ──────────────────────────
 
 const binDir = join(__dirname, 'conformance', 'bin');
+const ltpDir = join(binDir, 'ltp');
+
 let testBinaries: string[] = [];
 try {
   testBinaries = readdirSync(binDir)
@@ -158,6 +160,13 @@ try {
     .sort();
 } catch {
   // bin dir doesn't exist — tests will skip
+}
+
+let ltpBinaries: string[] = [];
+try {
+  ltpBinaries = readdirSync(ltpDir).sort();
+} catch {
+  // ltp dir doesn't exist — skip
 }
 
 describe('conformance', () => {
@@ -198,6 +207,50 @@ describe('conformance', () => {
       // Also check that no "not ok" lines appear in output
       const notOkLines = output.split('\n').filter(l => l.startsWith('not ok'));
       expect(notOkLines, `Failed assertions:\n${notOkLines.join('\n')}`).toHaveLength(0);
+    });
+  }
+});
+
+// ── LTP tests ───────────────────────────────────────────────────────────────
+
+describe('ltp', () => {
+  if (ltpBinaries.length === 0) {
+    it('skipped — no LTP binaries found', () => {
+      console.log('Cross-compile LTP and place binaries in tests/conformance/bin/ltp/');
+    });
+    return;
+  }
+
+  for (const bin of ltpBinaries) {
+    it(bin, () => {
+      const result = runElf(join(ltpDir, bin), [bin]);
+      if (!result) {
+        console.log(`Binary not found: ${bin}`);
+        return;
+      }
+
+      const output = (result.stderr + '\n' + result.stdout).trim();
+
+      // LTP output format: lines containing TPASS, TFAIL, TBROK, TCONF
+      const passed = (output.match(/TPASS/g) || []).length;
+      const failed = (output.match(/TFAIL/g) || []).length;
+      const broken = (output.match(/TBROK/g) || []).length;
+      const skipped = (output.match(/TCONF/g) || []).length;
+
+      console.log(`${bin}: ${passed} pass, ${failed} fail, ${broken} broken, ${skipped} skip | ${result.totalInsns.toLocaleString()} insns`);
+      if (failed > 0 || broken > 0) {
+        // Print the failing lines
+        const failLines = output.split('\n').filter(l => /TFAIL|TBROK/.test(l));
+        console.log(failLines.join('\n'));
+      }
+
+      if (result.haltInfo) {
+        console.error(result.haltInfo);
+      }
+
+      // LTP test passes if exit code is 0 (pass) or 4 (warn) and no TFAIL lines
+      expect([0, 4], `${bin} exited with code ${result.exitCode}`).toContain(result.exitCode);
+      expect(failed, `${bin} had ${failed} TFAIL results`).toBe(0);
     });
   }
 });

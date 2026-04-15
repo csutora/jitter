@@ -108,6 +108,31 @@ export type DecodedInsn =
   | { kind: 'simd_movi';     Q: number; rd: number; imm8: number; cmode: number; op: number }
   | { kind: 'simd_ins_gpr';  rd: number; rn: number; esize: number; index: number }
   | { kind: 'simd_orr_reg';  Q: number; rd: number; rn: number; rm: number }  // ORR/MOV (vector)
+  | { kind: 'simd_and_reg';  Q: number; rd: number; rn: number; rm: number }
+  | { kind: 'simd_bic_reg';  Q: number; rd: number; rn: number; rm: number }
+  | { kind: 'simd_eor_reg';  Q: number; rd: number; rn: number; rm: number }
+  | { kind: 'simd_add';      Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_sub';      Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_cmeq_reg'; Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_cmgt_reg'; Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_cmhi_reg'; Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_cmge_reg'; Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_cmhs_reg'; Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_umaxp';    Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_addp';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_tbl';      Q: number; rd: number; rn: number; rm: number; len: number; op: number }
+  | { kind: 'simd_zip1';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_zip2';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_uzp1';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_uzp2';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_trn1';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_trn2';     Q: number; rd: number; rn: number; rm: number; size: number }
+  | { kind: 'simd_not';      Q: number; rd: number; rn: number }
+  | { kind: 'simd_neg';      Q: number; rd: number; rn: number; size: number }
+  | { kind: 'simd_abs';      Q: number; rd: number; rn: number; size: number }
+  | { kind: 'simd_cnt';      Q: number; rd: number; rn: number }
+  | { kind: 'simd_cls_vec';  Q: number; rd: number; rn: number; size: number }
+  | { kind: 'simd_clz_vec';  Q: number; rd: number; rn: number; size: number }
   // FMOV between GPR and FP registers
   | { kind: 'fmov_to_fp';    vd: number; rn: number; sf: 0|1 }  // FMOV Sn/Dn, Wm/Xm
   | { kind: 'fmov_from_fp';  rd: number; vn: number; sf: 0|1 }  // FMOV Wn/Xn, Sm/Dm
@@ -308,4 +333,23 @@ export interface CompiledRegion {
   run: () => bigint;       // returns next PC (outside region)
   entryPC: bigint;
   blockPCs: bigint[];      // all block start PCs in this region
+}
+
+// ── Compiled modules (for JIT cache sharing across Workers) ─────────────────
+// A compiled module holds the WASM bytecode (Module), which can be instantiated
+// multiple times with different Memory imports. This is the split between the
+// expensive compile step and the cheap instantiate step.
+
+export interface CompiledBlockModule {
+  module: WebAssembly.Module;
+  startPC: bigint;
+  endPC: bigint;
+  insnCount: number;
+  isSelfLoop: boolean;
+}
+
+export interface CompiledRegionModule {
+  module: WebAssembly.Module;
+  entryPC: bigint;
+  blockPCs: bigint[];
 }

@@ -3,7 +3,7 @@ import {
   ValType, BLOCKTYPE_VOID, HALT_PC, SVC_PC,
   regOffset, vregOffset, SP_OFFSET, NZCV_OFFSET, ITER_OFFSET, TPIDR_OFFSET, PC_OFFSET, GUEST_MEM_BASE, V_OFFSET,
 } from './types.js';
-import type { DecodedInsn, ShiftType, CompiledBlock, CompiledRegion } from './types.js';
+import type { DecodedInsn, ShiftType, CompiledBlock, CompiledRegion, CompiledBlockModule, CompiledRegionModule } from './types.js';
 import type { BasicBlock, Region } from './block.js';
 
 // ── Register local mapping ──────────────────────────────────────────────────
@@ -68,18 +68,20 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
         if (insn.setFlags) writes.add(NZCV_LOCAL);
         break;
       case 'and_imm':
-        // For logical immediates, R31 = SP (not XZR)
-        if (insn.rn === 31) reads.add(SP_LOCAL); else addRead(reads, insn.rn);
+        // For logical immediates, Rn=31 is XZR (not SP)
+        addRead(reads, insn.rn);
         if (insn.setFlags) {
           // ANDS: Rd=31 is XZR
           addWrite(writes, insn.rd);
           writes.add(NZCV_LOCAL);
         } else {
+          // AND non-flag: Rd=31 is SP
           if (insn.rd === 31) writes.add(SP_LOCAL); else addWrite(writes, insn.rd);
         }
         break;
       case 'orr_imm': case 'eor_imm':
-        if (insn.rn === 31) reads.add(SP_LOCAL); else addRead(reads, insn.rn);
+        // Rn=31 is XZR, Rd=31 is SP
+        addRead(reads, insn.rn);
         if (insn.rd === 31) writes.add(SP_LOCAL); else addWrite(writes, insn.rd);
         break;
       case 'movz':
@@ -306,7 +308,16 @@ function analyzeRegUsage(insns: DecodedInsn[]): RegUsage {
       case 'fmov_fp': case 'fmul': case 'fdiv': case 'fadd': case 'fsub':
       case 'fabs': case 'fneg': case 'fcvt': case 'fmov_imm':
       case 'fmadd': case 'fmsub': case 'fnmadd': case 'fnmsub':
-      case 'simd_orr_reg':
+      case 'simd_orr_reg': case 'simd_and_reg': case 'simd_bic_reg': case 'simd_eor_reg':
+      case 'simd_add': case 'simd_sub':
+      case 'simd_cmeq_reg': case 'simd_cmgt_reg': case 'simd_cmhi_reg':
+      case 'simd_cmge_reg': case 'simd_cmhs_reg':
+      case 'simd_umaxp': case 'simd_addp':
+      case 'simd_tbl':
+      case 'simd_zip1': case 'simd_zip2': case 'simd_uzp1': case 'simd_uzp2':
+      case 'simd_trn1': case 'simd_trn2':
+      case 'simd_not': case 'simd_neg': case 'simd_abs':
+      case 'simd_cnt': case 'simd_cls_vec': case 'simd_clz_vec':
       case 'simd_sshll': case 'simd_ushll':
       case 'simd_scvtf': case 'simd_ucvtf':
       case 'simd_fcvtzs': case 'simd_fcvtzu':
@@ -361,6 +372,7 @@ interface HelperImports {
   f32_to_f64Idx: number;
   f64_to_f32Idx: number;
   f64_cmpIdx: number;
+  simd_opIdx: number;
 }
 
 function setupHelperImports(b: WasmModuleBuilder): HelperImports {
@@ -398,6 +410,10 @@ function setupHelperImports(b: WasmModuleBuilder): HelperImports {
   // FP compare: (i64, i64) -> i64 (returns NZCV bits)
   const f64_cmpIdx = b.addFunctionImport('env', 'f64_cmp', helperType);
 
+  // SIMD generic operation: (opcode_packed, extra_packed) -> 0
+  // Operates on V registers in linear memory directly
+  const simd_opIdx = b.addFunctionImport('env', 'simd_op', helperType);
+
   return {
     smulhIdx, umulhIdx,
     f64_mulIdx, f64_divIdx, f64_addIdx, f64_subIdx,
@@ -406,6 +422,7 @@ function setupHelperImports(b: WasmModuleBuilder): HelperImports {
     f64_to_s64Idx, f64_to_u64Idx, f64_to_s32Idx, f64_to_u32Idx,
     f32_to_f64Idx, f64_to_f32Idx,
     f64_cmpIdx,
+    simd_opIdx,
   };
 }
 
@@ -486,6 +503,209 @@ const helperFunctions: Record<string, Function> = {
   },
 };
 
+// ── SIMD operation helper (per-memory closure) ──────────────────────────────
+
+// Operation codes for simd_op
+const SIMD_ADD = 1, SIMD_SUB = 2;
+const SIMD_CMEQ = 10, SIMD_CMGT = 11, SIMD_CMHI = 12, SIMD_CMGE = 13, SIMD_CMHS = 14;
+const SIMD_UMAXP = 20, SIMD_ADDP = 21;
+const SIMD_TBL = 30;
+const SIMD_ZIP1 = 40, SIMD_ZIP2 = 41, SIMD_UZP1 = 42, SIMD_UZP2 = 43;
+const SIMD_TRN1 = 44, SIMD_TRN2 = 45;
+
+function createSimdOp(memory: WebAssembly.Memory) {
+  return function simd_op(packed: bigint, _extra: bigint): bigint {
+    const op = Number((packed >> 56n) & 0xFFn);
+    const Q = Number((packed >> 48n) & 0xFFn);
+    const size = Number((packed >> 40n) & 0xFFn);
+    const extra = Number((packed >> 32n) & 0xFFn);
+    const rd = Number((packed >> 24n) & 0xFFn);
+    const rn = Number((packed >> 16n) & 0xFFn);
+    const rm = Number((packed >> 8n) & 0xFFn);
+
+    const buf = new Uint8Array(memory.buffer);
+    const view = new DataView(memory.buffer);
+    const vn = V_OFFSET + rn * 16;
+    const vm = V_OFFSET + rm * 16;
+    const vd = V_OFFSET + rd * 16;
+    const bytes = Q ? 16 : 8;
+    const esize = 1 << size; // element size in bytes
+
+    // Read source vectors
+    const a = new Uint8Array(16), b_ = new Uint8Array(16), dst = new Uint8Array(16);
+    a.set(buf.subarray(vn, vn + bytes));
+    b_.set(buf.subarray(vm, vm + bytes));
+
+    const aView = new DataView(a.buffer);
+    const bView = new DataView(b_.buffer);
+    const dView = new DataView(dst.buffer);
+    const elems = bytes / esize;
+
+    switch (op) {
+      case SIMD_ADD:
+        for (let i = 0; i < elems; i++) {
+          if (esize === 1) dView.setUint8(i, (aView.getUint8(i) + bView.getUint8(i)) & 0xFF);
+          else if (esize === 2) dView.setUint16(i*2, (aView.getUint16(i*2, true) + bView.getUint16(i*2, true)) & 0xFFFF, true);
+          else if (esize === 4) dView.setUint32(i*4, (aView.getUint32(i*4, true) + bView.getUint32(i*4, true)) >>> 0, true);
+          else dView.setBigUint64(i*8, BigInt.asUintN(64, aView.getBigUint64(i*8, true) + bView.getBigUint64(i*8, true)), true);
+        }
+        break;
+      case SIMD_SUB:
+        for (let i = 0; i < elems; i++) {
+          if (esize === 1) dView.setUint8(i, (aView.getUint8(i) - bView.getUint8(i)) & 0xFF);
+          else if (esize === 2) dView.setUint16(i*2, (aView.getUint16(i*2, true) - bView.getUint16(i*2, true)) & 0xFFFF, true);
+          else if (esize === 4) dView.setUint32(i*4, (aView.getUint32(i*4, true) - bView.getUint32(i*4, true)) >>> 0, true);
+          else dView.setBigUint64(i*8, BigInt.asUintN(64, aView.getBigUint64(i*8, true) - bView.getBigUint64(i*8, true)), true);
+        }
+        break;
+      case SIMD_CMEQ:
+        for (let i = 0; i < elems; i++) {
+          let eq: boolean;
+          if (esize === 1) eq = aView.getUint8(i) === bView.getUint8(i);
+          else if (esize === 2) eq = aView.getUint16(i*2, true) === bView.getUint16(i*2, true);
+          else if (esize === 4) eq = aView.getUint32(i*4, true) === bView.getUint32(i*4, true);
+          else eq = aView.getBigUint64(i*8, true) === bView.getBigUint64(i*8, true);
+          // Result is all-ones if equal, all-zeros if not
+          if (esize === 1) dView.setUint8(i, eq ? 0xFF : 0);
+          else if (esize === 2) dView.setUint16(i*2, eq ? 0xFFFF : 0, true);
+          else if (esize === 4) dView.setUint32(i*4, eq ? 0xFFFFFFFF : 0, true);
+          else dView.setBigUint64(i*8, eq ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
+        }
+        break;
+      case SIMD_CMGT: // signed greater than
+        for (let i = 0; i < elems; i++) {
+          let gt: boolean;
+          if (esize === 1) gt = aView.getInt8(i) > bView.getInt8(i);
+          else if (esize === 2) gt = aView.getInt16(i*2, true) > bView.getInt16(i*2, true);
+          else if (esize === 4) gt = aView.getInt32(i*4, true) > bView.getInt32(i*4, true);
+          else gt = aView.getBigInt64(i*8, true) > bView.getBigInt64(i*8, true);
+          if (esize <= 4) dView.setUint32(i * esize, gt ? (esize === 1 ? 0xFF : esize === 2 ? 0xFFFF : 0xFFFFFFFF) : 0, true);
+          else dView.setBigUint64(i*8, gt ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
+        }
+        break;
+      case SIMD_CMHI: // unsigned higher
+        for (let i = 0; i < elems; i++) {
+          let hi: boolean;
+          if (esize === 1) hi = aView.getUint8(i) > bView.getUint8(i);
+          else if (esize === 2) hi = aView.getUint16(i*2, true) > bView.getUint16(i*2, true);
+          else if (esize === 4) hi = aView.getUint32(i*4, true) > bView.getUint32(i*4, true);
+          else hi = aView.getBigUint64(i*8, true) > bView.getBigUint64(i*8, true);
+          if (esize <= 4) { const mask = esize === 1 ? 0xFF : esize === 2 ? 0xFFFF : 0xFFFFFFFF; if (esize === 1) dView.setUint8(i, hi ? 0xFF : 0); else if (esize === 2) dView.setUint16(i*2, hi ? 0xFFFF : 0, true); else dView.setUint32(i*4, hi ? 0xFFFFFFFF : 0, true); }
+          else dView.setBigUint64(i*8, hi ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
+        }
+        break;
+      case SIMD_CMGE: // signed >=
+      case SIMD_CMHS: // unsigned >=
+        for (let i = 0; i < elems; i++) {
+          let ge: boolean;
+          if (op === SIMD_CMGE) {
+            if (esize === 1) ge = aView.getInt8(i) >= bView.getInt8(i);
+            else if (esize === 2) ge = aView.getInt16(i*2, true) >= bView.getInt16(i*2, true);
+            else if (esize === 4) ge = aView.getInt32(i*4, true) >= bView.getInt32(i*4, true);
+            else ge = aView.getBigInt64(i*8, true) >= bView.getBigInt64(i*8, true);
+          } else {
+            if (esize === 1) ge = aView.getUint8(i) >= bView.getUint8(i);
+            else if (esize === 2) ge = aView.getUint16(i*2, true) >= bView.getUint16(i*2, true);
+            else if (esize === 4) ge = aView.getUint32(i*4, true) >= bView.getUint32(i*4, true);
+            else ge = aView.getBigUint64(i*8, true) >= bView.getBigUint64(i*8, true);
+          }
+          if (esize === 1) dView.setUint8(i, ge ? 0xFF : 0);
+          else if (esize === 2) dView.setUint16(i*2, ge ? 0xFFFF : 0, true);
+          else if (esize === 4) dView.setUint32(i*4, ge ? 0xFFFFFFFF : 0, true);
+          else dView.setBigUint64(i*8, ge ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
+        }
+        break;
+      case SIMD_UMAXP: { // unsigned max pairwise
+        const total = elems * 2; // concat Vn:Vm
+        const all = new Uint8Array(32);
+        all.set(a.subarray(0, bytes), 0);
+        all.set(b_.subarray(0, bytes), bytes);
+        const allView = new DataView(all.buffer);
+        for (let i = 0; i < elems; i++) {
+          const off1 = i * 2 * esize;
+          const off2 = off1 + esize;
+          let v1: number | bigint, v2: number | bigint, mx: number | bigint;
+          if (esize === 1) { v1 = allView.getUint8(off1); v2 = allView.getUint8(off2); mx = v1 > v2 ? v1 : v2; dView.setUint8(i, mx); }
+          else if (esize === 2) { v1 = allView.getUint16(off1, true); v2 = allView.getUint16(off2, true); mx = v1 > v2 ? v1 : v2; dView.setUint16(i*2, mx, true); }
+          else if (esize === 4) { v1 = allView.getUint32(off1, true); v2 = allView.getUint32(off2, true); mx = v1 > v2 ? v1 : v2; dView.setUint32(i*4, mx, true); }
+          else { v1 = allView.getBigUint64(off1, true); v2 = allView.getBigUint64(off2, true); mx = v1 > v2 ? v1 : v2; dView.setBigUint64(i*8, mx, true); }
+        }
+        break;
+      }
+      case SIMD_ADDP: { // add pairwise
+        const all = new Uint8Array(32);
+        all.set(a.subarray(0, bytes), 0);
+        all.set(b_.subarray(0, bytes), bytes);
+        const allView = new DataView(all.buffer);
+        for (let i = 0; i < elems; i++) {
+          const off1 = i * 2 * esize;
+          const off2 = off1 + esize;
+          if (esize === 1) dView.setUint8(i, (allView.getUint8(off1) + allView.getUint8(off2)) & 0xFF);
+          else if (esize === 2) dView.setUint16(i*2, (allView.getUint16(off1, true) + allView.getUint16(off2, true)) & 0xFFFF, true);
+          else if (esize === 4) dView.setUint32(i*4, (allView.getUint32(off1, true) + allView.getUint32(off2, true)) >>> 0, true);
+          else dView.setBigUint64(i*8, BigInt.asUintN(64, allView.getBigUint64(off1, true) + allView.getBigUint64(off2, true)), true);
+        }
+        break;
+      }
+      case SIMD_TBL: { // table lookup
+        const len = extra; // number of consecutive table registers (0-3 = 1-4 regs)
+        const tableSize = (len + 1) * 16;
+        const table = new Uint8Array(tableSize);
+        for (let r = 0; r <= len; r++) {
+          const vr = V_OFFSET + ((rn + r) & 31) * 16;
+          table.set(buf.subarray(vr, vr + 16), r * 16);
+        }
+        for (let i = 0; i < bytes; i++) {
+          const idx = b_[i];
+          dst[i] = idx < tableSize ? table[idx] : 0;
+        }
+        break;
+      }
+      case SIMD_ZIP1: case SIMD_ZIP2: { // interleave
+        const half = op === SIMD_ZIP1 ? 0 : elems / 2;
+        for (let i = 0; i < elems / 2; i++) {
+          const srcIdx = half + i;
+          const dstIdx = i * 2;
+          if (esize === 1) { dst[dstIdx] = a[srcIdx]; dst[dstIdx + 1] = b_[srcIdx]; }
+          else if (esize === 2) { dView.setUint16(dstIdx*2, aView.getUint16(srcIdx*2, true), true); dView.setUint16((dstIdx+1)*2, bView.getUint16(srcIdx*2, true), true); }
+          else if (esize === 4) { dView.setUint32(dstIdx*4, aView.getUint32(srcIdx*4, true), true); dView.setUint32((dstIdx+1)*4, bView.getUint32(srcIdx*4, true), true); }
+          else { dView.setBigUint64(dstIdx*8, aView.getBigUint64(srcIdx*8, true), true); dView.setBigUint64((dstIdx+1)*8, bView.getBigUint64(srcIdx*8, true), true); }
+        }
+        break;
+      }
+      case SIMD_UZP1: case SIMD_UZP2: { // de-interleave
+        const phase = op === SIMD_UZP1 ? 0 : 1;
+        for (let i = 0; i < elems / 2; i++) {
+          const srcIdx = i * 2 + phase;
+          if (esize === 1) { dst[i] = a[srcIdx]; dst[i + elems/2] = b_[srcIdx]; }
+          else if (esize === 2) { dView.setUint16(i*2, aView.getUint16(srcIdx*2, true), true); dView.setUint16((i+elems/2)*2, bView.getUint16(srcIdx*2, true), true); }
+          else if (esize === 4) { dView.setUint32(i*4, aView.getUint32(srcIdx*4, true), true); dView.setUint32((i+elems/2)*4, bView.getUint32(srcIdx*4, true), true); }
+          else { dView.setBigUint64(i*8, aView.getBigUint64(srcIdx*8, true), true); dView.setBigUint64((i+elems/2)*8, bView.getBigUint64(srcIdx*8, true), true); }
+        }
+        break;
+      }
+      case SIMD_TRN1: case SIMD_TRN2: { // transpose
+        const phase = op === SIMD_TRN1 ? 0 : 1;
+        for (let i = 0; i < elems / 2; i++) {
+          const evenIdx = i * 2;
+          if (esize === 1) { dst[evenIdx] = a[evenIdx + phase]; dst[evenIdx + 1] = b_[evenIdx + phase]; }
+          else if (esize === 2) { dView.setUint16(evenIdx*2, aView.getUint16((evenIdx+phase)*2, true), true); dView.setUint16((evenIdx+1)*2, bView.getUint16((evenIdx+phase)*2, true), true); }
+          else if (esize === 4) { dView.setUint32(evenIdx*4, aView.getUint32((evenIdx+phase)*4, true), true); dView.setUint32((evenIdx+1)*4, bView.getUint32((evenIdx+phase)*4, true), true); }
+          else { dView.setBigUint64(evenIdx*8, aView.getBigUint64((evenIdx+phase)*8, true), true); dView.setBigUint64((evenIdx+1)*8, bView.getBigUint64((evenIdx+phase)*8, true), true); }
+        }
+        break;
+      }
+    }
+
+    // Write result
+    buf.set(dst.subarray(0, bytes), vd);
+    if (!Q) { // Zero upper half for 64-bit vector ops
+      buf.fill(0, vd + 8, vd + 16);
+    }
+    return 0n;
+  };
+}
+
 // ── Translate a basic block to a compiled WASM module ────────────────────────
 
 // The NEXT_PC local stores the return value. Branch instructions write to it
@@ -536,18 +756,63 @@ export function translateBlock(
   b.exportFunction('run');
 
   const bytes = b.finalize();
-
-  // Debug: dump WASM bytes for specific block
   const mod = new WebAssembly.Module(bytes);
-  const instance = new WebAssembly.Instance(mod, { env: { memory, ...helperFunctions } });
-  const run = instance.exports.run as () => bigint;
 
+  return instantiateBlock(
+    { module: mod, startPC: block.startPC, endPC: block.endPC, insnCount: block.insns.length, isSelfLoop: block.isSelfLoop },
+    memory,
+  );
+}
+
+/** Compile a basic block to a reusable WebAssembly.Module (expensive, cacheable). */
+export function compileBlock(
+  block: BasicBlock,
+  memory: WebAssembly.Memory,
+): CompiledBlockModule {
+  const b = new WasmModuleBuilder();
+  b.addMemoryImport('env', 'memory', 256);
+  const helpers = setupHelperImports(b);
+  const typeIdx = b.addFuncType([], [ValType.I64]);
+  b.beginFunction(typeIdx);
+  b.addLocals(ValType.I64, REG_COUNT + 6);
+  const TMP0 = REG_COUNT, TMP1 = REG_COUNT + 1, TMP2 = REG_COUNT + 2, TMP3 = REG_COUNT + 3;
+  const usage = analyzeRegUsage(block.insns);
+  const allUsed = new Set([...usage.reads, ...usage.writes]);
+  emitPrologue(b, allUsed);
+  b.i64_const(HALT_PC);
+  b.local_set(NEXT_PC_LOCAL);
+  if (block.isSelfLoop) {
+    emitSelfLoopBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers);
+  } else {
+    emitLinearBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers);
+    emitEpilogue(b, usage.writes);
+  }
+  b.local_get(NEXT_PC_LOCAL);
+  b.endFunction();
+  b.exportFunction('run');
+  const bytes = b.finalize();
   return {
-    run,
+    module: new WebAssembly.Module(bytes),
     startPC: block.startPC,
     endPC: block.endPC,
     insnCount: block.insns.length,
     isSelfLoop: block.isSelfLoop,
+  };
+}
+
+/** Instantiate a compiled block module with a specific Memory (cheap, per-Worker). */
+export function instantiateBlock(
+  compiled: CompiledBlockModule,
+  memory: WebAssembly.Memory,
+): CompiledBlock {
+  const env = { memory, ...helperFunctions, simd_op: createSimdOp(memory) };
+  const instance = new WebAssembly.Instance(compiled.module, { env });
+  return {
+    run: instance.exports.run as () => bigint,
+    startPC: compiled.startPC,
+    endPC: compiled.endPC,
+    insnCount: compiled.insnCount,
+    isSelfLoop: compiled.isSelfLoop,
   };
 }
 
@@ -1331,6 +1596,77 @@ function emitInsn(
       }
       break;
     }
+    // SIMD NOT (bitwise complement)
+    case 'simd_not': {
+      const rnOff = vregOffset(insn.rn);
+      const rdOff = vregOffset(insn.rd);
+      b.i32_const(rdOff);
+      b.i32_const(rnOff); b.i64_load(3, 0);
+      b.i64_const(-1n); b.i64_xor();
+      b.i64_store(3, 0);
+      b.i32_const(rdOff + 8);
+      if (insn.Q) {
+        b.i32_const(rnOff + 8); b.i64_load(3, 0);
+        b.i64_const(-1n); b.i64_xor();
+      } else {
+        b.i64_const(0n);
+      }
+      b.i64_store(3, 0);
+      break;
+    }
+
+    // SIMD NEG, ABS, CNT, CLS, CLZ (two-reg misc) — use JS helper
+    case 'simd_neg': case 'simd_abs':
+    case 'simd_cnt': case 'simd_cls_vec': case 'simd_clz_vec': {
+      // TODO: implement properly. For now halt (these are less common)
+      b.i64_const(HALT_PC);
+      b.local_set(NEXT_PC_LOCAL);
+      break;
+    }
+
+    // SIMD bitwise operations (AND, BIC, EOR)
+    case 'simd_and_reg': case 'simd_bic_reg': case 'simd_eor_reg': {
+      const rnOff = vregOffset(insn.rn);
+      const rmOff = vregOffset(insn.rm);
+      const rdOff = vregOffset(insn.rd);
+      const op = insn.kind === 'simd_and_reg' ? 'and' : insn.kind === 'simd_bic_reg' ? 'bic' : 'eor';
+      // Low qword
+      b.i32_const(rdOff);
+      b.i32_const(rnOff); b.i64_load(3, 0);
+      b.i32_const(rmOff); b.i64_load(3, 0);
+      if (op === 'bic') { b.i64_const(-1n); b.i64_xor(); b.i64_and(); }
+      else if (op === 'and') { b.i64_and(); }
+      else { b.i64_xor(); }
+      b.i64_store(3, 0);
+      // High qword
+      b.i32_const(rdOff + 8);
+      if (insn.Q) {
+        b.i32_const(rnOff + 8); b.i64_load(3, 0);
+        b.i32_const(rmOff + 8); b.i64_load(3, 0);
+        if (op === 'bic') { b.i64_const(-1n); b.i64_xor(); b.i64_and(); }
+        else if (op === 'and') { b.i64_and(); }
+        else { b.i64_xor(); }
+      } else {
+        b.i64_const(0n);
+      }
+      b.i64_store(3, 0);
+      break;
+    }
+
+    // SIMD integer ADD/SUB — element-wise via helper function
+    case 'simd_add': case 'simd_sub':
+    case 'simd_cmeq_reg': case 'simd_cmgt_reg': case 'simd_cmhi_reg':
+    case 'simd_cmge_reg': case 'simd_cmhs_reg':
+    case 'simd_umaxp': case 'simd_addp':
+    case 'simd_tbl':
+    case 'simd_zip1': case 'simd_zip2': case 'simd_uzp1': case 'simd_uzp2':
+    case 'simd_trn1': case 'simd_trn2': {
+      // These all need element-wise processing — emit JS helper calls
+      // For now, use a WASM→JS helper approach: call out to JS for the operation
+      emitSimdThreeSameGeneric(b, insn, TMP0, helpers);
+      break;
+    }
+
     // SIMD shift by immediate
     case 'simd_sshll': case 'simd_ushll': {
       emitSimdShiftLong(b, insn, TMP0);
@@ -1589,8 +1925,8 @@ function emitLogicalImm(
   insn: DecodedInsn & { kind: 'and_imm' | 'orr_imm' | 'eor_imm' },
   TMP0: number,
 ): void {
-  // For logical immediates, Rn=31 is always SP
-  emitGetRegSP(b, insn.rn, insn.sf);
+  // For logical immediates, Rn=31 is XZR (not SP)
+  emitGetReg(b, insn.rn, insn.sf);
   b.i64_const(insn.imm);
   switch (insn.kind) {
     case 'and_imm': b.i64_and(); break;
@@ -1711,13 +2047,12 @@ function emitMulLong(
 
   // Add or subtract Ra
   if (isSub) {
-    // Xd = Ra - product
+    // Stack: [product]. Need: Ra - product
+    // Store product to temp, push Ra, push product, subtract
+    const tmpLocal = regLocal(insn.rd); // safe to use as temp since we'll overwrite rd
+    b.local_set(tmpLocal);
     emitGetReg(b, insn.ra, 1);
-    // Stack: [product, Ra] → need Ra - product
-    // Swap: use a temp approach
-    b.local_set(regLocal(insn.rd)); // temp store product
-    emitGetReg(b, insn.ra, 1);
-    b.local_get(regLocal(insn.rd));
+    b.local_get(tmpLocal);
     b.i64_sub();
   } else {
     // Xd = product + Ra
@@ -3026,13 +3361,24 @@ export function translateRegion(
 
   const bytes = b.finalize();
   const mod = new WebAssembly.Module(bytes);
-  const instance = new WebAssembly.Instance(mod, { env: { memory, ...helperFunctions } });
-  const run = instance.exports.run as () => bigint;
 
+  return instantiateRegion(
+    { module: mod, entryPC: blocks[0].startPC, blockPCs: blocks.map(bl => bl.startPC) },
+    memory,
+  );
+}
+
+/** Instantiate a compiled region module with a specific Memory (cheap, per-Worker). */
+export function instantiateRegion(
+  compiled: CompiledRegionModule,
+  memory: WebAssembly.Memory,
+): CompiledRegion {
+  const env = { memory, ...helperFunctions, simd_op: createSimdOp(memory) };
+  const instance = new WebAssembly.Instance(compiled.module, { env });
   return {
-    run,
-    entryPC: blocks[0].startPC,
-    blockPCs: blocks.map(bl => bl.startPC),
+    run: instance.exports.run as () => bigint,
+    entryPC: compiled.entryPC,
+    blockPCs: compiled.blockPCs,
   };
 }
 
@@ -3849,6 +4195,50 @@ function emitFcvt(
   b.i32_const(vdOff + 8);
   b.i64_const(0n);
   b.i64_store(3, 0);
+}
+
+// ── SIMD three-same generic (via JS helper) ─────────────────────────────────
+
+function emitSimdThreeSameGeneric(
+  b: WasmModuleBuilder,
+  insn: DecodedInsn & { kind: string; Q: number; rd: number; rn: number; rm: number },
+  TMP0: number,
+  helpers?: HelperImports,
+): void {
+  if (!helpers) return;
+
+  // Map instruction kind to operation code
+  let op = 0, size = 0, extra = 0;
+  switch (insn.kind) {
+    case 'simd_add': op = SIMD_ADD; break;
+    case 'simd_sub': op = SIMD_SUB; break;
+    case 'simd_cmeq_reg': op = SIMD_CMEQ; break;
+    case 'simd_cmgt_reg': op = SIMD_CMGT; break;
+    case 'simd_cmhi_reg': op = SIMD_CMHI; break;
+    case 'simd_cmge_reg': op = SIMD_CMGE; break;
+    case 'simd_cmhs_reg': op = SIMD_CMHS; break;
+    case 'simd_umaxp': op = SIMD_UMAXP; break;
+    case 'simd_addp': op = SIMD_ADDP; break;
+    case 'simd_tbl': op = SIMD_TBL; extra = (insn as any).len ?? 0; break;
+    case 'simd_zip1': op = SIMD_ZIP1; break;
+    case 'simd_zip2': op = SIMD_ZIP2; break;
+    case 'simd_uzp1': op = SIMD_UZP1; break;
+    case 'simd_uzp2': op = SIMD_UZP2; break;
+    case 'simd_trn1': op = SIMD_TRN1; break;
+    case 'simd_trn2': op = SIMD_TRN2; break;
+    default: return; // unknown, emit nothing (will HALT)
+  }
+  size = (insn as any).size ?? 0;
+
+  // Pack: op|Q|size|extra|rd|rn|rm|0 into a single i64
+  const packed = (BigInt(op) << 56n) | (BigInt(insn.Q) << 48n) | (BigInt(size) << 40n) |
+    (BigInt(extra) << 32n) | (BigInt(insn.rd) << 24n) | (BigInt(insn.rn) << 16n) |
+    (BigInt(insn.rm) << 8n);
+
+  b.i64_const(packed);
+  b.i64_const(0n); // unused second arg
+  b.call(helpers.simd_opIdx);
+  b.drop(); // discard return value
 }
 
 // ── FMOV immediate ──────────────────────────────────────────────────────────

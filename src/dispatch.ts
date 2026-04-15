@@ -27,6 +27,7 @@ export class Emulator {
   processManager = new ProcessManager();
   /** ELF bytes for execve (busybox binary) */
   elfBytes?: Uint8Array;
+  private _trampolineInstalled = false;
   /** Native bridge for Swift filesystem calls */
   bridge?: NativeBridge;
 
@@ -71,6 +72,11 @@ export class Emulator {
   }
 
   run(startPC: bigint, maxInsns?: number): RunResult {
+    // Install signal trampoline if not already done
+    if (this.syscallHandlerInstance && !this._trampolineInstalled) {
+      this.syscallHandlerInstance.installSignalTrampoline(this.memory);
+      this._trampolineInstalled = true;
+    }
     this.cpu.setPC(startPC);
     let pc = startPC;
     let totalInsns = 0;
@@ -99,11 +105,12 @@ export class Emulator {
             // Check if this is a child process exit
             const restored = this.processManager.exit(this.memory, this.cpu, result.code);
             if (restored) {
-              // Parent restored — set up wait4 state
+              // Parent restored — set up wait4 state and restore PID
               if (this.syscallHandlerInstance) {
                 this.syscallHandlerInstance.lastWaitStatus = result.code;
                 this.syscallHandlerInstance.lastWaitPid = restored.childPid;
                 this.syscallHandlerInstance.restoreState(restored.syscallState);
+                this.syscallHandlerInstance.currentPid = restored.parentPid;
               }
               pc = restored.resumePC;
               continue;
@@ -117,11 +124,15 @@ export class Emulator {
           }
           if (result.status === 'fork') {
             if (this.syscallHandlerInstance) {
+              const parentPid = this.syscallHandlerInstance.currentPid;
               this.processManager.fork(
                 this.memory, this.cpu,
                 this.syscallHandlerInstance.getState(),
                 result.resumePC,
               );
+              // Child gets a new PID
+              this.syscallHandlerInstance.currentPid = this.processManager.getLastChildPid();
+              this.syscallHandlerInstance.currentPpid = parentPid;
             }
             // Child continues at resumePC with X0=0 (set by fork())
             pc = result.resumePC;
@@ -145,6 +156,34 @@ export class Emulator {
         }
         // Resume at PC + 4
         pc = svcPC + 4n;
+
+        // Check for pending signals and deliver them
+        if (this.syscallHandlerInstance?.pendingSignals.length) {
+          while (this.syscallHandlerInstance.pendingSignals.length > 0) {
+            const sig = this.syscallHandlerInstance.pendingSignals.shift()!;
+            const result2 = this.syscallHandlerInstance.deliverSignal(this.cpu, this.memory, sig);
+            if (result2.action === 'exit') {
+              const restored = this.processManager.exit(this.memory, this.cpu, result2.exitCode ?? 128 + sig);
+              if (restored) {
+                if (this.syscallHandlerInstance) {
+                  this.syscallHandlerInstance.lastWaitStatus = result2.exitCode ?? 128 + sig;
+                  this.syscallHandlerInstance.lastWaitPid = restored.childPid;
+                  this.syscallHandlerInstance.restoreState(restored.syscallState);
+                  this.syscallHandlerInstance.currentPid = restored.parentPid;
+                }
+                pc = restored.resumePC;
+                break;
+              }
+              pc = HALT_PC;
+              break;
+            }
+            if (result2.delivered && result2.action === 'continue') {
+              // Signal handler was set up — PC has been redirected to the handler
+              pc = this.cpu.getPC();
+              break;
+            }
+          }
+        }
         continue;
       }
 
