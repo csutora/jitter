@@ -5555,6 +5555,7 @@
   var EINVAL = 22;
   var ENOENT = 2;
   var EPERM = 1;
+  var ENOTDIR = 20;
   var ECHILD = 10;
   var ESPIPE = 29;
   var MAX_FDS = 1024;
@@ -5607,6 +5608,10 @@
     // nativeFd -> refcount
     nextFd = 3;
     // next available fd (0-2 are stdio)
+    // Stat cache: populated from getdents, consumed by fs_stat. Avoids N+1 bridge calls for ls -l.
+    // Path → {mode, size, nlink, mtime, expiresAt (ms since epoch)}
+    statCache = /* @__PURE__ */ new Map();
+    STAT_CACHE_TTL_MS = 1e3;
     lastWaitStatus;
     // exit code from last child (set by dispatch loop)
     lastWaitPid;
@@ -5619,22 +5624,32 @@
     }
     /**
      * Check if a guest path should be routed to the native Swift filesystem.
-     * Returns the resolved absolute path if bridging, or null if staying in JS.
+     * Returns the resolved absolute path if bridging, or null if staying in JS VFS.
      *
-     * JS VFS handles: /proc, /dev, /tmp (virtual/ephemeral), /bin, /etc, /usr (busybox + config)
-     * Native Swift handles: /root, /home, /var (persistent user storage)
+     * JS VFS handles: /proc, /dev (virtual, per-process)
+     * Native Swift handles: everything else (/bin, /etc, /tmp, /root, /home, /var, /usr, ...)
      */
     bridgePath(path) {
-      if (!this.bridge?.isNative) return null;
+      if (!this.bridge?.isNative && !this.bridgeAvailable) return null;
       let resolved = path;
       if (!path.startsWith("/")) {
         const cwd = this.vfs?.getcwd() ?? this.cwd;
         resolved = cwd === "/" ? "/" + path : cwd + "/" + path;
       }
-      if (resolved.startsWith("/root") || resolved.startsWith("/home") || resolved.startsWith("/var")) {
-        return resolved;
+      const parts = [];
+      for (const p of resolved.split("/")) {
+        if (p === "" || p === ".") continue;
+        if (p === "..") {
+          parts.pop();
+          continue;
+        }
+        parts.push(p);
       }
-      return null;
+      resolved = "/" + parts.join("/");
+      if (resolved === "/proc" || resolved.startsWith("/proc/") || resolved === "/dev" || resolved.startsWith("/dev/")) {
+        return null;
+      }
+      return resolved;
     }
     setTermSize(cols, rows) {
       this.termCols = cols;
@@ -6029,6 +6044,7 @@
             if (writeEntry.type === "native") {
               const writeData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
               const b64 = btoa(String.fromCharCode(...writeData));
+              this.statCache.delete(writeEntry.path);
               return {
                 status: "bridge",
                 method: "fs_write",
@@ -6453,6 +6469,7 @@
           if (ftEntry && ftEntry.type === "vfs" && this.vfs) {
             ret = BigInt(this.vfs.ftruncate(ftEntry.fd, ftLen));
           } else if (ftEntry && ftEntry.type === "native") {
+            this.statCache.delete(ftEntry.path);
             return {
               status: "bridge",
               method: "fs_ftruncate",
@@ -6545,6 +6562,12 @@
           const statBuf79 = Number(a2);
           const bp79 = this.bridgePath(path);
           if (bp79 !== null) {
+            const cached = this.statCache.get(bp79);
+            if (cached && cached.expiresAt > Date.now()) {
+              writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime] });
+              ret = 0n;
+              break;
+            }
             return {
               status: "bridge",
               method: "fs_stat",
@@ -6554,6 +6577,15 @@
                   cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
                 } else {
                   writeBridgeStat(view, statBuf79, resp);
+                  if (resp._meta) {
+                    this.statCache.set(bp79, {
+                      mode: resp._meta[0],
+                      size: resp._meta[1],
+                      nlink: resp._meta[2],
+                      mtime: resp._meta[3],
+                      expiresAt: Date.now() + this.STAT_CACHE_TTL_MS
+                    });
+                  }
                   cpu2.setReg(0, 0n);
                 }
               }
@@ -6572,6 +6604,7 @@
           const count = Number(a2);
           const gdEntry = this.getFdEntry(fd);
           if (gdEntry?.type === "native") {
+            const dirPath = gdEntry.path;
             return {
               status: "bridge",
               method: "fs_getdents",
@@ -6581,7 +6614,28 @@
                   cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
                   return;
                 }
-                const entries = resp.entries ?? [];
+                let entries = [];
+                if (resp.data) {
+                  try {
+                    const decoded = atob(resp.data);
+                    entries = JSON.parse(decoded);
+                  } catch {
+                  }
+                }
+                const cacheExpiry = Date.now() + this.STAT_CACHE_TTL_MS;
+                for (const entry of entries) {
+                  if (entry.mode !== void 0) {
+                    const childPath = dirPath === "/" ? "/" + entry.name : dirPath + "/" + entry.name;
+                    this.statCache.set(childPath, {
+                      mode: entry.mode,
+                      size: entry.size ?? 0,
+                      nlink: entry.type === 4 ? 2 : 1,
+                      // DT_DIR=4
+                      mtime: entry.mtime ?? 0,
+                      expiresAt: cacheExpiry
+                    });
+                  }
+                }
                 let offset = 0;
                 for (const entry of entries) {
                   const nameBytes = new TextEncoder().encode(entry.name);
@@ -6631,6 +6685,7 @@
           const path = readGuestString(bytes, Number(a1));
           const bp35 = this.bridgePath(path);
           if (bp35 !== null) {
+            this.statCache.delete(bp35);
             return {
               status: "bridge",
               method: "fs_unlink",
@@ -6675,6 +6730,20 @@
         case 38: {
           const oldpath = readGuestString(bytes, Number(a1));
           const newpath = readGuestString(bytes, Number(a3));
+          const bOld = this.bridgePath(oldpath);
+          if (bOld) {
+            const bNew = this.bridgePath(newpath) ?? newpath;
+            this.statCache.delete(bOld);
+            this.statCache.delete(bNew);
+            return {
+              status: "bridge",
+              method: "fs_rename",
+              args: { oldPath: bOld, newPath: bNew },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              }
+            };
+          }
           if (this.vfs) {
             ret = BigInt(this.vfs.rename(oldpath, newpath));
           } else {
@@ -6685,6 +6754,17 @@
         case 36: {
           const target = readGuestString(bytes, Number(a0));
           const linkpath = readGuestString(bytes, Number(a2));
+          const bLink = this.bridgePath(linkpath);
+          if (bLink) {
+            return {
+              status: "bridge",
+              method: "fs_symlink",
+              args: { target, linkpath: bLink },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              }
+            };
+          }
           if (this.vfs) {
             ret = BigInt(this.vfs.symlinkat(target, linkpath));
           } else {
@@ -6710,6 +6790,26 @@
           const path = readGuestString(bytes, Number(a1));
           const buf = Number(a2);
           const bufsiz = Number(a3);
+          const bPath = this.bridgePath(path);
+          if (bPath) {
+            return {
+              status: "bridge",
+              method: "fs_readlink",
+              args: { path: bPath },
+              apply: (resp) => {
+                if (resp.ret < 0) {
+                  cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                } else if (resp.data) {
+                  const decoded = Uint8Array.from(atob(resp.data), (c) => c.charCodeAt(0));
+                  const len = Math.min(decoded.length, bufsiz);
+                  bytes.set(decoded.subarray(0, len), buf + GUEST_MEM_BASE);
+                  cpu2.setReg(0, BigInt(len));
+                } else {
+                  cpu2.setReg(0, BigInt.asUintN(64, BigInt(-EINVAL)));
+                }
+              }
+            };
+          }
           if (this.vfs) {
             const target = this.vfs.readlinkat(path);
             if (target === null) {
@@ -7014,6 +7114,25 @@
         }
         case 49: {
           const path = readGuestString(bytes, Number(a0));
+          const bPath = this.bridgePath(path);
+          if (bPath) {
+            return {
+              status: "bridge",
+              method: "fs_stat",
+              args: { path: bPath },
+              apply: (resp) => {
+                if (resp.ret < 0) {
+                  cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+                } else if (resp.mode && (resp.mode & 61440) === 16384) {
+                  this.cwd = bPath;
+                  if (this.vfs) this.vfs.setCwd(bPath);
+                  cpu2.setReg(0, 0n);
+                } else {
+                  cpu2.setReg(0, BigInt.asUintN(64, BigInt(-ENOTDIR)));
+                }
+              }
+            };
+          }
           if (this.vfs) {
             const res = this.vfs.chdir(path);
             ret = BigInt(res);
@@ -8844,10 +8963,15 @@
     for (let i = 0; i < 128; i += 8) {
       view.setBigUint64(base + i, 0n, true);
     }
-    view.setUint32(base + 16, resp.mode ?? 33188, true);
-    view.setUint32(base + 20, resp.nlink ?? 1, true);
-    view.setBigUint64(base + 48, BigInt(resp.size ?? 0), true);
-    view.setBigUint64(base + 88, BigInt(resp.mtime ?? 0), true);
+    const meta = resp._meta;
+    const mode = meta ? meta[0] : resp.mode ?? 33188;
+    const size = meta ? meta[1] : resp.size ?? 0;
+    const nlink = meta ? meta[2] : resp.nlink ?? 1;
+    const mtime = meta ? meta[3] : resp.mtime ?? 0;
+    view.setUint32(base + 16, mode, true);
+    view.setUint32(base + 20, nlink, true);
+    view.setBigUint64(base + 48, BigInt(size), true);
+    view.setBigUint64(base + 88, BigInt(mtime), true);
   }
 
   // src/vfs.ts
@@ -8855,7 +8979,7 @@
   var ENOENT2 = 2;
   var EBADF2 = 9;
   var EEXIST = 17;
-  var ENOTDIR = 20;
+  var ENOTDIR2 = 20;
   var EISDIR = 21;
   var EINVAL2 = 22;
   var EMFILE = 24;
@@ -9213,7 +9337,7 @@
         inode = newFile;
       }
       if (!inode) return -ENOENT2;
-      if (flags & O_DIRECTORY && inode.type !== "dir") return -ENOTDIR;
+      if (flags & O_DIRECTORY && inode.type !== "dir") return -ENOTDIR2;
       if (inode.type === "dir") {
         if ((flags & O_ACCMODE) !== O_RDONLY) return -EISDIR;
         const fd2 = this.nextFd++;
@@ -9460,7 +9584,7 @@
       const child = dir.children.get(name);
       if (!child) return -ENOENT2;
       if (flags & AT_REMOVEDIR) {
-        if (child.type !== "dir") return -ENOTDIR;
+        if (child.type !== "dir") return -ENOTDIR2;
         if (child.children.size > 0) return -ENOTEMPTY;
         dir.nlink--;
       } else {
@@ -9516,7 +9640,7 @@
       const [newDir, newName] = newParent;
       const dstNode = newDir.children.get(newName);
       if (dstNode) {
-        if (srcNode.type === "dir" && dstNode.type !== "dir") return -ENOTDIR;
+        if (srcNode.type === "dir" && dstNode.type !== "dir") return -ENOTDIR2;
         if (srcNode.type !== "dir" && dstNode.type === "dir") return -EISDIR;
         if (dstNode.type === "dir" && dstNode.children.size > 0) return -ENOTEMPTY;
       }
@@ -9533,6 +9657,10 @@
       newDir.mtime = newDir.ctime = this.now();
       return 0;
     }
+    /** Set cwd directly (used when chdir target is on native FS, not in VFS) */
+    setCwd(path) {
+      this.cwd = path;
+    }
     chdir(path) {
       if (path.length > PATH_MAX) return -ENAMETOOLONG;
       for (const part of path.split("/")) {
@@ -9540,7 +9668,7 @@
       }
       const inode = this.resolve(path);
       if (!inode) return -ENOENT2;
-      if (inode.type !== "dir") return -ENOTDIR;
+      if (inode.type !== "dir") return -ENOTDIR2;
       this.cwd = this.resolvePath(path);
       this.cwdInode = inode;
       return 0;
@@ -10030,7 +10158,9 @@
     const initialPages = 1024;
     memory = new WebAssembly.Memory({ initial: initialPages });
     vfs = new InMemoryVFS();
-    vfs.loadBinary(elfBytes);
+    if (!config.kernelSAB) {
+      vfs.loadBinary(elfBytes);
+    }
     let pc;
     if (config.memoryBuffer) {
       const parentBytes = new Uint8Array(config.memoryBuffer);
@@ -10432,13 +10562,21 @@
     const respOffset = BRIDGE_RESP_OFFSET + mySlot * BRIDGE_RESP_SLOT_SIZE;
     const respView = new DataView(kernelSAB, respOffset, BRIDGE_RESP_SLOT_SIZE);
     const ret = respView.getInt32(0, true);
-    const dataLen = respView.getUint32(4, true);
+    const metaCount = respView.getUint16(4, true);
+    const dataLen = respView.getUint32(6, true);
+    const dataOffset = 10 + metaCount * 8;
     const resp = { ret };
+    if (metaCount > 0) {
+      resp._meta = new Array(metaCount);
+      for (let i = 0; i < metaCount; i++) {
+        resp._meta[i] = respView.getFloat64(10 + i * 8, true);
+      }
+    }
     if (dataLen > 0) {
-      const dataBytes = new Uint8Array(kernelSAB, respOffset + 8, dataLen);
-      let b64 = "";
-      for (let i = 0; i < dataLen; i++) b64 += String.fromCharCode(dataBytes[i]);
-      resp.data = btoa(b64);
+      const dataBytes = new Uint8Array(kernelSAB, respOffset + dataOffset, dataLen);
+      let str = "";
+      for (let i = 0; i < dataLen; i++) str += String.fromCharCode(dataBytes[i]);
+      resp.data = btoa(str);
     }
     apply(resp);
   }

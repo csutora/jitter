@@ -81,6 +81,7 @@ export interface VFS {
   fchown(fd: number, uid: number, gid: number): number;
   ftruncate(fd: number, length: number): number;
   getcwd(): string;
+  setCwd(path: string): void;
   chdir(path: string): number;
   getdents64(fd: number, buf: number, count: number, memory: DataView): number;
   readlinkat(path: string): string | null;
@@ -146,6 +147,10 @@ export class SyscallHandler {
   private fdTable = new Map<number, FdEntry>(); // unified fd table
   private nativeRefs = new Map<number, number>(); // nativeFd -> refcount
   private nextFd = 3; // next available fd (0-2 are stdio)
+  // Stat cache: populated from getdents, consumed by fs_stat. Avoids N+1 bridge calls for ls -l.
+  // Path → {mode, size, nlink, mtime, expiresAt (ms since epoch)}
+  private statCache = new Map<string, { mode: number; size: number; nlink: number; mtime: number; expiresAt: number }>();
+  private readonly STAT_CACHE_TTL_MS = 1000;
   lastWaitStatus?: number;  // exit code from last child (set by dispatch loop)
   lastWaitPid?: number;     // PID of last exited child
 
@@ -163,24 +168,34 @@ export class SyscallHandler {
 
   /**
    * Check if a guest path should be routed to the native Swift filesystem.
-   * Returns the resolved absolute path if bridging, or null if staying in JS.
+   * Returns the resolved absolute path if bridging, or null if staying in JS VFS.
    *
-   * JS VFS handles: /proc, /dev, /tmp (virtual/ephemeral), /bin, /etc, /usr (busybox + config)
-   * Native Swift handles: /root, /home, /var (persistent user storage)
+   * JS VFS handles: /proc, /dev (virtual, per-process)
+   * Native Swift handles: everything else (/bin, /etc, /tmp, /root, /home, /var, /usr, ...)
    */
   private bridgePath(path: string): string | null {
-    if (!this.bridge?.isNative) return null;
+    if (!this.bridge?.isNative && !this.bridgeAvailable) return null;
     // Resolve relative paths using cwd
     let resolved = path;
     if (!path.startsWith('/')) {
       const cwd = this.vfs?.getcwd() ?? this.cwd;
       resolved = cwd === '/' ? '/' + path : cwd + '/' + path;
     }
-    // Only route known persistent-storage paths to native
-    if (resolved.startsWith('/root') || resolved.startsWith('/home') || resolved.startsWith('/var')) {
-      return resolved;
+    // Normalize . and ..
+    const parts: string[] = [];
+    for (const p of resolved.split('/')) {
+      if (p === '' || p === '.') continue;
+      if (p === '..') { parts.pop(); continue; }
+      parts.push(p);
     }
-    return null;
+    resolved = '/' + parts.join('/');
+    // Virtual filesystems stay in JS
+    if (resolved === '/proc' || resolved.startsWith('/proc/') ||
+        resolved === '/dev' || resolved.startsWith('/dev/')) {
+      return null;
+    }
+    // Everything else → Swift NativeFS
+    return resolved;
   }
 
   setTermSize(cols: number, rows: number): void {
@@ -658,6 +673,7 @@ export class SyscallHandler {
           if (writeEntry.type === 'native') {
             const writeData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
             const b64 = btoa(String.fromCharCode(...writeData));
+            this.statCache.delete(writeEntry.path); // invalidate stat cache for this file
             return {
               status: 'bridge', method: 'fs_write',
               args: { fd: writeEntry.nativeFd, data: b64 },
@@ -1077,6 +1093,7 @@ export class SyscallHandler {
         if (ftEntry && ftEntry.type === 'vfs' && this.vfs) {
           ret = BigInt(this.vfs.ftruncate(ftEntry.fd, ftLen));
         } else if (ftEntry && ftEntry.type === 'native') {
+          this.statCache.delete(ftEntry.path);
           return {
             status: 'bridge', method: 'fs_ftruncate',
             args: { fd: ftEntry.nativeFd, length: ftLen },
@@ -1171,6 +1188,13 @@ export class SyscallHandler {
         const statBuf79 = Number(a2);
         const bp79 = this.bridgePath(path);
         if (bp79 !== null) {
+          // Check stat cache (populated by recent getdents) — avoids bridge round-trip
+          const cached = this.statCache.get(bp79);
+          if (cached && cached.expiresAt > Date.now()) {
+            writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime] });
+            ret = 0n;
+            break;
+          }
           return {
             status: 'bridge', method: 'fs_stat',
             args: { path: bp79 },
@@ -1179,6 +1203,16 @@ export class SyscallHandler {
                 cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
               } else {
                 writeBridgeStat(view, statBuf79, resp);
+                // Cache for subsequent stat calls
+                if (resp._meta) {
+                  this.statCache.set(bp79, {
+                    mode: resp._meta[0],
+                    size: resp._meta[1],
+                    nlink: resp._meta[2],
+                    mtime: resp._meta[3],
+                    expiresAt: Date.now() + this.STAT_CACHE_TTL_MS,
+                  });
+                }
                 cpu.setReg(0, 0n);
               }
             },
@@ -1199,6 +1233,7 @@ export class SyscallHandler {
 
         const gdEntry = this.getFdEntry(fd);
         if (gdEntry?.type === 'native') {
+          const dirPath = gdEntry.path; // capture for cache population
           return {
             status: 'bridge', method: 'fs_getdents',
             args: { fd: gdEntry.nativeFd },
@@ -1209,7 +1244,28 @@ export class SyscallHandler {
               }
               // Write linux_dirent64 structs to guest memory
               // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
-              const entries: { name: string; type: number }[] = resp.entries ?? [];
+              // Entries come as base64-encoded JSON array in resp.data, enriched with stat info
+              let entries: { name: string; type: number; mode?: number; size?: number; mtime?: number }[] = [];
+              if (resp.data) {
+                try {
+                  const decoded = atob(resp.data);
+                  entries = JSON.parse(decoded);
+                } catch {}
+              }
+              // Populate stat cache for each entry (eliminates N+1 bridge calls in ls -l)
+              const cacheExpiry = Date.now() + this.STAT_CACHE_TTL_MS;
+              for (const entry of entries) {
+                if (entry.mode !== undefined) {
+                  const childPath = dirPath === '/' ? '/' + entry.name : dirPath + '/' + entry.name;
+                  this.statCache.set(childPath, {
+                    mode: entry.mode,
+                    size: entry.size ?? 0,
+                    nlink: entry.type === 4 ? 2 : 1, // DT_DIR=4
+                    mtime: entry.mtime ?? 0,
+                    expiresAt: cacheExpiry,
+                  });
+                }
+              }
               let offset = 0;
               for (const entry of entries) {
                 const nameBytes = new TextEncoder().encode(entry.name);
@@ -1260,6 +1316,7 @@ export class SyscallHandler {
         const path = readGuestString(bytes, Number(a1));
         const bp35 = this.bridgePath(path);
         if (bp35 !== null) {
+          this.statCache.delete(bp35);
           return {
             status: 'bridge', method: 'fs_unlink',
             args: { path: bp35 },
@@ -1310,6 +1367,17 @@ export class SyscallHandler {
       case 38: { // renameat(olddirfd, oldpath, newdirfd, newpath)
         const oldpath = readGuestString(bytes, Number(a1));
         const newpath = readGuestString(bytes, Number(a3));
+        const bOld = this.bridgePath(oldpath);
+        if (bOld) {
+          const bNew = this.bridgePath(newpath) ?? newpath;
+          this.statCache.delete(bOld);
+          this.statCache.delete(bNew);
+          return {
+            status: 'bridge', method: 'fs_rename',
+            args: { oldPath: bOld, newPath: bNew },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+          };
+        }
         if (this.vfs) {
           ret = BigInt(this.vfs.rename(oldpath, newpath));
         } else {
@@ -1321,6 +1389,14 @@ export class SyscallHandler {
       case 36: { // symlinkat(target, newdirfd, linkpath)
         const target = readGuestString(bytes, Number(a0));
         const linkpath = readGuestString(bytes, Number(a2));
+        const bLink = this.bridgePath(linkpath);
+        if (bLink) {
+          return {
+            status: 'bridge', method: 'fs_symlink',
+            args: { target, linkpath: bLink },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+          };
+        }
         if (this.vfs) {
           ret = BigInt(this.vfs.symlinkat(target, linkpath));
         } else {
@@ -1350,6 +1426,26 @@ export class SyscallHandler {
         const path = readGuestString(bytes, Number(a1));
         const buf = Number(a2);
         const bufsiz = Number(a3);
+        const bPath = this.bridgePath(path);
+        if (bPath) {
+          return {
+            status: 'bridge', method: 'fs_readlink',
+            args: { path: bPath },
+            apply: (resp: any) => {
+              if (resp.ret < 0) {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              } else if (resp.data) {
+                // Data is the symlink target, base64-encoded
+                const decoded = Uint8Array.from(atob(resp.data), c => c.charCodeAt(0));
+                const len = Math.min(decoded.length, bufsiz);
+                bytes.set(decoded.subarray(0, len), buf + GUEST_MEM_BASE);
+                cpu.setReg(0, BigInt(len));
+              } else {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(-EINVAL)));
+              }
+            },
+          };
+        }
         if (this.vfs) {
           const target = this.vfs.readlinkat(path);
           if (target === null) {
@@ -1714,6 +1810,26 @@ export class SyscallHandler {
 
       case 49: { // chdir(path)
         const path = readGuestString(bytes, Number(a0));
+        const bPath = this.bridgePath(path);
+        if (bPath) {
+          // Verify directory exists via bridge, then update cwd
+          return {
+            status: 'bridge', method: 'fs_stat',
+            args: { path: bPath },
+            apply: (resp: any) => {
+              if (resp.ret < 0) {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              } else if (resp.mode && (resp.mode & 0o170000) === 0o40000) {
+                // It's a directory — update cwd
+                this.cwd = bPath;
+                if (this.vfs) this.vfs.setCwd(bPath);
+                cpu.setReg(0, 0n);
+              } else {
+                cpu.setReg(0, BigInt.asUintN(64, BigInt(-ENOTDIR)));
+              }
+            },
+          };
+        }
         if (this.vfs) {
           const res = this.vfs.chdir(path);
           ret = BigInt(res);
@@ -3650,8 +3766,14 @@ function writeBridgeStat(view: DataView, guestAddr: number, resp: any): void {
   // struct stat (aarch64 Linux):
   // 0: st_dev (8), 8: st_ino (8), 16: st_mode (4), 20: st_nlink (4)
   // 48: st_size (8), 88: st_mtime (8)
-  view.setUint32(base + 16, resp.mode ?? 0o100644, true);
-  view.setUint32(base + 20, resp.nlink ?? 1, true);
-  view.setBigUint64(base + 48, BigInt(resp.size ?? 0), true);
-  view.setBigUint64(base + 88, BigInt(resp.mtime ?? 0), true);
+  // Meta layout for fs_stat: _meta[0]=mode, _meta[1]=size, _meta[2]=nlink, _meta[3]=mtime
+  const meta = resp._meta;
+  const mode = meta ? meta[0] : (resp.mode ?? 0o100644);
+  const size = meta ? meta[1] : (resp.size ?? 0);
+  const nlink = meta ? meta[2] : (resp.nlink ?? 1);
+  const mtime = meta ? meta[3] : (resp.mtime ?? 0);
+  view.setUint32(base + 16, mode, true);
+  view.setUint32(base + 20, nlink, true);
+  view.setBigUint64(base + 48, BigInt(size), true);
+  view.setBigUint64(base + 88, BigInt(mtime), true);
 }

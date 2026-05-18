@@ -13,9 +13,10 @@ struct EmulatorWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
 
-        // Register JS→Swift bridge
+        // Register JS→Swift bridge using WithReply API (iOS 14+).
+        // JS postMessage returns a Promise that Swift fulfills directly — no evaluateJavaScript round-trip.
         let contentController = WKUserContentController()
-        contentController.add(messageRouter, name: "jitter")
+        contentController.addScriptMessageHandler(messageRouter, contentWorld: .page, name: "jitter")
         config.userContentController = contentController
 
         let webView = JitterWebView(frame: .zero, configuration: config)

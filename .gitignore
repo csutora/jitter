@@ -1,1 +1,11 @@
+# Build output
+dist/
+
+# Test artifacts
 tests/conformance/bin
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store

@@ -803,6 +803,11 @@ export class InMemoryVFS implements VFS {
     return 0;
   }
 
+  /** Set cwd directly (used when chdir target is on native FS, not in VFS) */
+  setCwd(path: string): void {
+    this.cwd = path;
+  }
+
   chdir(path: string): number {
     if (path.length > PATH_MAX) return -ENAMETOOLONG;
     for (const part of path.split('/')) {

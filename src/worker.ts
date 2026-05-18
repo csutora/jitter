@@ -85,9 +85,13 @@ function init(config: WorkerInitConfig) {
   const initialPages = 1024; // 64MB — will grow on demand
   memory = new WebAssembly.Memory({ initial: initialPages });
 
-  // VFS (each process gets its own instance for independent cwd / open fd positions)
+  // VFS (each process gets its own instance for /proc and /dev; real files go through bridge)
   vfs = new InMemoryVFS();
-  vfs.loadBinary(elfBytes); // populate /bin/busybox + applet symlinks
+  // Only load busybox into VFS if no native bridge (test harness / non-iPad)
+  // On iPad, busybox + applets live on disk via NativeFS bootstrap
+  if (!config.kernelSAB) {
+    vfs.loadBinary(elfBytes);
+  }
 
   let pc: bigint;
 
@@ -657,17 +661,29 @@ function handleBridgeCall(method: string, args: Record<string, unknown>, apply: 
   const respOffset = BRIDGE_RESP_OFFSET + mySlot * BRIDGE_RESP_SLOT_SIZE;
   const respView = new DataView(kernelSAB, respOffset, BRIDGE_RESP_SLOT_SIZE);
 
-  // Response format: [ret: i32] [dataLen: u32] [data: bytes...]
+  // Response layout: [ret:i32][metaCount:u16][dataLen:u32][meta: metaCount×f64][data: dataLen bytes]
   const ret = respView.getInt32(0, true);
-  const dataLen = respView.getUint32(4, true);
+  const metaCount = respView.getUint16(4, true);
+  const dataLen = respView.getUint32(6, true);
+  const dataOffset = 10 + metaCount * 8;
 
   const resp: any = { ret };
+
+  // Read meta values
+  if (metaCount > 0) {
+    resp._meta = new Array(metaCount);
+    for (let i = 0; i < metaCount; i++) {
+      resp._meta[i] = respView.getFloat64(10 + i * 8, true);
+    }
+  }
+
+  // Read data
   if (dataLen > 0) {
-    // Read raw bytes and convert to base64 for the apply callback
-    const dataBytes = new Uint8Array(kernelSAB, respOffset + 8, dataLen);
-    let b64 = '';
-    for (let i = 0; i < dataLen; i++) b64 += String.fromCharCode(dataBytes[i]);
-    resp.data = btoa(b64);
+    const dataBytes = new Uint8Array(kernelSAB, respOffset + dataOffset, dataLen);
+    // Store raw bytes — the apply callback decides how to interpret (base64 string, JSON, UTF-8)
+    let str = '';
+    for (let i = 0; i < dataLen; i++) str += String.fromCharCode(dataBytes[i]);
+    resp.data = btoa(str);
   }
 
   apply(resp);

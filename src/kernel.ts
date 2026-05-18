@@ -314,38 +314,67 @@ export class Kernel {
 
   private handleBridgeCall(pid: number, slot: number, msg: KernelMessage & { type: 'bridge_call' }): void {
     if (!this.bridge) {
-      this.writeBridgeResponse(slot, -38, null);
+      this.writeBridgeResponse(slot, -38, [], null);
       return;
     }
 
-    console.log(`[kernel] bridge call: ${(msg as any).method} from PID ${pid}`);
-    this.bridge.call((msg as any).method, (msg as any).args as Record<string, any>).then((resp) => {
-      console.log(`[kernel] bridge response: ${(msg as any).method} ret=${(resp as any).ret}`);
-      // Write response to bridge response area in SAB
+    const args = (msg as any).args as Record<string, any>;
+    const argSummary = args.path ?? args.fd ?? '';
+    console.log(`[kernel] bridge call: ${(msg as any).method}(${argSummary}) from PID ${pid}`);
+    const method = (msg as any).method as string;
+    this.bridge.call(method, (msg as any).args as Record<string, any>).then((resp) => {
+      console.log(`[kernel] bridge response: ${method} ret=${(resp as any).ret}`);
       const ret = (resp as any).ret ?? 0;
-      const data = (resp as any).data as string | undefined; // base64 string
 
+      // Pack response into SAB: [ret:i32][dataLen:u32][meta:32B][data:bytes]
+      // Meta fields are method-specific fixed-layout integers.
+      // Data is variable-length (binary for reads, JSON for getdents, UTF-8 for readlink).
+      const meta = [0, 0, 0, 0]; // 4 x i64
       let rawData: Uint8Array | null = null;
-      if (data) {
-        // Decode base64 to raw bytes for SAB storage
-        rawData = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+
+      if (method === 'fs_stat' || method === 'fs_fstat') {
+        meta[0] = (resp as any).mode ?? 0;
+        meta[1] = (resp as any).size ?? 0;
+        meta[2] = (resp as any).nlink ?? 0;
+        meta[3] = (resp as any).mtime ?? 0;
+      } else if (method === 'fs_readlink') {
+        if ((resp as any).target) {
+          rawData = new TextEncoder().encode((resp as any).target);
+        }
+      } else if (method === 'fs_getdents') {
+        if ((resp as any).entries) {
+          rawData = new TextEncoder().encode(JSON.stringify((resp as any).entries));
+        }
+      } else if ((resp as any).data) {
+        // Binary data: fs_read, net_read — base64 decode
+        rawData = Uint8Array.from(atob((resp as any).data), c => c.charCodeAt(0));
       }
 
-      this.writeBridgeResponse(slot, ret, rawData);
+      this.writeBridgeResponse(slot, ret, meta, rawData);
     });
   }
 
-  private writeBridgeResponse(slot: number, ret: number, data: Uint8Array | null): void {
+  private writeBridgeResponse(slot: number, ret: number, meta: number[], data: Uint8Array | null): void {
     const respOffset = BRIDGE_RESP_OFFSET + slot * BRIDGE_RESP_SLOT_SIZE;
     const respView = new DataView(this.sab, respOffset, BRIDGE_RESP_SLOT_SIZE);
 
-    // Write response: [ret: i32] [dataLen: u32] [data: bytes...]
+    // Response layout: [ret:i32][metaCount:u16][dataLen:u32][meta: metaCount×f64][data: dataLen bytes]
+    // Header: 10 bytes, then variable meta, then variable data.
+    const metaCount = meta.length;
+    const dataOffset = 10 + metaCount * 8;
+
     respView.setInt32(0, ret, true);
-    if (data && data.length > 0 && data.length <= BRIDGE_RESP_SLOT_SIZE - 8) {
-      respView.setUint32(4, data.length, true);
-      new Uint8Array(this.sab, respOffset + 8, data.length).set(data);
+    respView.setUint16(4, metaCount, true);
+
+    for (let i = 0; i < metaCount; i++) {
+      respView.setFloat64(10 + i * 8, meta[i], true);
+    }
+
+    if (data && data.length > 0 && data.length <= BRIDGE_RESP_SLOT_SIZE - dataOffset) {
+      respView.setUint32(6, data.length, true);
+      new Uint8Array(this.sab, respOffset + dataOffset, data.length).set(data);
     } else {
-      respView.setUint32(4, 0, true);
+      respView.setUint32(6, 0, true);
     }
 
     // Wake the Worker
