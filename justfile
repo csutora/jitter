@@ -20,3 +20,18 @@ build:
 # Build and serve locally
 serve: build
     nix-shell --run "npx -y serve dist"
+
+# Build ghostty-vt.xcframework into Jitter/Frameworks
+build-ghostty:
+    cd ghostty && nix develop --command zig build \
+        -Demit-lib-vt=true \
+        -Demit-xcframework=true \
+        -Dxcframework-target=universal \
+        -Doptimize=ReleaseFast
+    mkdir -p Jitter/Frameworks
+    rm -rf Jitter/Frameworks/ghostty-vt.xcframework
+    cp -R ghostty/zig-out/lib/ghostty-vt.xcframework Jitter/Frameworks/
+
+clean-ghostty:
+    rm -rf ghostty/.zig-cache ghostty/zig-out ghostty/macos/GhosttyKit.xcframework
+    rm -rf Jitter/Frameworks/GhosttyKit.xcframework Jitter/Frameworks/ghostty-vt.xcframework

@@ -1,7 +1,6 @@
 /**
  * Web Worker entry point for multicore process execution.
  */
-console.log('[worker] Script loaded');
 
 import { HALT_PC, SVC_PC, GUEST_MEM_BASE, ITER_OFFSET, PC_OFFSET, STATE_SIZE } from './types.js';
 import type { CompiledRegion, CompiledBlockModule, CompiledRegionModule } from './types.js';
@@ -66,6 +65,9 @@ self.onmessage = (e: MessageEvent) => {
       // Signal delivered — we check signal_pending in the run loop
       break;
     }
+    case 'term_size':
+      if (syscalls) syscalls.setTermSize(msg.cols, msg.rows);
+      break;
   }
 };
 
@@ -120,6 +122,8 @@ function init(config: WorkerInitConfig) {
       writeStdout: (d) => postWrite(1, d),
       writeStderr: (d) => postWrite(2, d),
       readStdin: (count) => readStdin(count),
+      stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
+      waitStdin: (timeoutMs) => waitStdin(timeoutMs),
     }, vfs);
     syscalls.bridgeAvailable = true; // Worker can relay bridge calls to kernel
     if (config.syscallState) {
@@ -158,6 +162,8 @@ function init(config: WorkerInitConfig) {
       writeStdout: (d) => postWrite(1, d),
       writeStderr: (d) => postWrite(2, d),
       readStdin: (count) => readStdin(count),
+      stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
+      waitStdin: (timeoutMs) => waitStdin(timeoutMs),
     }, vfs);
     syscalls.bridgeAvailable = true;
 
@@ -170,8 +176,10 @@ function init(config: WorkerInitConfig) {
     stdinRing = new PipeRing(kernelSAB, stdinRingOffset(stdinRingIdx), STDIN_RING_SIZE);
   }
 
-  // ── Run! ──
-  console.log(`[worker ${myPid}] Starting at pc=0x${pc.toString(16)}`);
+  if (config.termCols && config.termRows) {
+    syscalls.setTermSize(config.termCols, config.termRows);
+  }
+
   try {
     runLoop(pc);
   } catch (e: any) {
@@ -314,8 +322,6 @@ function runLoop(startPC: bigint) {
     }
   }
 
-  console.log(`[worker] Exited run loop: pc=0x${pc.toString(16)} blocks=${blockCount} insns=${totalInsns}`);
-  // Reached HALT_PC — unknown instruction or end of execution
   postExit(0);
 }
 
@@ -702,6 +708,19 @@ function readStdin(count: number): Uint8Array | null {
   }
   if (n === 0) return null; // no data, will block
   return buf.subarray(0, n);
+}
+
+function waitStdin(timeoutMs: number): 'data' | 'timeout' {
+  if (!stdinRing) return 'timeout';
+  if (!stdinRing.empty || stdinRing.writerClosed) return 'data';
+  const stdinRingIdx = Atomics.load(procTable, (procSlotOffset(mySlot) / 4) + 7);
+  if (stdinRingIdx < 0) return 'timeout';
+  const ringI32 = new Int32Array(kernelSAB, stdinRingOffset(stdinRingIdx), 4);
+  const wp = Atomics.load(ringI32, 0);
+  const result = timeoutMs < 0
+    ? Atomics.wait(ringI32, 0, wp)
+    : Atomics.wait(ringI32, 0, wp, timeoutMs);
+  return result === 'timed-out' ? 'timeout' : 'data';
 }
 
 function postWrite(fd: number, data: Uint8Array): void {

@@ -1,14 +1,14 @@
 /**
  * Main-thread kernel for multicore process management.
  *
- * The Kernel runs on the main JS thread (which also owns xterm.js and the Swift bridge).
+ * The Kernel runs on the main JS thread (which also owns the terminal and the Swift bridge).
  * Each emulated Linux process runs in its own Web Worker with JIT-compiled WASM.
  *
  * Responsibilities:
  *   - Spawn/terminate Workers for fork/exec/exit
  *   - Manage the process table in SharedArrayBuffer
- *   - Route stdin from xterm.js to the foreground process's stdin ring
- *   - Route stdout/stderr from Workers to xterm.js
+ *   - Route stdin from terminal to the foreground process's stdin ring
+ *   - Route stdout/stderr from Workers to terminal
  *   - Relay bridge calls (native filesystem) from Workers to Swift
  *   - Deliver signals (Ctrl+C → SIGINT)
  */
@@ -52,6 +52,9 @@ export class Kernel {
 
   // Stdin ring for the foreground process
   private fgStdinRing: PipeRing | null = null;
+
+  private termCols = 80;
+  private termRows = 24;
 
   constructor(config: KernelConfig) {
     this.elfBytes = config.elfBytes;
@@ -97,18 +100,25 @@ export class Kernel {
     }
   }
 
+  setTermSize(cols: number, rows: number): void {
+    if (cols < 1 || rows < 1) return;
+    if (cols === this.termCols && rows === this.termRows) return;
+    this.termCols = cols;
+    this.termRows = rows;
+    for (const w of this.workers.values()) {
+      w.postMessage({ type: 'term_size', cols, rows });
+    }
+  }
+
   /** Send Ctrl+C (SIGINT) to the foreground process group. */
   sendInterrupt(): void {
     const fgPgid = Atomics.load(this.globalState, GLOBAL_FG_PGID);
-    console.log(`[kernel] sendInterrupt: fgPgid=${fgPgid}`);
-    // Signal all processes in the foreground group
     for (let slot = 0; slot < 64; slot++) {
       const slotBase = procSlotOffset(slot) / 4;
       const state = Atomics.load(this.procTable, slotBase + PROC_STATE);
       if (state === PROC_RUNNING) {
         const pgid = Atomics.load(this.procTable, slotBase + PROC_PGID);
         if (pgid === fgPgid) {
-          console.log(`[kernel] SIGINT → slot=${slot} pid=${Atomics.load(this.procTable, slotBase + PROC_PID)}`);
           Atomics.or(this.procTable, slotBase + PROC_SIGNAL, SIG_INT);
           // Wake the Worker from any Atomics.wait it might be in
           // 1. Bridge call mailbox
@@ -192,6 +202,8 @@ export class Kernel {
       memoryBuffer: opts.memoryBuffer,
       syscallState: opts.syscallState,
       kernelPipesSnapshot: opts.kernelPipesSnapshot as any,
+      termCols: this.termCols,
+      termRows: this.termRows,
     };
 
     // Send init — transfer memoryBuffer if present (zero-copy)
@@ -199,7 +211,6 @@ export class Kernel {
     if (config.memoryBuffer) {
       transferList.push(config.memoryBuffer);
     }
-    console.log(`[kernel] Sending init to Worker PID ${opts.pid}, elfBytes=${opts.elfBytes.length}, hasMem=${!!config.memoryBuffer}`);
     worker.postMessage({ type: 'init', config }, transferList);
   }
 
@@ -239,15 +250,17 @@ export class Kernel {
   private handleFork(parentPid: number, parentSlot: number, msg: KernelMessage & { type: 'fork' }): void {
     const childPid = this.allocPid();
     const childSlot = this.findFreeSlot();
+    const parentBase = procSlotOffset(parentSlot) / 4;
+    const parentStdin = Atomics.load(this.procTable, parentBase + PROC_STDIN_RING);
 
-    // Spawn child with parent's memory snapshot
     this.spawnProcess({
       pid: childPid,
       ppid: parentPid,
-      pgid: Atomics.load(this.procTable, (procSlotOffset(parentSlot) / 4) + PROC_PGID),
+      pgid: Atomics.load(this.procTable, parentBase + PROC_PGID),
       slot: childSlot,
+      stdinRing: parentStdin >= 0 ? parentStdin : undefined,
       elfBytes: this.elfBytes,
-      argv: [], // Not used for fork (child inherits parent's state)
+      argv: [],
       envp: [],
       memoryBuffer: msg.memoryBuffer,
       syscallState: msg.syscallState,
@@ -318,12 +331,8 @@ export class Kernel {
       return;
     }
 
-    const args = (msg as any).args as Record<string, any>;
-    const argSummary = args.path ?? args.fd ?? '';
-    console.log(`[kernel] bridge call: ${(msg as any).method}(${argSummary}) from PID ${pid}`);
     const method = (msg as any).method as string;
     this.bridge.call(method, (msg as any).args as Record<string, any>).then((resp) => {
-      console.log(`[kernel] bridge response: ${method} ret=${(resp as any).ret}`);
       const ret = (resp as any).ret ?? 0;
 
       // Pack response into SAB: [ret:i32][dataLen:u32][meta:32B][data:bytes]

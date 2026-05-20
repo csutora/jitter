@@ -27,19 +27,20 @@ await esbuild.build({
 });
 console.log('Built dist/worker.js');
 
-// Read xterm.js CSS
-let xtermCss = '';
-const xtermCssPath = 'node_modules/@xterm/xterm/css/xterm.css';
-if (existsSync(xtermCssPath)) {
-  xtermCss = `<style>${readFileSync(xtermCssPath, 'utf-8')}</style>`;
-}
-
 const html = readFileSync('index.html', 'utf-8');
-const output = html
-  .replace('/* BUNDLE */', js)
-  .replace('</head>', `${xtermCss}\n</head>`);
+const output = html.replace('/* BUNDLE */', js);
 writeFileSync('dist/index.html', output);
 console.log('Built dist/index.html');
+
+writeFileSync('dist/serve.json', JSON.stringify({
+  headers: [{
+    source: '**/*',
+    headers: [
+      { key: 'Cross-Origin-Opener-Policy', value: 'same-origin' },
+      { key: 'Cross-Origin-Embedder-Policy', value: 'require-corp' },
+    ],
+  }],
+}, null, 2));
 
 // Copy busybox binary if present
 const busyboxPath = 'assets/busybox-aarch64';
@@ -48,4 +49,13 @@ if (existsSync(busyboxPath)) {
   console.log('Copied busybox-aarch64 to dist/');
 } else {
   console.log('Note: assets/busybox-aarch64 not found — Boot Shell will not work');
+}
+
+const iosResources = 'Jitter/Jitter/Resources';
+if (existsSync(iosResources)) {
+  for (const f of ['index.html', 'worker.js', 'busybox-aarch64']) {
+    const src = `dist/${f}`;
+    if (existsSync(src)) copyFileSync(src, `${iosResources}/${f}`);
+  }
+  console.log(`Synced bundle into ${iosResources}/`);
 }

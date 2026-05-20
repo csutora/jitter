@@ -9,6 +9,9 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
     weak var webView: WKWebView?
     private var handlers: [String: ([String: Any], @escaping (Any?, String?) -> Void) -> Void] = [:]
     private(set) var nativeFS: NativeFS?
+    var onTerminalData: ((Data) -> Void)?
+    private var lastTermCols: Int = 0
+    private var lastTermRows: Int = 0
 
     override init() {
         super.init()
@@ -286,6 +289,37 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                 reply(["ret": -22], nil); return
             }
             reply(["ret": fs.chmod(path: path, mode: Int32(mode))], nil)
+        }
+
+        handlers["term_size_query"] = { [weak self] _, reply in
+            reply(["cols": self?.lastTermCols ?? 0, "rows": self?.lastTermRows ?? 0], nil)
+        }
+
+        handlers["term_data"] = { [weak self] args, reply in
+            if let b64 = args["data"] as? String,
+               let data = Data(base64Encoded: b64),
+               let cb = self?.onTerminalData {
+                DispatchQueue.main.async { cb(data) }
+            }
+            reply([:], nil)
+        }
+    }
+
+    func sendStdin(_ data: Data) {
+        guard !data.isEmpty else { return }
+        let b64 = data.base64EncodedString()
+        let js = "window.__jitterStdin && window.__jitterStdin('\(b64)')"
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    func sendTermSize(cols: Int, rows: Int) {
+        lastTermCols = cols
+        lastTermRows = rows
+        let js = "window.__jitterTermSize && window.__jitterTermSize(\(cols), \(rows))"
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript(js, completionHandler: nil)
         }
     }
 

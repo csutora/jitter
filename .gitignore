@@ -1,5 +1,15 @@
 # Build output
 dist/
+build/
+
+# Built frameworks (regenerable from ghostty submodule)
+Jitter/Frameworks/
+
+# Submodule build artifacts (ghostty internal cache + outputs)
+ghostty/zig-cache/
+ghostty/.zig-cache/
+ghostty/zig-out/
+ghostty/macos/GhosttyKit.xcframework/
 
 # Test artifacts
 tests/conformance/bin

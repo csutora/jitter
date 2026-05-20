@@ -21,9 +21,9 @@ struct EmulatorWebView: UIViewRepresentable {
 
         let webView = JitterWebView(frame: .zero, configuration: config)
         webView.isInspectable = true  // Enable Safari Web Inspector
-        webView.isOpaque = false
-        webView.backgroundColor = UIColor(red: 10/255, green: 10/255, blue: 10/255, alpha: 1)
-        webView.scrollView.backgroundColor = webView.backgroundColor
+        webView.isOpaque = true
+        webView.backgroundColor = .black
+        webView.scrollView.backgroundColor = .black
 
         // Disable bouncing/scrolling — the terminal handles its own scrolling
         webView.scrollView.isScrollEnabled = false

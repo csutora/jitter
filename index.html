@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-  <title>jitter - ARM64 Dynamic Recompiler</title>
+  <title>jitter</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -20,8 +20,6 @@
       font-family: inherit;
       font-size: 1em;
       padding: 0.4em 1.2em;
-      margin-right: 0.5em;
-      margin-bottom: 0.5em;
       background: #1a1a1a;
       color: #00ff41;
       border: 1px solid #00ff41;
@@ -29,58 +27,21 @@
     }
     button:hover { background: #00ff41; color: #0a0a0a; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    #bench-panel #output {
-      background: #111;
-      border: 1px solid #333;
-      padding: 1em;
-      min-height: 400px;
-      white-space: pre-wrap;
-      word-wrap: break-word;
-      font-size: 0.9em;
-      overflow-y: auto;
-    }
-    .error { color: #ff4141; }
-    .dim { color: #666; }
-    .highlight { color: #ffff41; }
-    #terminal-container {
-      display: none;
-      margin-top: 1em;
-    }
-    #terminal-container.active {
-      display: block;
-    }
     #status-bar {
       display: none;
       margin-top: 0.5em;
       font-size: 0.8em;
       color: #666;
     }
-    #status-bar.active {
-      display: block;
-    }
-    /* Suppress iOS native text input UI for xterm.js */
-    .xterm-helper-textarea {
-      caret-color: transparent !important;
-      -webkit-user-select: none !important;
-      -webkit-text-size-adjust: none !important;
-      font-size: 16px !important; /* prevents iOS zoom on focus */
-    }
+    #status-bar.active { display: block; }
   </style>
 </head>
 <body>
   <h1>jitter</h1>
-  <div class="subtitle">ARM64 &rarr; WASM dynamic recompiler</div>
+  <div class="subtitle">arm64 &rarr; wasm dynamic recompiler</div>
   <div class="controls">
-    <button id="btn-fib" onclick="window.runFib()">Fib(40)</button>
-    <button id="btn-fib-large" onclick="window.runFibLarge()">Fib(10M)</button>
-    <button id="btn-sum" onclick="window.runSum()">Sum 1..100M</button>
-    <button id="btn-sumsq" onclick="window.runSumSq()">Sum&sup2; 1..10M</button>
-    <button id="btn-shell" onclick="window.bootShell()">Boot Shell</button>
+    <button id="btn-shell" onclick="window.bootShell()">boot shell</button>
   </div>
-  <div id="bench-panel">
-    <pre id="output">Ready.\n</pre>
-  </div>
-  <div id="terminal-container"></div>
   <div id="status-bar"></div>
   <script type="module">/* BUNDLE */</script>
 </body>

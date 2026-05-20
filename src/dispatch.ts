@@ -346,7 +346,7 @@ export class IOManager {
   private stdinWaiters: (() => void)[] = [];
   interrupted = false;
 
-  /** Push data from terminal (xterm.js onData) */
+  /** Push data from terminal */
   pushStdin(data: Uint8Array): void {
     this.stdinBuffer.push(data);
     // Wake up any waiting readers

@@ -121,7 +121,8 @@ export type KernelMessage =
   | { type: 'pipe_result'; pipeSlot: number }
   | { type: 'bridge_response'; id: number; resp: unknown }
   | { type: 'stdin_data' } // notification only; data is in the stdin ring buffer
-  | { type: 'signal'; sig: number };
+  | { type: 'signal'; sig: number }
+  | { type: 'term_size'; cols: number; rows: number };
 
 export interface WorkerInitConfig {
   pid: number;
@@ -140,6 +141,8 @@ export interface WorkerInitConfig {
   kernelPipesSnapshot?: Array<[number, { pipeIndex: number; mode: 'read' | 'write' }]>;
   // Cached JIT modules from parent (compile once, instantiate per-worker)
   jitModules?: Array<{ pc: string; wasmBytes: ArrayBuffer }>;
+  termCols?: number;
+  termRows?: number;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

@@ -3,20 +3,32 @@ import SwiftUI
 struct ContentView: View {
     @State private var messageRouter = MessageRouter()
     @State private var server: LocalServer?
+    @State private var ghosttyProxy = TerminalProxy()
 
     var body: some View {
-        Group {
-            if let server = server {
-                EmulatorWebView(messageRouter: messageRouter, baseURL: server.baseURL)
-            } else {
-                ProgressView("Starting server...")
-                    .foregroundStyle(.white)
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Group {
+                if let server = server {
+                    EmulatorWebView(messageRouter: messageRouter, baseURL: server.baseURL)
+                } else {
+                    Color.black
+                }
             }
+            .ignoresSafeArea()
+            TerminalView(
+                proxy: ghosttyProxy,
+                onStdin: { [router = messageRouter] data in router.sendStdin(data) },
+                onTermSize: { [router = messageRouter] cols, rows in router.sendTermSize(cols: cols, rows: rows) }
+            )
+            .ignoresSafeArea()
         }
-        .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
         .onAppear {
+            messageRouter.onTerminalData = { [proxy = ghosttyProxy] data in
+                proxy.feed(data)
+            }
             startServer()
         }
     }
@@ -26,7 +38,6 @@ struct ContentView: View {
         let webDir = fm.temporaryDirectory.appendingPathComponent("jitter-web", isDirectory: true)
         try? fm.createDirectory(at: webDir, withIntermediateDirectories: true)
 
-        // Copy all resources to the serving directory
         let filesToCopy = [
             ("index", "html"),
             ("busybox-aarch64", nil),

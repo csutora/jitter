@@ -22,7 +22,10 @@ const EPERM  = 1;
 const ENOTDIR = 20;
 const ECHILD = 10;
 const ESPIPE = 29;
+const EAGAIN = 11;
 const MAX_FDS = 1024;
+
+const O_NONBLOCK = 0o4000;
 
 // Signal constants
 const SIG_DFL = 0n;
@@ -102,6 +105,10 @@ export interface IOInterface {
   writeStdout(data: Uint8Array): void;
   writeStderr(data: Uint8Array): void;
   readStdin(count: number): Uint8Array | null;
+  /** Whether stdin has bytes available for non-blocking read. */
+  stdinHasData?(): boolean;
+  /** Block until stdin has data or timeout fires (ms; negative = infinite). Returns whether data arrived. */
+  waitStdin?(timeoutMs: number): 'data' | 'timeout';
 }
 
 // ── Syscall handler ─────────────────────────────────────────────────────────
@@ -116,11 +123,16 @@ interface PipeBuffer {
 
 type FdEntry =
   | { type: 'stdio'; fd: number }  // 0=stdin, 1=stdout, 2=stderr
+  | { type: 'tty' }                // /dev/tty — controlling terminal
   | { type: 'vfs'; fd: number }    // VFS file descriptor
   | { type: 'pipe_read'; pipe: PipeBuffer }
   | { type: 'pipe_write'; pipe: PipeBuffer }
-  | { type: 'native'; nativeFd: number; path: string }  // Native Swift fd (via bridge)
-  | { type: 'socket'; socketId: number; domain: number; sockType: number; remoteAddr?: { family: number; host: string; port: number } };  // Network socket
+  | { type: 'native'; nativeFd: number; path: string }
+  | { type: 'socket'; socketId: number; domain: number; sockType: number; remoteAddr?: { family: number; host: string; port: number } }
+  | { type: 'inotify' }                                  // event queue (stub: no watches, never ready)
+  | { type: 'timerfd' }                                  // periodic timer (stub: no timer armed, never ready)
+  | { type: 'eventfd'; counter: bigint; semaphore: boolean }  // 8-byte counter (real semantics)
+  | { type: 'epoll' };                                   // multiplexer (state in this.epollSets)
 
 export class SyscallHandler {
   private brk: bigint;
@@ -164,6 +176,9 @@ export class SyscallHandler {
     this.io = io;
     this.vfs = vfs;
     this.bridge = bridge;
+    this.fdTable.set(0, { type: 'stdio', fd: 0 });
+    this.fdTable.set(1, { type: 'stdio', fd: 1 });
+    this.fdTable.set(2, { type: 'stdio', fd: 2 });
   }
 
   /**
@@ -419,6 +434,75 @@ export class SyscallHandler {
     return this.fdTable.get(fd);
   }
 
+  private isNonBlocking(fd: number): boolean {
+    return ((this.fdFlags.get(fd) ?? 0) & O_NONBLOCK) !== 0;
+  }
+
+  /** Whether the fd has data available for read without blocking. */
+  private isFdReadable(fd: number): boolean {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return false;
+    switch (entry.type) {
+      case 'stdio': return entry.fd === 0 ? (this.io.stdinHasData?.() ?? true) : true;
+      case 'tty': return this.io.stdinHasData?.() ?? true;
+      case 'pipe_read': return entry.pipe.data.length > 0 || entry.pipe.writeClosed;
+      case 'pipe_write': return false;
+      case 'vfs': case 'native': return true;
+      case 'socket': return false; // handled via bridge poll
+      case 'eventfd': return entry.counter > 0n;
+      case 'inotify': case 'timerfd': return false; // stub: never have events
+      case 'epoll': return false;
+    }
+  }
+
+  /** Whether the fd can accept a write without blocking. */
+  private isFdWritable(fd: number): boolean {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return false;
+    switch (entry.type) {
+      case 'stdio': return entry.fd === 1 || entry.fd === 2;
+      case 'tty': return true;
+      case 'pipe_write': return !entry.pipe.readClosed;
+      case 'pipe_read': return false;
+      case 'vfs': case 'native': return true;
+      case 'socket': return false;
+      case 'eventfd': return entry.counter < 0xFFFFFFFFFFFFFFFEn;
+      case 'inotify': case 'timerfd': case 'epoll': return false;
+    }
+  }
+
+  /** Whether a wait on this fd's underlying waker mechanism would resume on data arrival. */
+  private isFdWakeable(fd: number): boolean {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return false;
+    return (entry.type === 'stdio' && entry.fd === 0) || entry.type === 'tty';
+  }
+
+  /** Read an fd_set bitmap from guest memory into a Set<number>. */
+  private readFdSet(view: DataView, ptr: number, nfds: number): Set<number> {
+    const out = new Set<number>();
+    if (ptr === 0) return out;
+    const bytes = new Uint8Array(view.buffer);
+    for (let fd = 0; fd < nfds; fd++) {
+      const byte = bytes[ptr + GUEST_MEM_BASE + (fd >> 3)];
+      if ((byte & (1 << (fd & 7))) !== 0) out.add(fd);
+    }
+    return out;
+  }
+
+  /** Write a Set<number> as an fd_set bitmap to guest memory, zeroing the rest. */
+  private writeFdSet(view: DataView, ptr: number, nfds: number, set: Set<number>): void {
+    if (ptr === 0) return;
+    const bytes = new Uint8Array(view.buffer);
+    const sz = Math.ceil(nfds / 8);
+    for (let i = 0; i < sz; i++) bytes[ptr + GUEST_MEM_BASE + i] = 0;
+    for (const fd of set) {
+      if (fd < nfds && fd >= 0) {
+        bytes[ptr + GUEST_MEM_BASE + (fd >> 3)] |= (1 << (fd & 7));
+      }
+    }
+  }
+
   handle(cpu: CpuState, memory: WebAssembly.Memory): SyscallResult {
     const nr = Number(cpu.getReg(8));   // X8 = syscall number
     const a0 = cpu.getReg(0);          // X0-X5 = args
@@ -556,12 +640,12 @@ export class SyscallHandler {
             if (pipe.data.length === 0) {
               if (pipe.writeClosed) {
                 ret = 0n; // EOF
+              } else if (this.isNonBlocking(fd)) {
+                ret = -BigInt(EAGAIN);
               } else {
-                // Would block — in our sequential model, write side hasn't finished
-                ret = 0n; // Return EOF for now (sequential pipe)
+                ret = 0n; // Pipes currently don't block; legacy behavior
               }
             } else {
-              // Read from pipe buffer
               const chunk = pipe.data.shift()!;
               const toRead = Math.min(count, chunk.length);
               bytes.set(chunk.subarray(0, toRead), buf + GUEST_MEM_BASE);
@@ -572,11 +656,34 @@ export class SyscallHandler {
             }
             break;
           }
-          if (readEntry.type === 'stdio' && readEntry.fd === 0) {
+          if ((readEntry.type === 'stdio' && readEntry.fd === 0) || readEntry.type === 'tty') {
             const data = this.io.readStdin(count);
-            if (data === null) return { status: 'blocked_read', fd: 0 };
+            if (data === null) {
+              if (this.isNonBlocking(fd)) { ret = -BigInt(EAGAIN); break; }
+              return { status: 'blocked_read', fd: 0 };
+            }
             bytes.set(data, buf + GUEST_MEM_BASE);
             ret = BigInt(data.length);
+            break;
+          }
+          if (readEntry.type === 'eventfd') {
+            if (readEntry.counter === 0n) {
+              ret = -BigInt(EAGAIN); // would block; we don't have a per-fd waker
+              break;
+            }
+            if (count < 8) { ret = -BigInt(EINVAL); break; }
+            const value = readEntry.semaphore ? 1n : readEntry.counter;
+            readEntry.counter = readEntry.semaphore ? readEntry.counter - 1n : 0n;
+            view.setBigUint64(buf + GUEST_MEM_BASE, value, true);
+            ret = 8n;
+            break;
+          }
+          if (readEntry.type === 'inotify' || readEntry.type === 'timerfd') {
+            ret = -BigInt(EAGAIN); // never have events in our stub
+            break;
+          }
+          if (readEntry.type === 'epoll') {
+            ret = -BigInt(EINVAL); // epoll fd is not directly readable; must use epoll_wait
             break;
           }
           if (readEntry.type === 'vfs') {
@@ -621,13 +728,8 @@ export class SyscallHandler {
           break;
         }
 
-        // Default behavior for non-overridden fds
-        if (fd === 0) {
-          const data = this.io.readStdin(count);
-          if (data === null) return { status: 'blocked_read', fd: 0 };
-          bytes.set(data, buf + GUEST_MEM_BASE);
-          ret = BigInt(data.length);
-        } else if (this.vfs) {
+        // No fdTable entry: fall through to VFS for raw fds (legacy path for VFS-issued fds)
+        if (this.vfs && this.vfs.hasFd(fd)) {
           ret = BigInt(this.vfs.read(fd, buf, count, view));
         } else {
           ret = -BigInt(EBADF);
@@ -640,7 +742,6 @@ export class SyscallHandler {
         const buf = Number(a1);
         const count = Number(a2);
 
-        // Check fd table for overrides
         const writeEntry = this.getFdEntry(fd);
         if (writeEntry) {
           if (writeEntry.type === 'pipe_read') {
@@ -666,6 +767,12 @@ export class SyscallHandler {
             ret = BigInt(count);
             break;
           }
+          if (writeEntry.type === 'tty') {
+            const data = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
+            this.io.writeStdout(data);
+            ret = BigInt(count);
+            break;
+          }
           if (writeEntry.type === 'vfs') {
             ret = this.vfs ? BigInt(this.vfs.write(writeEntry.fd, buf, count, view)) : -BigInt(EBADF);
             break;
@@ -688,8 +795,6 @@ export class SyscallHandler {
           }
           if (writeEntry.type === 'socket') {
             const sockWriteData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-            const sockText = new TextDecoder().decode(sockWriteData);
-            console.log(`[net] write(fd=${fd}, ${count}B): ${JSON.stringify(sockText)}`);
             const sockB64 = btoa(String.fromCharCode(...sockWriteData));
             return {
               status: 'bridge', method: 'net_write',
@@ -699,20 +804,26 @@ export class SyscallHandler {
               },
             };
           }
+          if (writeEntry.type === 'eventfd') {
+            if (count < 8) { ret = -BigInt(EINVAL); break; }
+            const value = view.getBigUint64(buf + GUEST_MEM_BASE, true);
+            if (value === 0xFFFFFFFFFFFFFFFFn) { ret = -BigInt(EINVAL); break; }
+            const newCounter = writeEntry.counter + value;
+            if (newCounter > 0xFFFFFFFFFFFFFFFEn) { ret = -BigInt(EAGAIN); break; }
+            writeEntry.counter = newCounter;
+            ret = 8n;
+            break;
+          }
+          if (writeEntry.type === 'inotify' || writeEntry.type === 'timerfd' || writeEntry.type === 'epoll') {
+            ret = -BigInt(EBADF); // not writable
+            break;
+          }
           ret = -BigInt(EBADF);
           break;
         }
 
-        // Default behavior
-        if (fd === 1) {
-          const data = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-          this.io.writeStdout(data);
-          ret = BigInt(count);
-        } else if (fd === 2) {
-          const data = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-          this.io.writeStderr(data);
-          ret = BigInt(count);
-        } else if (this.vfs) {
+        // No fdTable entry: fall through to VFS for raw fds
+        if (this.vfs && this.vfs.hasFd(fd)) {
           ret = BigInt(this.vfs.write(fd, buf, count, view));
         } else {
           ret = -BigInt(EBADF);
@@ -745,29 +856,6 @@ export class SyscallHandler {
             off += len;
           }
           const b64 = btoa(String.fromCharCode(...combined));
-          const text = new TextDecoder().decode(combined);
-          // Log individual iov entries for debugging
-          const iovDetails: string[] = [];
-          for (let i = 0; i < iovcnt; i++) {
-            const iovBase2 = Number(view.getBigUint64(iovBase + i * 16 + GUEST_MEM_BASE, true));
-            const iovLen2 = Number(view.getBigUint64(iovBase + i * 16 + 8 + GUEST_MEM_BASE, true));
-            iovDetails.push(`{0x${iovBase2.toString(16)},${iovLen2}}`);
-          }
-          // For the corrupted User-Agent: check the null byte
-          if (totalLen > 30 && text.includes('User-Agent')) {
-            const strAddr = Number(view.getBigUint64(iovBase + 16 + GUEST_MEM_BASE, true));
-            const strLen = Number(view.getBigUint64(iovBase + 24 + GUEST_MEM_BASE, true));
-            console.log(`[net] DEBUG iov[1] str@0x${strAddr.toString(16)} len=${strLen}`);
-            // Dump bytes at the string address
-            const strBytes: string[] = [];
-            for (let i = 0; i < Math.min(strLen + 4, 35); i++) {
-              strBytes.push(bytes[strAddr + GUEST_MEM_BASE + i].toString(16).padStart(2, '0'));
-            }
-            console.log(`[net] DEBUG bytes: ${strBytes.join(' ')}`);
-            // Check if null byte at position 4
-            console.log(`[net] DEBUG byte@+4: ${bytes[strAddr + GUEST_MEM_BASE + 4]} (should be 0)`);
-          }
-          console.log(`[net] writev(fd=${fd}, ${totalLen}B, iovs=[${iovDetails.join(',')}]): ${JSON.stringify(text)}`);
           return {
             status: 'bridge', method: 'net_write',
             args: { socketId: writevEntry.socketId, data: b64 },
@@ -817,19 +905,20 @@ export class SyscallHandler {
             } else if (writevEntry.type === 'stdio') {
               if (writevEntry.fd === 1) this.io.writeStdout(data);
               else if (writevEntry.fd === 2) this.io.writeStderr(data);
+            } else if (writevEntry.type === 'tty') {
+              this.io.writeStdout(data);
             } else if (writevEntry.type === 'vfs' && this.vfs) {
               this.vfs.write(writevEntry.fd, base, len, view);
             }
-          } else if (fd === 1) {
-            this.io.writeStdout(data);
-          } else if (fd === 2) {
-            this.io.writeStderr(data);
-          } else if (this.vfs) {
+          } else if (this.vfs && this.vfs.hasFd(fd)) {
             this.vfs.write(fd, base, len, view);
+          } else {
+            ret = -BigInt(EBADF);
+            break;
           }
           totalWritten += len;
         }
-        ret = BigInt(totalWritten);
+        if (ret !== -BigInt(EBADF)) ret = BigInt(totalWritten);
         break;
       }
 
@@ -928,11 +1017,7 @@ export class SyscallHandler {
             this.fdTable.set(newfd, { ...oldEntry });
           }
           ret = BigInt(newfd);
-        } else if (oldfd <= 2) {
-          const newfd = this.allocFd();
-          this.fdTable.set(newfd, { type: 'stdio', fd: oldfd });
-          ret = BigInt(newfd);
-        } else if (this.vfs) {
+        } else if (this.vfs && this.vfs.hasFd(oldfd)) {
           // oldfd is a VFS fd not in our table — dup it in VFS
           const vfsFd = this.vfs.dup(oldfd);
           if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
@@ -954,7 +1039,7 @@ export class SyscallHandler {
         // Validate fd range
         if (newfd < 0 || newfd >= MAX_FDS) { ret = -BigInt(EBADF); break; }
         // Validate oldfd exists
-        const oldfdValid = oldfd >= 0 && (oldfd <= 2 || this.fdTable.has(oldfd) || (this.vfs && this.vfs.hasFd(oldfd)));
+        const oldfdValid = oldfd >= 0 && (this.fdTable.has(oldfd) || (this.vfs?.hasFd(oldfd) ?? false));
         if (!oldfdValid) { ret = -BigInt(EBADF); break; }
         // Close newfd if it's open
         const existingEntry = this.fdTable.get(newfd);
@@ -984,11 +1069,7 @@ export class SyscallHandler {
             this.fdTable.set(newfd, { ...srcEntry });
           }
           ret = BigInt(newfd);
-        } else if (oldfd <= 2) {
-          this.fdTable.set(newfd, { type: 'stdio', fd: oldfd });
-          ret = BigInt(newfd);
-        } else if (this.vfs) {
-          // oldfd is a VFS fd not in our table — dup it in VFS
+        } else if (this.vfs && this.vfs.hasFd(oldfd)) {
           const vfsFd = this.vfs.dup(oldfd);
           if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
           this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
@@ -1008,6 +1089,12 @@ export class SyscallHandler {
         const path = readGuestString(bytes, Number(a1));
         const flags56 = Number(a2);
         const mode56 = Number(a3);
+        if (path === '/dev/tty') {
+          const ttyFd = this.allocFd();
+          this.fdTable.set(ttyFd, { type: 'tty' });
+          ret = BigInt(ttyFd);
+          break;
+        }
         const bp56 = this.bridgePath(path);
         if (bp56 !== null) {
           const guestFd = this.allocFd();
@@ -1074,11 +1161,12 @@ export class SyscallHandler {
               apply: (resp: any) => { cpu.setReg(0, 0n); },
             };
           }
+          if (closeEntry.type === 'epoll') this.epollSets?.delete(fd);
           this.fdTable.delete(fd);
+          this.fdFlags.delete(fd);
+          this.fdCloexec.delete(fd);
           ret = 0n;
-        } else if (fd <= 2) {
-          ret = 0n; // don't close stdio
-        } else if (this.vfs) {
+        } else if (this.vfs && this.vfs.hasFd(fd)) {
           ret = BigInt(this.vfs.close(fd));
         } else {
           ret = -BigInt(EBADF);
@@ -1110,32 +1198,27 @@ export class SyscallHandler {
       case 62: { // lseek(fd, offset, whence)
         const lseekFd = Number(a0);
         const lseekEntry = this.getFdEntry(lseekFd);
-        // Stdio and pipes are not seekable — return ESPIPE
-        if (lseekFd <= 2 && !lseekEntry) {
-          ret = -BigInt(ESPIPE);
+        if (lseekEntry) {
+          switch (lseekEntry.type) {
+            case 'stdio': case 'tty':
+            case 'pipe_read': case 'pipe_write':
+            case 'inotify': case 'timerfd': case 'eventfd': case 'epoll':
+            case 'socket':
+              ret = -BigInt(ESPIPE);
+              break;
+            case 'native':
+              return {
+                status: 'bridge', method: 'fs_lseek',
+                args: { fd: lseekEntry.nativeFd, offset: Number(a1), whence: Number(a2) },
+                apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+              };
+            case 'vfs':
+              ret = this.vfs ? this.vfs.lseek(lseekEntry.fd, BigInt.asIntN(64, a1), Number(a2)) : -BigInt(EBADF);
+              break;
+          }
           break;
         }
-        if (lseekEntry) {
-          if (lseekEntry.type === 'stdio' || lseekEntry.type === 'pipe_read' || lseekEntry.type === 'pipe_write') {
-            ret = -BigInt(ESPIPE);
-            break;
-          }
-          if (lseekEntry.type === 'native') {
-            return {
-              status: 'bridge', method: 'fs_lseek',
-              args: { fd: lseekEntry.nativeFd, offset: Number(a1), whence: Number(a2) },
-              apply: (resp: any) => {
-                cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-              },
-            };
-          }
-          if (lseekEntry.type === 'vfs') {
-            // Offset is signed (negative for backward seeks)
-            ret = this.vfs ? this.vfs.lseek(lseekEntry.fd, BigInt.asIntN(64, a1), Number(a2)) : -BigInt(EBADF);
-            break;
-          }
-        }
-        if (this.vfs) {
+        if (this.vfs && this.vfs.hasFd(lseekFd)) {
           ret = this.vfs.lseek(lseekFd, BigInt.asIntN(64, a1), Number(a2));
         } else {
           ret = -BigInt(EBADF);
@@ -1151,7 +1234,10 @@ export class SyscallHandler {
         // Check fd table first
         const fstatEntry = this.getFdEntry(fd);
         if (fstatEntry) {
-          if (fstatEntry.type === 'stdio' || fstatEntry.type === 'pipe_read' || fstatEntry.type === 'pipe_write') {
+          if (fstatEntry.type === 'stdio' || fstatEntry.type === 'tty' ||
+              fstatEntry.type === 'pipe_read' || fstatEntry.type === 'pipe_write' ||
+              fstatEntry.type === 'inotify' || fstatEntry.type === 'timerfd' ||
+              fstatEntry.type === 'eventfd' || fstatEntry.type === 'epoll') {
             writeChardevStat(view, statBuf);
             ret = 0n;
           } else if (fstatEntry.type === 'native') {
@@ -1172,10 +1258,7 @@ export class SyscallHandler {
           } else {
             ret = -BigInt(EBADF);
           }
-        } else if (fd <= 2) {
-          writeChardevStat(view, statBuf);
-          ret = 0n;
-        } else if (this.vfs) {
+        } else if (this.vfs && this.vfs.hasFd(fd)) {
           ret = BigInt(this.vfs.fstat(fd, statBuf, view));
         } else {
           ret = -BigInt(EBADF);
@@ -1544,7 +1627,7 @@ export class SyscallHandler {
 
         // Resolve fd through fd table — check if this is a dup'd stdio fd
         const ioctlEntry = this.getFdEntry(fd);
-        const isStdio = fd <= 2 || (ioctlEntry?.type === 'stdio');
+        const isStdio = ioctlEntry?.type === 'stdio' || ioctlEntry?.type === 'tty';
         const isPipe = ioctlEntry?.type === 'pipe_read' || ioctlEntry?.type === 'pipe_write';
         if (isPipe) {
           // Pipes don't support terminal ioctls
@@ -1819,8 +1902,10 @@ export class SyscallHandler {
             apply: (resp: any) => {
               if (resp.ret < 0) {
                 cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-              } else if (resp.mode && (resp.mode & 0o170000) === 0o40000) {
-                // It's a directory — update cwd
+                return;
+              }
+              const mode = resp._meta ? resp._meta[0] : resp.mode;
+              if (mode && (mode & 0o170000) === 0o40000) {
                 this.cwd = bPath;
                 if (this.vfs) this.vfs.setCwd(bPath);
                 cpu.setReg(0, 0n);
@@ -1899,10 +1984,7 @@ export class SyscallHandler {
               } else {
                 this.fdTable.set(newfd, { ...srcEntry });
               }
-            } else if (fd <= 2) {
-              this.fdTable.set(newfd, { type: 'stdio', fd });
-            } else if (this.vfs) {
-              // fd is a VFS fd not in our table — dup it in VFS
+            } else if (this.vfs && this.vfs.hasFd(fd)) {
               const vfsFd = this.vfs.dup(fd);
               if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
               this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
@@ -2088,7 +2170,6 @@ export class SyscallHandler {
         const domain = Number(a0);   // AF_INET=2, AF_INET6=10, AF_UNIX=1
         const sockType = Number(a1) & 0xFF; // SOCK_STREAM=1, SOCK_DGRAM=2 (strip SOCK_CLOEXEC|SOCK_NONBLOCK)
         const protocol = Number(a2);
-        console.log(`[net] socket(domain=${domain}, type=${sockType})`);
 
         // AF_UNIX sockets used by musl nscd — return ENOSYS so musl falls back to /etc/passwd
         if (domain === 1) { ret = -BigInt(ENOSYS); break; }
@@ -2160,13 +2241,11 @@ export class SyscallHandler {
         const connEntry = this.getFdEntry(Number(a0));
         if (!connEntry || connEntry.type !== 'socket') { ret = -BigInt(EBADF); break; }
         const connAddr = this.parseSockaddr(bytes, Number(a1), Number(a2));
-        console.log(`[net] connect(${connAddr.host}:${connAddr.port})`);
         connEntry.remoteAddr = connAddr;
         return {
           status: 'bridge', method: 'net_connect',
           args: { socketId: connEntry.socketId, ...connAddr },
           apply: (resp: any) => {
-            console.log(`[net] connect → ${resp.ret}`);
             cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
           },
         };
@@ -2209,12 +2288,10 @@ export class SyscallHandler {
         if (destAddrPtr !== 0 && destAddrLen > 0) {
           const dest = this.parseSockaddr(bytes, destAddrPtr, destAddrLen);
           if (!stEntry.remoteAddr) stEntry.remoteAddr = dest;
-          console.log(`[net] sendto(${dest.host}:${dest.port}, ${sendLen}B)`);
           return {
             status: 'bridge', method: 'net_sendto',
             args: { socketId: stEntry.socketId, data: b64, host: dest.host, port: dest.port },
             apply: (resp: any) => {
-              console.log(`[net] sendto → ${resp.ret}`);
               cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
             },
           };
@@ -2239,15 +2316,12 @@ export class SyscallHandler {
           args: { socketId: rfEntry.socketId, count: recvLen },
           apply: (resp: any) => {
             if (resp.ret < 0) {
-              console.log(`[net] recvfrom → err ${resp.ret}`);
               cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
             } else if (resp.data) {
               const decoded = Uint8Array.from(atob(resp.data), c => c.charCodeAt(0));
               bytes.set(decoded, recvBuf + GUEST_MEM_BASE);
-              console.log(`[net] recvfrom → ${decoded.length}B`);
               cpu.setReg(0, BigInt(decoded.length));
             } else {
-              console.log(`[net] recvfrom → ${resp.ret} (no data)`);
               cpu.setReg(0, BigInt(resp.ret));
             }
           },
@@ -2565,7 +2639,8 @@ export class SyscallHandler {
 
       case 26: { // inotify_init1(flags)
         const inoFd = this.allocFd();
-        this.fdTable.set(inoFd, { type: 'stdio', fd: inoFd }); // placeholder
+        this.fdTable.set(inoFd, { type: 'inotify' });
+        this.fdFlags.set(inoFd, Number(a0) & O_NONBLOCK);
         ret = BigInt(inoFd);
         break;
       }
@@ -2580,7 +2655,8 @@ export class SyscallHandler {
 
       case 85: { // timerfd_create(clockid, flags)
         const tfFd = this.allocFd();
-        this.fdTable.set(tfFd, { type: 'stdio', fd: tfFd }); // placeholder
+        this.fdTable.set(tfFd, { type: 'timerfd' });
+        this.fdFlags.set(tfFd, Number(a1) & O_NONBLOCK);
         ret = BigInt(tfFd);
         break;
       }
@@ -2828,29 +2904,24 @@ export class SyscallHandler {
       // ── I/O multiplexing (epoll, eventfd) ──
 
       case 19: { // eventfd2(initval, flags)
-        // Create an eventfd — a simple counter-based notification fd
-        // For our purposes, return a fd that reads/writes a 64-bit counter
-        // Implementation: use a VFS file as backing
-        if (this.vfs) {
-          const buf = new Uint8Array(8);
-          const dv = new DataView(buf.buffer);
-          dv.setBigUint64(0, BigInt(Number(a0)), true);
-          // Create a temp file for the eventfd
-          const fd = this.vfs.open('/dev/null', 0, 0); // just get a fd
-          // Actually, eventfd needs special semantics. For now, return a valid fd.
-          // Most software just needs it to not return ENOSYS.
-          ret = BigInt(fd >= 0 ? fd : -EBADF);
-        } else {
-          ret = -BigInt(ENOSYS);
-        }
+        const initVal = BigInt.asUintN(32, a0);
+        const efdFlags = Number(a1);
+        const EFD_SEMAPHORE = 1;
+        const EFD_NONBLOCK = O_NONBLOCK;
+        const efd = this.allocFd();
+        this.fdTable.set(efd, {
+          type: 'eventfd',
+          counter: initVal,
+          semaphore: (efdFlags & EFD_SEMAPHORE) !== 0,
+        });
+        this.fdFlags.set(efd, efdFlags & EFD_NONBLOCK);
+        ret = BigInt(efd);
         break;
       }
 
       case 20: { // epoll_create1(flags)
-        // Per spec: create epoll instance, returns fd
-        // We store epoll state indexed by the returned fd
         const epfd = this.allocFd();
-        this.fdTable.set(epfd, { type: 'stdio', fd: epfd }); // placeholder entry
+        this.fdTable.set(epfd, { type: 'epoll' });
         if (!this.epollSets) this.epollSets = new Map();
         this.epollSets.set(epfd, new Map()); // fd → { events, data }
         ret = BigInt(epfd);
@@ -2911,92 +2982,183 @@ export class SyscallHandler {
       }
 
       case 72: { // pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
-        // Per spec: synchronous I/O multiplexing
-        // Simple implementation: report all fds as ready
         const nfds = Number(a0);
-        // readfds, writefds at a1, a2 — leave them as-is (already set by caller)
-        ret = BigInt(nfds); // all ready
+        const readPtr = Number(a1);
+        const writePtr = Number(a2);
+        const exceptPtr = Number(a3);
+        const tmoPtr = Number(a4);
+
+        let tmoMs = -1;
+        if (tmoPtr !== 0) {
+          const sec = Number(view.getBigInt64(tmoPtr + GUEST_MEM_BASE, true));
+          const nsec = Number(view.getBigInt64(tmoPtr + GUEST_MEM_BASE + 8, true));
+          tmoMs = sec * 1000 + Math.floor(nsec / 1_000_000);
+        }
+
+        const wantRead = this.readFdSet(view, readPtr, nfds);
+        const wantWrite = this.readFdSet(view, writePtr, nfds);
+
+        const readyRead = new Set<number>();
+        const readyWrite = new Set<number>();
+        let deadline = tmoMs < 0 ? -1 : Date.now() + tmoMs;
+
+        while (true) {
+          readyRead.clear();
+          readyWrite.clear();
+          for (const fd of wantRead) if (this.isFdReadable(fd)) readyRead.add(fd);
+          for (const fd of wantWrite) if (this.isFdWritable(fd)) readyWrite.add(fd);
+          const total = readyRead.size + readyWrite.size;
+
+          if (total > 0) {
+            this.writeFdSet(view, readPtr, nfds, readyRead);
+            this.writeFdSet(view, writePtr, nfds, readyWrite);
+            if (exceptPtr !== 0) this.writeFdSet(view, exceptPtr, nfds, new Set());
+            ret = BigInt(total);
+            break;
+          }
+
+          const remaining = deadline < 0 ? -1 : Math.max(0, deadline - Date.now());
+          if (deadline >= 0 && remaining === 0) {
+            this.writeFdSet(view, readPtr, nfds, readyRead);
+            this.writeFdSet(view, writePtr, nfds, readyWrite);
+            if (exceptPtr !== 0) this.writeFdSet(view, exceptPtr, nfds, new Set());
+            ret = 0n;
+            break;
+          }
+
+          let wakeable = -1;
+          for (const fd of wantRead) if (this.isFdWakeable(fd)) { wakeable = fd; break; }
+
+          if (wakeable < 0 || !this.io.waitStdin) {
+            // No fd we can block on; behave as poll
+            this.writeFdSet(view, readPtr, nfds, readyRead);
+            this.writeFdSet(view, writePtr, nfds, readyWrite);
+            if (exceptPtr !== 0) this.writeFdSet(view, exceptPtr, nfds, new Set());
+            ret = 0n;
+            break;
+          }
+
+          const status = this.io.waitStdin(remaining);
+          if (status === 'timeout' && deadline >= 0) {
+            // Final empty result
+            this.writeFdSet(view, readPtr, nfds, readyRead);
+            this.writeFdSet(view, writePtr, nfds, readyWrite);
+            if (exceptPtr !== 0) this.writeFdSet(view, exceptPtr, nfds, new Set());
+            ret = 0n;
+            break;
+          }
+          // loop back, re-check
+        }
         break;
       }
 
       case 73: { // ppoll(fds, nfds, tmo_p, sigmask)
-        // struct pollfd { int fd; short events; short revents; }  (8 bytes each)
-        // Per POSIX: block until at least one fd is ready, or timeout expires.
-        // Returns number of fds with non-zero revents, 0 on timeout.
+        // struct pollfd { int fd; short events; short revents; }  — 8 bytes each
+        const POLLIN = 1, POLLOUT = 4;
         const fdsAddr = Number(a0);
         const nfds = Number(a1);
         const tmoPtr = Number(a2);
 
-        let tmoMs = -1; // -1 = infinite
+        let tmoMs = -1;
         if (tmoPtr !== 0) {
-          const tmoSec = Number(view.getBigInt64(tmoPtr + GUEST_MEM_BASE, true));
-          const tmoNsec = Number(view.getBigInt64(tmoPtr + GUEST_MEM_BASE + 8, true));
-          tmoMs = tmoSec * 1000 + Math.floor(tmoNsec / 1_000_000);
+          const sec = Number(view.getBigInt64(tmoPtr + GUEST_MEM_BASE, true));
+          const nsec = Number(view.getBigInt64(tmoPtr + GUEST_MEM_BASE + 8, true));
+          tmoMs = sec * 1000 + Math.floor(nsec / 1_000_000);
         }
 
-        // First pass: handle non-socket fds and find socket fds
-        let readyCount = 0;
-        let socketFd = -1;
-        let socketEntry: any = null;
-
+        // Snapshot pollfds
+        type Pfd = { fd: number; events: number; revents: number };
+        const pfds: Pfd[] = [];
         for (let i = 0; i < nfds; i++) {
-          const pfd = fdsAddr + i * 8 + GUEST_MEM_BASE;
-          const fd = view.getInt32(pfd, true);
-          const events = view.getInt16(pfd + 4, true);
+          const off = fdsAddr + i * 8 + GUEST_MEM_BASE;
+          pfds.push({
+            fd: view.getInt32(off, true),
+            events: view.getInt16(off + 4, true),
+            revents: 0,
+          });
+        }
 
-          if (fd < 0) {
-            view.setInt16(pfd + 6, 0, true);
-            continue;
+        const writeBack = () => {
+          for (let i = 0; i < nfds; i++) {
+            view.setInt16(fdsAddr + i * 8 + 6 + GUEST_MEM_BASE, pfds[i].revents, true);
           }
+        };
 
-          const entry = this.getFdEntry(fd);
-          if (entry?.type === 'socket' && (events & 1)) { // POLLIN
-            // Don't set revents yet — need to ask bridge
-            view.setInt16(pfd + 6, 0, true);
-            if (socketFd < 0) {
-              socketFd = fd;
-              socketEntry = entry;
-            }
-          } else {
-            // Non-socket fds: report as ready
-            view.setInt16(pfd + 6, events, true);
-            if (events) readyCount++;
+        // First pass: identify sockets (handled via bridge), do synchronous readiness for the rest
+        let socketEntry: any = null;
+        for (const pfd of pfds) {
+          if (pfd.fd < 0) continue;
+          const entry = this.getFdEntry(pfd.fd);
+          if (entry?.type === 'socket' && (pfd.events & POLLIN)) {
+            if (!socketEntry) socketEntry = { fd: pfd.fd, entry };
           }
         }
 
-        // If non-socket fds are ready, return immediately (don't block for sockets)
-        if (readyCount > 0) {
-          ret = BigInt(readyCount);
-          break;
-        }
+        const checkReady = (): number => {
+          let count = 0;
+          for (const pfd of pfds) {
+            pfd.revents = 0;
+            if (pfd.fd < 0) continue;
+            const entry = this.getFdEntry(pfd.fd);
+            if (entry?.type === 'socket') continue; // socket readiness handled by bridge
+            if ((pfd.events & POLLIN) && this.isFdReadable(pfd.fd)) pfd.revents |= POLLIN;
+            if ((pfd.events & POLLOUT) && this.isFdWritable(pfd.fd)) pfd.revents |= POLLOUT;
+            if (pfd.revents !== 0) count++;
+          }
+          return count;
+        };
 
-        // Only socket fds being polled — ask bridge to wait for data
-        if (socketFd >= 0 && socketEntry) {
-          const pollTmo = tmoMs < 0 ? 30000 : tmoMs; // cap infinite at 30s
+        // If only socket fds are watched, defer to bridge poll
+        const watchingLocal = pfds.some((p) => p.fd >= 0 && this.getFdEntry(p.fd)?.type !== 'socket');
+        if (!watchingLocal && socketEntry) {
+          const pollTmo = tmoMs < 0 ? 30000 : tmoMs;
           return {
             status: 'bridge', method: 'net_poll',
-            args: { socketId: socketEntry.socketId, timeoutMs: pollTmo },
+            args: { socketId: socketEntry.entry.socketId, timeoutMs: pollTmo },
             apply: (resp: any) => {
               if (resp.ret > 0) {
-                // Mark socket fds as ready
-                for (let i = 0; i < nfds; i++) {
-                  const pfd = fdsAddr + i * 8 + GUEST_MEM_BASE;
-                  const fd = view.getInt32(pfd, true);
-                  const events = view.getInt16(pfd + 4, true);
-                  if (fd >= 0 && this.getFdEntry(fd)?.type === 'socket' && (events & 1)) {
-                    view.setInt16(pfd + 6, events, true);
-                  }
+                for (const pfd of pfds) {
+                  if (pfd.fd < 0) continue;
+                  const e = this.getFdEntry(pfd.fd);
+                  if (e?.type === 'socket' && (pfd.events & POLLIN)) pfd.revents |= POLLIN;
                 }
-                cpu.setReg(0, 1n);
-              } else {
-                cpu.setReg(0, 0n); // timeout
               }
+              writeBack();
+              const c = pfds.filter((p) => p.revents !== 0).length;
+              cpu.setReg(0, BigInt(c));
             },
           };
         }
 
-        // No fds at all (or all fd=-1)
-        ret = 0n;
+        // Synchronous + wait path for local fds (stdin/tty/pipes/files)
+        let deadline = tmoMs < 0 ? -1 : Date.now() + tmoMs;
+        while (true) {
+          const ready = checkReady();
+          if (ready > 0) {
+            writeBack();
+            ret = BigInt(ready);
+            break;
+          }
+          const remaining = deadline < 0 ? -1 : Math.max(0, deadline - Date.now());
+          if (deadline >= 0 && remaining === 0) {
+            writeBack();
+            ret = 0n;
+            break;
+          }
+          // Find a wakeable fd (only stdin/tty currently). If none, behave as poll.
+          const wakeable = pfds.some((p) => p.fd >= 0 && (p.events & POLLIN) && this.isFdWakeable(p.fd));
+          if (!wakeable || !this.io.waitStdin) {
+            writeBack();
+            ret = 0n;
+            break;
+          }
+          const status = this.io.waitStdin(remaining);
+          if (status === 'timeout' && deadline >= 0) {
+            writeBack();
+            ret = 0n;
+            break;
+          }
+        }
         break;
       }
 
@@ -3102,13 +3264,11 @@ export class SyscallHandler {
         for (let i = 0; i < rmIovLen; i++) {
           rmCapacity += Number(view.getBigUint64(rmIovPtr + i * 16 + 8 + GUEST_MEM_BASE, true));
         }
-        console.log(`[net] recvmsg(fd=${Number(a0)}, capacity=${rmCapacity})`);
         return {
           status: 'bridge', method: 'net_read',
           args: { socketId: rmEntry.socketId, count: rmCapacity },
           apply: (resp: any) => {
             if (resp.ret < 0) {
-              console.log(`[net] recvmsg → err ${resp.ret}`);
               cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
               return;
             }
@@ -3141,7 +3301,6 @@ export class SyscallHandler {
             // Clear msg_flags and msg_controllen
             view.setInt32(rmhdr + 48, 0, true);     // msg_flags
             view.setBigUint64(rmhdr + 40, 0n, true); // msg_controllen
-            console.log(`[net] recvmsg → ${recvd.length}B`);
             cpu.setReg(0, BigInt(recvd.length));
           },
         };
