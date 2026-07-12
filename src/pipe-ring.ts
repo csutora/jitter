@@ -93,6 +93,32 @@ export class PipeRing {
     return toWrite;
   }
 
+  /**
+   * Blocking write: keep writing `src` until it is fully in the ring, parking on reader progress
+   * (PIPE_READ_POS) whenever the ring is full. `waiter` is the interruptible park (same one the
+   * blocking read uses): it returns true if a signal interrupted the wait.
+   * Returns bytes written (== src.length on success); if nothing could be written it returns
+   * -1 (all readers closed -> EPIPE) or -2 (interrupted -> EINTR). A partial write that then hits
+   * reader-close/interrupt returns the partial count, per posix.
+   */
+  writeAll(src: Uint8Array, waiter: (i32: Int32Array, idx: number, expected: number) => boolean): number {
+    let written = 0;
+    while (written < src.length) {
+      const n = this.write(src.subarray(written));
+      if (n === -1) return written > 0 ? written : -1; // readers gone: partial, else EPIPE
+      written += n;
+      if (written >= src.length) break;
+      // ring full: wait for a reader to consume before writing the rest. load rp *after* the write
+      // filled the ring so a reader that advances it wakes us (no lost wakeup).
+      const rp = Atomics.load(this.i32, PIPE_READ_POS);
+      const wp = Atomics.load(this.i32, PIPE_WRITE_POS);
+      if (this.dataSize - 1 - (wp - rp) <= 0) {
+        if (waiter(this.i32, PIPE_READ_POS, rp)) return written > 0 ? written : -2; // interrupted
+      }
+    }
+    return written;
+  }
+
   /** Decrement writer refcount. Last close triggers EOF for readers. */
   closeWriter(): void {
     const remaining = Atomics.sub(this.i32, PIPE_WRITER_CLOSED, 1) - 1;
@@ -112,11 +138,17 @@ export class PipeRing {
   /**
    * Read data from the ring into dst. Returns the number of bytes read.
    * Returns 0 for EOF (writer closed and ring empty).
-   * Blocks via Atomics.wait() if the ring is empty and writer is still open.
+   * Returns -1 if `waiter` reported an interruption (EINTR — a pending signal).
+   * Blocks via Atomics.wait() (or `waiter`) if the ring is empty and writer is still open.
+   *
+   * `waiter`, when given, replaces the bare Atomics.wait: it parks on the passed futex and
+   * returns true if the wait should be abandoned because a signal is pending. this keeps the
+   * signal machinery in the Worker while letting the ring own the empty/EOF logic. without it
+   * the read blocks indefinitely, which is un-interruptible by anything but SIGKILL.
    *
    * IMPORTANT: Only call from a Worker thread (Atomics.wait blocks the thread).
    */
-  read(dst: Uint8Array): number {
+  read(dst: Uint8Array, waiter?: (i32: Int32Array, idx: number, expected: number) => boolean): number {
     while (true) {
       const wp = Atomics.load(this.i32, PIPE_WRITE_POS);
       const rp = Atomics.load(this.i32, PIPE_READ_POS);
@@ -146,9 +178,12 @@ export class PipeRing {
         return 0; // EOF — no more writers
       }
 
-      // Block until writer adds data or closes
-      // wp hasn't changed, so wait for it to change
-      Atomics.wait(this.i32, PIPE_WRITE_POS, wp);
+      // Block until writer adds data or closes. wp hasn't changed, so wait for it to change.
+      if (waiter) {
+        if (waiter(this.i32, PIPE_WRITE_POS, wp)) return -1; // interrupted by a signal
+      } else {
+        Atomics.wait(this.i32, PIPE_WRITE_POS, wp);
+      }
     }
   }
 

@@ -25,27 +25,27 @@
   var PC_OFFSET = 256;
   var NZCV_OFFSET = 264;
   var ITER_OFFSET = 272;
-  var TPIDR_OFFSET = 280;
   var V_OFFSET = 512;
+  var STATE_SIZE = 1024;
   var GUEST_MEM_BASE = 65536;
   function regOffset(r) {
     if (r === 31) return SP_OFFSET;
     return REG_OFFSET + r * 8;
   }
-  function vregOffset(r) {
-    return V_OFFSET + r * 16;
-  }
-  var BLOCKTYPE_VOID = 64;
   var HALT_PC = 0xDEAD0000n;
   var SVC_PC = 0xDEAD0001n;
 
   // src/cpu.ts
   var CpuState = class {
     memory;
+    /** per-thread register-block base in linear memory. 0 for the main thread / single-threaded;
+     * a thread-worker's block sits at its reg_base so threads sharing one memory keep private regs. */
+    base;
     _view;
     _buffer;
-    constructor(memory2) {
+    constructor(memory2, base = 0) {
       this.memory = memory2;
+      this.base = base;
       this._buffer = memory2.buffer;
       this._view = new DataView(this._buffer);
     }
@@ -59,29 +59,29 @@
     }
     getReg(r) {
       if (r === 31) return 0n;
-      return this.view.getBigUint64(regOffset(r), true);
+      return this.view.getBigUint64(this.base + regOffset(r), true);
     }
     setReg(r, value) {
       if (r === 31) return;
-      this.view.setBigUint64(regOffset(r), value, true);
+      this.view.setBigUint64(this.base + regOffset(r), value, true);
     }
     getSP() {
-      return this.view.getBigUint64(SP_OFFSET, true);
+      return this.view.getBigUint64(this.base + SP_OFFSET, true);
     }
     setSP(value) {
-      this.view.setBigUint64(SP_OFFSET, value, true);
+      this.view.setBigUint64(this.base + SP_OFFSET, value, true);
     }
     getPC() {
-      return this.view.getBigUint64(PC_OFFSET, true);
+      return this.view.getBigUint64(this.base + PC_OFFSET, true);
     }
     setPC(value) {
-      this.view.setBigUint64(PC_OFFSET, value, true);
+      this.view.setBigUint64(this.base + PC_OFFSET, value, true);
     }
     getNZCV() {
-      return this.view.getBigUint64(NZCV_OFFSET, true);
+      return this.view.getBigUint64(this.base + NZCV_OFFSET, true);
     }
     setNZCV(value) {
-      this.view.setBigUint64(NZCV_OFFSET, value, true);
+      this.view.setBigUint64(this.base + NZCV_OFFSET, value, true);
     }
     reset() {
       for (let i = 0; i < 31; i++) this.setReg(i, 0n);
@@ -89,7 +89,7 @@
       this.setPC(0n);
       this.setNZCV(0n);
       for (let i = 0; i < 32 * 16; i += 8) {
-        this.view.setBigUint64(V_OFFSET + i, 0n, true);
+        this.view.setBigUint64(this.base + V_OFFSET + i, 0n, true);
       }
     }
   };
@@ -1191,918 +1191,10 @@
     };
   }
 
-  // src/wasm-emit.ts
-  function encodeULEB128(value) {
-    const bytes = [];
-    do {
-      let byte = value & 127;
-      value >>>= 7;
-      if (value !== 0) byte |= 128;
-      bytes.push(byte);
-    } while (value !== 0);
-    return bytes;
-  }
-  function encodeSLEB128(value) {
-    const bytes = [];
-    let more = true;
-    while (more) {
-      let byte = value & 127;
-      value >>= 7;
-      if (value === 0 && (byte & 64) === 0 || value === -1 && (byte & 64) !== 0) {
-        more = false;
-      } else {
-        byte |= 128;
-      }
-      bytes.push(byte);
-    }
-    return bytes;
-  }
-  function encodeSLEB128_i64(value) {
-    value = BigInt.asIntN(64, value);
-    const bytes = [];
-    let more = true;
-    while (more) {
-      let byte = Number(value & 0x7Fn);
-      value >>= 7n;
-      if (value === 0n && (byte & 64) === 0 || value === -1n && (byte & 64) !== 0) {
-        more = false;
-      } else {
-        byte |= 128;
-      }
-      bytes.push(byte);
-    }
-    return bytes;
-  }
-  function encodeString(s) {
-    const utf8 = new TextEncoder().encode(s);
-    return [...encodeULEB128(utf8.length), ...utf8];
-  }
-  function encodeSection(id, content) {
-    return [id, ...encodeULEB128(content.length), ...content];
-  }
-  var WasmModuleBuilder = class {
-    // Section data
-    types = [];
-    // encoded function types
-    imports = [];
-    // encoded imports
-    importCount = 0;
-    importedFuncCount = 0;
-    // function imports only (for func index space)
-    funcTypeIndices = [];
-    // type index per function
-    exports = [];
-    exportCount = 0;
-    // Current function being built
-    code = [];
-    // instruction bytecode
-    localGroups = [];
-    localCount = 0;
-    // total locals (params + declared)
-    paramCount = 0;
-    funcBodies = [];
-    // finalized function bodies
-    // ── Types ──────────────────────────────────────────────────────────────────
-    addFuncType(params, results) {
-      const encoded = [
-        96,
-        // function type marker
-        ...encodeULEB128(params.length),
-        ...params,
-        ...encodeULEB128(results.length),
-        ...results
-      ];
-      this.types.push(encoded);
-      return this.types.length - 1;
-    }
-    // ── Imports ────────────────────────────────────────────────────────────────
-    addMemoryImport(module, name, minPages, maxPages) {
-      const importData = [
-        ...encodeString(module),
-        ...encodeString(name),
-        2
-        // import kind: memory
-      ];
-      if (maxPages !== void 0) {
-        importData.push(1, ...encodeULEB128(minPages), ...encodeULEB128(maxPages));
-      } else {
-        importData.push(0, ...encodeULEB128(minPages));
-      }
-      this.imports.push(...importData);
-      this.importCount++;
-    }
-    addFunctionImport(module, name, typeIndex) {
-      const importData = [
-        ...encodeString(module),
-        ...encodeString(name),
-        0,
-        // import kind: function
-        ...encodeULEB128(typeIndex)
-      ];
-      this.imports.push(...importData);
-      const funcIdx = this.importedFuncCount;
-      this.importCount++;
-      this.importedFuncCount++;
-      return funcIdx;
-    }
-    // ── Functions ──────────────────────────────────────────────────────────────
-    beginFunction(typeIndex) {
-      this.funcTypeIndices.push(typeIndex);
-      this.code = [];
-      this.localGroups = [];
-      this.localCount = 0;
-      const typeData = this.types[typeIndex];
-      this.paramCount = typeData[1];
-      this.localCount = this.paramCount;
-    }
-    addLocals(type, count) {
-      const firstIndex = this.localCount;
-      this.localGroups.push({ count, type });
-      this.localCount += count;
-      return firstIndex;
-    }
-    exportFunction(name, funcIndex) {
-      const idx = funcIndex ?? this.importedFuncCount + this.funcTypeIndices.length - 1;
-      this.exports.push(
-        ...encodeString(name),
-        0,
-        ...encodeULEB128(idx)
-      );
-      this.exportCount++;
-    }
-    endFunction() {
-      const localDecls = [
-        ...encodeULEB128(this.localGroups.length)
-      ];
-      for (const g of this.localGroups) {
-        localDecls.push(...encodeULEB128(g.count), g.type);
-      }
-      const body = [...localDecls, ...this.code, 11 /* End */];
-      const bodyWithSize = [...encodeULEB128(body.length), ...body];
-      this.funcBodies.push(bodyWithSize);
-    }
-    // ── Instruction emission ───────────────────────────────────────────────────
-    // Constants
-    i32_const(value) {
-      this.code.push(65 /* I32Const */, ...encodeSLEB128(value));
-    }
-    i64_const(value) {
-      this.code.push(66 /* I64Const */, ...encodeSLEB128_i64(value));
-    }
-    // Variables
-    local_get(idx) {
-      this.code.push(32 /* LocalGet */, ...encodeULEB128(idx));
-    }
-    local_set(idx) {
-      this.code.push(33 /* LocalSet */, ...encodeULEB128(idx));
-    }
-    local_tee(idx) {
-      this.code.push(34 /* LocalTee */, ...encodeULEB128(idx));
-    }
-    // Memory
-    i32_load(align, offset) {
-      this.code.push(40 /* I32Load */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load(align, offset) {
-      this.code.push(41 /* I64Load */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_store(align, offset) {
-      this.code.push(54 /* I32Store */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_store(align, offset) {
-      this.code.push(55 /* I64Store */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_load8_s(align, offset) {
-      this.code.push(44 /* I32Load8S */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_load8_u(align, offset) {
-      this.code.push(45 /* I32Load8U */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_load16_s(align, offset) {
-      this.code.push(46 /* I32Load16S */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_load16_u(align, offset) {
-      this.code.push(47 /* I32Load16U */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load8_s(align, offset) {
-      this.code.push(48 /* I64Load8S */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load8_u(align, offset) {
-      this.code.push(49 /* I64Load8U */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load16_s(align, offset) {
-      this.code.push(50 /* I64Load16S */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load16_u(align, offset) {
-      this.code.push(51 /* I64Load16U */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load32_s(align, offset) {
-      this.code.push(52 /* I64Load32S */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_load32_u(align, offset) {
-      this.code.push(53 /* I64Load32U */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_store8(align, offset) {
-      this.code.push(60 /* I64Store8 */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_store16(align, offset) {
-      this.code.push(61 /* I64Store16 */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i64_store32(align, offset) {
-      this.code.push(62 /* I64Store32 */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_store8(align, offset) {
-      this.code.push(58 /* I32Store8 */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    i32_store16(align, offset) {
-      this.code.push(59 /* I32Store16 */, ...encodeULEB128(align), ...encodeULEB128(offset));
-    }
-    // i32 comparison
-    i32_eqz() {
-      this.code.push(69 /* I32Eqz */);
-    }
-    i32_eq() {
-      this.code.push(70 /* I32Eq */);
-    }
-    i32_ne() {
-      this.code.push(71 /* I32Ne */);
-    }
-    // i32 arithmetic
-    i32_add() {
-      this.code.push(106 /* I32Add */);
-    }
-    i32_sub() {
-      this.code.push(107 /* I32Sub */);
-    }
-    // i64 comparison
-    i64_eqz() {
-      this.code.push(80 /* I64Eqz */);
-    }
-    i64_eq() {
-      this.code.push(81 /* I64Eq */);
-    }
-    i64_ne() {
-      this.code.push(82 /* I64Ne */);
-    }
-    i64_lt_s() {
-      this.code.push(83 /* I64LtS */);
-    }
-    i64_lt_u() {
-      this.code.push(84 /* I64LtU */);
-    }
-    i64_gt_s() {
-      this.code.push(85 /* I64GtS */);
-    }
-    i64_gt_u() {
-      this.code.push(86 /* I64GtU */);
-    }
-    i64_le_s() {
-      this.code.push(87 /* I64LeS */);
-    }
-    i64_le_u() {
-      this.code.push(88 /* I64LeU */);
-    }
-    i64_ge_s() {
-      this.code.push(89 /* I64GeS */);
-    }
-    i64_ge_u() {
-      this.code.push(90 /* I64GeU */);
-    }
-    // i64 unary
-    i64_clz() {
-      this.code.push(121 /* I64Clz */);
-    }
-    i64_ctz() {
-      this.code.push(122 /* I64Ctz */);
-    }
-    i64_popcnt() {
-      this.code.push(123 /* I64Popcnt */);
-    }
-    // i64 arithmetic
-    i64_add() {
-      this.code.push(124 /* I64Add */);
-    }
-    i64_sub() {
-      this.code.push(125 /* I64Sub */);
-    }
-    i64_mul() {
-      this.code.push(126 /* I64Mul */);
-    }
-    i64_div_s() {
-      this.code.push(127 /* I64DivS */);
-    }
-    i64_div_u() {
-      this.code.push(128 /* I64DivU */);
-    }
-    i64_rem_s() {
-      this.code.push(129 /* I64RemS */);
-    }
-    i64_rem_u() {
-      this.code.push(130 /* I64RemU */);
-    }
-    i64_and() {
-      this.code.push(131 /* I64And */);
-    }
-    i64_or() {
-      this.code.push(132 /* I64Or */);
-    }
-    i64_xor() {
-      this.code.push(133 /* I64Xor */);
-    }
-    i64_shl() {
-      this.code.push(134 /* I64Shl */);
-    }
-    i64_shr_s() {
-      this.code.push(135 /* I64ShrS */);
-    }
-    i64_shr_u() {
-      this.code.push(136 /* I64ShrU */);
-    }
-    i64_rotl() {
-      this.code.push(137 /* I64Rotl */);
-    }
-    i64_rotr() {
-      this.code.push(138 /* I64Rotr */);
-    }
-    // Conversions
-    i32_wrap_i64() {
-      this.code.push(167 /* I32WrapI64 */);
-    }
-    i64_extend_i32_s() {
-      this.code.push(172 /* I64ExtendI32S */);
-    }
-    i64_extend_i32_u() {
-      this.code.push(173 /* I64ExtendI32U */);
-    }
-    // Control flow
-    block(blocktype) {
-      this.code.push(2 /* Block */, blocktype);
-    }
-    loop(blocktype) {
-      this.code.push(3 /* Loop */, blocktype);
-    }
-    if_(blocktype) {
-      this.code.push(4 /* If */, blocktype);
-    }
-    else_() {
-      this.code.push(5 /* Else */);
-    }
-    end() {
-      this.code.push(11 /* End */);
-    }
-    br(depth) {
-      this.code.push(12 /* Br */, ...encodeULEB128(depth));
-    }
-    br_if(depth) {
-      this.code.push(13 /* BrIf */, ...encodeULEB128(depth));
-    }
-    br_table(labels, defaultLabel) {
-      this.code.push(14 /* BrTable */, ...encodeULEB128(labels.length));
-      for (const label of labels) {
-        this.code.push(...encodeULEB128(label));
-      }
-      this.code.push(...encodeULEB128(defaultLabel));
-    }
-    return_() {
-      this.code.push(15 /* Return */);
-    }
-    unreachable() {
-      this.code.push(0 /* Unreachable */);
-    }
-    call(funcIdx) {
-      this.code.push(16 /* Call */, ...encodeULEB128(funcIdx));
-    }
-    drop() {
-      this.code.push(26);
-    }
-    // ── Finalize ───────────────────────────────────────────────────────────────
-    finalize() {
-      const sections = [];
-      sections.push(0, 97, 115, 109);
-      sections.push(1, 0, 0, 0);
-      if (this.types.length > 0) {
-        const content = [
-          ...encodeULEB128(this.types.length),
-          ...this.types.flat()
-        ];
-        sections.push(...encodeSection(1, content));
-      }
-      if (this.importCount > 0) {
-        const content = [
-          ...encodeULEB128(this.importCount),
-          ...this.imports
-        ];
-        sections.push(...encodeSection(2, content));
-      }
-      if (this.funcTypeIndices.length > 0) {
-        const content = [
-          ...encodeULEB128(this.funcTypeIndices.length),
-          ...this.funcTypeIndices.flatMap((i) => encodeULEB128(i))
-        ];
-        sections.push(...encodeSection(3, content));
-      }
-      if (this.exportCount > 0) {
-        const content = [
-          ...encodeULEB128(this.exportCount),
-          ...this.exports
-        ];
-        sections.push(...encodeSection(7, content));
-      }
-      if (this.funcBodies.length > 0) {
-        const content = [
-          ...encodeULEB128(this.funcBodies.length),
-          ...this.funcBodies.flat()
-        ];
-        sections.push(...encodeSection(10, content));
-      }
-      return new Uint8Array(sections);
-    }
-  };
-
-  // src/translate.ts
-  var REG_COUNT = 33;
-  function regLocal(r) {
-    if (r >= 0 && r <= 30) return r;
-    if (r === 31) return 31;
-    throw new Error(`Invalid register ${r}`);
-  }
-  var SP_LOCAL = 31;
-  var NZCV_LOCAL = 32;
-  function analyzeRegUsage(insns) {
-    const reads = /* @__PURE__ */ new Set();
-    const writes = /* @__PURE__ */ new Set();
-    for (const insn of insns) {
-      switch (insn.kind) {
-        case "add_imm":
-        case "sub_imm":
-          if (insn.rn !== 31) reads.add(regLocal(insn.rn));
-          else reads.add(SP_LOCAL);
-          if (insn.rd === 31) {
-            if (!insn.setFlags) writes.add(SP_LOCAL);
-          } else {
-            writes.add(regLocal(insn.rd));
-          }
-          if (insn.setFlags) writes.add(NZCV_LOCAL);
-          break;
-        case "add_reg":
-        case "sub_reg":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          if (insn.setFlags) writes.add(NZCV_LOCAL);
-          break;
-        case "adc":
-        case "sbc":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          reads.add(NZCV_LOCAL);
-          addWrite(writes, insn.rd);
-          if (insn.setFlags) writes.add(NZCV_LOCAL);
-          break;
-        case "orr_reg":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          break;
-        case "eor_reg":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          break;
-        case "and_reg":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          if (insn.setFlags) writes.add(NZCV_LOCAL);
-          break;
-        case "and_imm":
-          addRead(reads, insn.rn);
-          if (insn.setFlags) {
-            addWrite(writes, insn.rd);
-            writes.add(NZCV_LOCAL);
-          } else {
-            if (insn.rd === 31) writes.add(SP_LOCAL);
-            else addWrite(writes, insn.rd);
-          }
-          break;
-        case "orr_imm":
-        case "eor_imm":
-          addRead(reads, insn.rn);
-          if (insn.rd === 31) writes.add(SP_LOCAL);
-          else addWrite(writes, insn.rd);
-          break;
-        case "movz":
-          addWrite(writes, insn.rd);
-          break;
-        case "movk":
-          addRead(reads, insn.rd);
-          addWrite(writes, insn.rd);
-          break;
-        case "movn":
-          addWrite(writes, insn.rd);
-          break;
-        case "madd":
-        case "msub":
-        case "smaddl":
-        case "smsubl":
-        case "umaddl":
-        case "umsubl":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addRead(reads, insn.ra);
-          addWrite(writes, insn.rd);
-          break;
-        case "sdiv":
-        case "udiv":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          break;
-        case "csel":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          reads.add(NZCV_LOCAL);
-          addWrite(writes, insn.rd);
-          break;
-        case "sbfm":
-        case "ubfm":
-          addRead(reads, insn.rn);
-          addWrite(writes, insn.rd);
-          break;
-        case "bfm":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rd);
-          addWrite(writes, insn.rd);
-          break;
-        case "b_cond":
-          reads.add(NZCV_LOCAL);
-          break;
-        case "cbz":
-        case "cbnz":
-          addRead(reads, insn.rt);
-          break;
-        case "bl":
-        case "blr":
-          writes.add(regLocal(30));
-          if (insn.kind === "blr") addRead(reads, insn.rn);
-          break;
-        case "br":
-          addRead(reads, insn.rn);
-          break;
-        case "ret":
-          addRead(reads, insn.rn);
-          break;
-        case "ldr_imm":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addWrite(writes, insn.rt);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "str_imm":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rt);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "ldrb_imm":
-        case "ldrh_imm":
-        case "ldrsw_imm":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addWrite(writes, insn.rt);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "ldrsb_imm":
-        case "ldrsh_imm":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addWrite(writes, insn.rt);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "strb_imm":
-        case "strh_imm":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rt);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "ldr_reg":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rt);
-          break;
-        case "str_reg":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rm);
-          addRead(reads, insn.rt);
-          break;
-        case "ldp":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addWrite(writes, insn.rt);
-          addWrite(writes, insn.rt2);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "stp":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rt);
-          addRead(reads, insn.rt2);
-          if (insn.mode !== "offset") {
-            if (insn.rn !== 31) addWrite(writes, insn.rn);
-            else writes.add(SP_LOCAL);
-          }
-          break;
-        case "adr":
-        case "adrp":
-          addWrite(writes, insn.rd);
-          break;
-        case "smulh":
-        case "umulh":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          break;
-        case "tbz":
-        case "tbnz":
-          addRead(reads, insn.rt);
-          break;
-        case "clz":
-        case "cls":
-        case "rbit":
-        case "rev":
-        case "rev16":
-          addRead(reads, insn.rn);
-          addWrite(writes, insn.rd);
-          break;
-        case "rev32":
-          addRead(reads, insn.rn);
-          addWrite(writes, insn.rd);
-          break;
-        case "extr":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          break;
-        case "ccmp":
-        case "ccmn":
-          addRead(reads, insn.rn);
-          if (!insn.isImm) addRead(reads, insn.rm_imm);
-          reads.add(NZCV_LOCAL);
-          writes.add(NZCV_LOCAL);
-          break;
-        case "ldr_lit":
-        case "ldrsw_lit":
-          addWrite(writes, insn.rt);
-          break;
-        case "ldrb_reg":
-        case "ldrh_reg":
-        case "ldrsw_reg":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rt);
-          break;
-        case "ldrsb_reg":
-        case "ldrsh_reg":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rt);
-          break;
-        case "strb_reg":
-        case "strh_reg":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rm);
-          addRead(reads, insn.rt);
-          break;
-        case "ldxr":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addWrite(writes, insn.rt);
-          break;
-        case "stxr":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rt);
-          addWrite(writes, insn.rs);
-          break;
-        case "mrs":
-          addWrite(writes, insn.rt);
-          if (insn.sysreg === "nzcv") reads.add(NZCV_LOCAL);
-          break;
-        case "msr":
-          addRead(reads, insn.rt);
-          if (insn.sysreg === "nzcv") writes.add(NZCV_LOCAL);
-          break;
-        case "add_ext":
-        case "sub_ext":
-          if (insn.rn !== 31) addRead(reads, insn.rn);
-          else reads.add(SP_LOCAL);
-          addRead(reads, insn.rm);
-          if (insn.setFlags) {
-            reads.add(NZCV_LOCAL);
-            writes.add(NZCV_LOCAL);
-          }
-          if (insn.rd === 31) {
-            if (!insn.setFlags) writes.add(SP_LOCAL);
-          } else addWrite(writes, insn.rd);
-          break;
-        // Variable shifts
-        case "lslv":
-        case "lsrv":
-        case "asrv":
-        case "rorv":
-          addRead(reads, insn.rn);
-          addRead(reads, insn.rm);
-          addWrite(writes, insn.rd);
-          break;
-        // SIMD load/store: reads base register (SP or GPR), may write back
-        case "str_simd":
-        case "ldr_simd":
-          if (insn.rn === 31) reads.add(SP_LOCAL);
-          else addRead(reads, insn.rn);
-          if (insn.mode !== "offset") {
-            if (insn.rn === 31) writes.add(SP_LOCAL);
-            else addWrite(writes, insn.rn);
-          }
-          break;
-        case "stp_simd":
-        case "ldp_simd":
-          if (insn.rn === 31) reads.add(SP_LOCAL);
-          else addRead(reads, insn.rn);
-          if (insn.mode !== "offset") {
-            if (insn.rn === 31) writes.add(SP_LOCAL);
-            else addWrite(writes, insn.rn);
-          }
-          break;
-        // SIMD data ops: read/write V regs directly from memory, may read GPRs
-        case "simd_dup_gpr":
-          addRead(reads, insn.rn);
-          break;
-        case "simd_umov":
-          addWrite(writes, insn.rd);
-          break;
-        case "simd_ins_gpr":
-          addRead(reads, insn.rn);
-          break;
-        case "simd_dup_elem":
-        case "simd_movi":
-          break;
-        // FMOV GPR → FP: reads GPR
-        case "fmov_to_fp":
-        case "fmov_top_to_fp":
-          addRead(reads, insn.rn);
-          break;
-        // FMOV FP → GPR: writes GPR
-        case "fmov_from_fp":
-        case "fmov_top_from_fp":
-          addWrite(writes, insn.rd);
-          break;
-        // FP-only / SIMD-only: no GPR involvement
-        case "fmov_fp":
-        case "fmul":
-        case "fdiv":
-        case "fadd":
-        case "fsub":
-        case "fabs":
-        case "fneg":
-        case "fcvt":
-        case "fmov_imm":
-        case "fmadd":
-        case "fmsub":
-        case "fnmadd":
-        case "fnmsub":
-        case "simd_orr_reg":
-        case "simd_and_reg":
-        case "simd_bic_reg":
-        case "simd_eor_reg":
-        case "simd_add":
-        case "simd_sub":
-        case "simd_cmeq_reg":
-        case "simd_cmgt_reg":
-        case "simd_cmhi_reg":
-        case "simd_cmge_reg":
-        case "simd_cmhs_reg":
-        case "simd_umaxp":
-        case "simd_addp":
-        case "simd_tbl":
-        case "simd_zip1":
-        case "simd_zip2":
-        case "simd_uzp1":
-        case "simd_uzp2":
-        case "simd_trn1":
-        case "simd_trn2":
-        case "simd_not":
-        case "simd_neg":
-        case "simd_abs":
-        case "simd_cnt":
-        case "simd_cls_vec":
-        case "simd_clz_vec":
-        case "simd_sshll":
-        case "simd_ushll":
-        case "simd_scvtf":
-        case "simd_ucvtf":
-        case "simd_fcvtzs":
-        case "simd_fcvtzu":
-          break;
-        // FP compare: writes NZCV
-        case "fcmp":
-          writes.add(NZCV_LOCAL);
-          break;
-        // FP int conversions: read/write GPRs
-        case "scvtf_int":
-        case "ucvtf_int":
-          addRead(reads, insn.rn);
-          break;
-        case "fcvtzs_int":
-        case "fcvtzu_int":
-          addWrite(writes, insn.rd);
-          break;
-        default:
-          break;
-      }
-    }
-    return { reads, writes };
-  }
-  function addRead(set, r) {
-    if (r !== 31) set.add(regLocal(r));
-  }
-  function addWrite(set, r) {
-    if (r !== 31) set.add(regLocal(r));
-  }
-  function setupHelperImports(b) {
-    const helperType = b.addFuncType([126 /* I64 */, 126 /* I64 */], [126 /* I64 */]);
-    const smulhIdx = b.addFunctionImport("env", "smulh", helperType);
-    const umulhIdx = b.addFunctionImport("env", "umulh", helperType);
-    const f64_mulIdx = b.addFunctionImport("env", "f64_mul", helperType);
-    const f64_divIdx = b.addFunctionImport("env", "f64_div", helperType);
-    const f64_addIdx = b.addFunctionImport("env", "f64_add", helperType);
-    const f64_subIdx = b.addFunctionImport("env", "f64_sub", helperType);
-    const unaryType = b.addFuncType([126 /* I64 */], [126 /* I64 */]);
-    const f64_absIdx = b.addFunctionImport("env", "f64_abs", unaryType);
-    const f64_negIdx = b.addFunctionImport("env", "f64_neg", unaryType);
-    const f64_from_s64Idx = b.addFunctionImport("env", "f64_from_s64", unaryType);
-    const f64_from_u64Idx = b.addFunctionImport("env", "f64_from_u64", unaryType);
-    const f64_from_s32Idx = b.addFunctionImport("env", "f64_from_s32", unaryType);
-    const f64_from_u32Idx = b.addFunctionImport("env", "f64_from_u32", unaryType);
-    const f64_to_s64Idx = b.addFunctionImport("env", "f64_to_s64", unaryType);
-    const f64_to_u64Idx = b.addFunctionImport("env", "f64_to_u64", unaryType);
-    const f64_to_s32Idx = b.addFunctionImport("env", "f64_to_s32", unaryType);
-    const f64_to_u32Idx = b.addFunctionImport("env", "f64_to_u32", unaryType);
-    const f32_to_f64Idx = b.addFunctionImport("env", "f32_to_f64", unaryType);
-    const f64_to_f32Idx = b.addFunctionImport("env", "f64_to_f32", unaryType);
-    const f64_cmpIdx = b.addFunctionImport("env", "f64_cmp", helperType);
-    const simd_opIdx = b.addFunctionImport("env", "simd_op", helperType);
-    return {
-      smulhIdx,
-      umulhIdx,
-      f64_mulIdx,
-      f64_divIdx,
-      f64_addIdx,
-      f64_subIdx,
-      f64_absIdx,
-      f64_negIdx,
-      f64_from_s64Idx,
-      f64_from_u64Idx,
-      f64_from_s32Idx,
-      f64_from_u32Idx,
-      f64_to_s64Idx,
-      f64_to_u64Idx,
-      f64_to_s32Idx,
-      f64_to_u32Idx,
-      f32_to_f64Idx,
-      f64_to_f32Idx,
-      f64_cmpIdx,
-      simd_opIdx
-    };
-  }
+  // src/helpers.ts
   var _fpBuf = new ArrayBuffer(8);
   var _f64View = new Float64Array(_fpBuf);
-  var _u8View = new Uint8Array(_fpBuf);
   var _f32View = new Float32Array(_fpBuf);
-  var _i64View = new BigInt64Array(_fpBuf);
   var _u64View = new BigUint64Array(_fpBuf);
   function f64FromBits(bits2) {
     _u64View[0] = BigInt.asUintN(64, bits2);
@@ -2131,7 +1223,6 @@
       const ub = BigInt.asUintN(64, b);
       return BigInt.asUintN(64, ua * ub >> 64n);
     },
-    // FP 2-source: operate on f64 bit patterns (or f32 widened to f64 bits)
     f64_mul(a, b) {
       return f64ToBits(f64FromBits(a) * f64FromBits(b));
     },
@@ -2144,14 +1235,27 @@
     f64_sub(a, b) {
       return f64ToBits(f64FromBits(a) - f64FromBits(b));
     },
-    // FP 1-source
     f64_abs(a) {
       return f64ToBits(Math.abs(f64FromBits(a)));
     },
     f64_neg(a) {
       return f64ToBits(-f64FromBits(a));
     },
-    // Int → FP
+    f64_sqrt(a) {
+      return f64ToBits(Math.sqrt(f64FromBits(a)));
+    },
+    f64_min(a, b) {
+      const fa = f64FromBits(a);
+      const fb = f64FromBits(b);
+      if (isNaN(fa) || isNaN(fb)) return f64ToBits(NaN);
+      return f64ToBits(Math.min(fa, fb));
+    },
+    f64_max(a, b) {
+      const fa = f64FromBits(a);
+      const fb = f64FromBits(b);
+      if (isNaN(fa) || isNaN(fb)) return f64ToBits(NaN);
+      return f64ToBits(Math.max(fa, fb));
+    },
     f64_from_s64(a) {
       return f64ToBits(Number(BigInt.asIntN(64, a)));
     },
@@ -2164,7 +1268,6 @@
     f64_from_u32(a) {
       return f64ToBits(Number(BigInt.asUintN(32, a)));
     },
-    // FP → Int (round toward zero)
     f64_to_s64(a) {
       return BigInt.asUintN(64, BigInt(Math.trunc(f64FromBits(a))));
     },
@@ -2179,7 +1282,6 @@
       const v = Math.trunc(f64FromBits(a));
       return v < 0 ? 0n : BigInt(v) & 0xFFFFFFFFn;
     },
-    // Precision conversions
     f32_to_f64(a) {
       const f = f32FromBits(Number(a & 0xFFFFFFFFn));
       return f64ToBits(f);
@@ -2188,7 +1290,6 @@
       const f = f64FromBits(a);
       return BigInt(f32ToBits(Math.fround(f)));
     },
-    // FP compare: returns ARM NZCV bits (N=bit3, Z=bit2, C=bit1, V=bit0)
     f64_cmp(a, b) {
       const fa = f64FromBits(a);
       const fb = f64FromBits(b);
@@ -2208,12 +1309,36 @@
   var SIMD_UMAXP = 20;
   var SIMD_ADDP = 21;
   var SIMD_TBL = 30;
+  var SIMD_TBX = 31;
   var SIMD_ZIP1 = 40;
   var SIMD_ZIP2 = 41;
   var SIMD_UZP1 = 42;
   var SIMD_UZP2 = 43;
   var SIMD_TRN1 = 44;
   var SIMD_TRN2 = 45;
+  var SIMD_MUL = 50;
+  var SIMD_SMAX = 51;
+  var SIMD_SMIN = 52;
+  var SIMD_UMIN = 53;
+  var SIMD_UMAX = 54;
+  var SIMD_SQADD = 55;
+  var SIMD_UQADD = 56;
+  var SIMD_SQSUB = 57;
+  var SIMD_UQSUB = 58;
+  var SIMD_ADDV = 60;
+  var SIMD_SADDLV = 61;
+  var SIMD_UADDLV = 62;
+  var SIMD_SMAXV = 63;
+  var SIMD_UMAXV = 64;
+  var SIMD_SMINV = 65;
+  var SIMD_UMINV = 66;
+  var SIMD_FMAXV = 67;
+  var SIMD_FMINV = 68;
+  var SIMD_LDST_STRUCT = 70;
+  var SIMD_SHRN = 72;
+  var SIMD_ADDHN = 73;
+  var SIMD_UMINP = 22;
+  var SIMD_EXT = 74;
   function createSimdOp(memory2) {
     return function simd_op(packed, _extra) {
       const op = Number(packed >> 56n & 0xFFn);
@@ -2224,7 +1349,95 @@
       const rn = Number(packed >> 16n & 0xFFn);
       const rm = Number(packed >> 8n & 0xFFn);
       const buf = new Uint8Array(memory2.buffer);
-      const view = new DataView(memory2.buffer);
+      if (op === SIMD_LDST_STRUCT) {
+        const regCount = extra & 15;
+        const isLoad = extra >> 4 & 1;
+        const es = 1 << size;
+        const laneBytes = Q ? 16 : 8;
+        const lanes = laneBytes / es;
+        const gview = new DataView(memory2.buffer);
+        const addr = Number(gview.getBigUint64(rn * 8, true)) + GUEST_MEM_BASE;
+        const cp = (from, to) => {
+          for (let k = 0; k < es; k++) buf[to + k] = buf[from + k];
+        };
+        if (isLoad) {
+          for (let e = 0; e < lanes; e++) {
+            for (let r = 0; r < regCount; r++) {
+              const memOff = addr + (e * regCount + r) * es;
+              const vOff = V_OFFSET + (rd + r & 31) * 16 + e * es;
+              cp(memOff, vOff);
+            }
+          }
+          if (!Q) for (let r = 0; r < regCount; r++) buf.fill(0, V_OFFSET + (rd + r & 31) * 16 + 8, V_OFFSET + (rd + r & 31) * 16 + 16);
+        } else {
+          for (let e = 0; e < lanes; e++) {
+            for (let r = 0; r < regCount; r++) {
+              const memOff = addr + (e * regCount + r) * es;
+              const vOff = V_OFFSET + (rd + r & 31) * 16 + e * es;
+              cp(vOff, memOff);
+            }
+          }
+        }
+        return 0n;
+      }
+      if (op === SIMD_SHRN) {
+        const destEs = 1 << size;
+        const srcEs = destEs * 2;
+        const shift = BigInt(extra);
+        const n = 8 / destEs;
+        const gv = new DataView(memory2.buffer);
+        const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+        const out = new Uint8Array(8);
+        const ov = new DataView(out.buffer);
+        for (let i = 0; i < n; i++) {
+          const src = srcEs === 2 ? BigInt(gv.getUint16(vnA + i * 2, true)) : srcEs === 4 ? BigInt(gv.getUint32(vnA + i * 4, true)) : gv.getBigUint64(vnA + i * 8, true);
+          const t = BigInt.asUintN(destEs * 8, src >> shift);
+          if (destEs === 1) ov.setUint8(i, Number(t));
+          else if (destEs === 2) ov.setUint16(i * 2, Number(t), true);
+          else ov.setUint32(i * 4, Number(t), true);
+        }
+        const off = Q ? 8 : 0;
+        for (let k = 0; k < 8; k++) buf[vdA + off + k] = out[k];
+        if (!Q) for (let k = 8; k < 16; k++) buf[vdA + k] = 0;
+        return 0n;
+      }
+      if (op === SIMD_ADDHN) {
+        const destEs = 1 << size;
+        const srcEs = destEs * 2;
+        const srcBits = BigInt(srcEs * 8);
+        const srcMask = (1n << srcBits) - 1n;
+        const n = 8 / destEs;
+        const gv = new DataView(memory2.buffer);
+        const vnA = V_OFFSET + rn * 16, vmA = V_OFFSET + rm * 16, vdA = V_OFFSET + rd * 16;
+        const rdSrc = (base, i) => srcEs === 2 ? BigInt(gv.getUint16(base + i * 2, true)) : srcEs === 4 ? BigInt(gv.getUint32(base + i * 4, true)) : gv.getBigUint64(base + i * 8, true);
+        const out = new Uint8Array(8);
+        const ov = new DataView(out.buffer);
+        for (let i = 0; i < n; i++) {
+          const sum = rdSrc(vnA, i) + rdSrc(vmA, i) & srcMask;
+          const t = BigInt.asUintN(destEs * 8, sum >> BigInt(destEs * 8));
+          if (destEs === 1) ov.setUint8(i, Number(t));
+          else if (destEs === 2) ov.setUint16(i * 2, Number(t), true);
+          else ov.setUint32(i * 4, Number(t), true);
+        }
+        const off = Q ? 8 : 0;
+        for (let k = 0; k < 8; k++) buf[vdA + off + k] = out[k];
+        if (!Q) for (let k = 8; k < 16; k++) buf[vdA + k] = 0;
+        return 0n;
+      }
+      if (op === SIMD_EXT) {
+        const w = Q ? 16 : 8;
+        const index = extra;
+        const vnA = V_OFFSET + rn * 16, vmA = V_OFFSET + rm * 16, vdA = V_OFFSET + rd * 16;
+        const concat = new Uint8Array(2 * w);
+        for (let k = 0; k < w; k++) {
+          concat[k] = buf[vnA + k];
+          concat[w + k] = buf[vmA + k];
+        }
+        const out = new Uint8Array(16);
+        for (let i = 0; i < w; i++) out[i] = concat[index + i];
+        for (let k = 0; k < 16; k++) buf[vdA + k] = out[k];
+        return 0n;
+      }
       const vn = V_OFFSET + rn * 16;
       const vm = V_OFFSET + rm * 16;
       const vd = V_OFFSET + rd * 16;
@@ -2237,7 +1450,143 @@
       const bView = new DataView(b_.buffer);
       const dView = new DataView(dst.buffer);
       const elems = bytes / esize;
+      const getS = (view, i) => {
+        if (esize === 1) return BigInt(view.getInt8(i));
+        if (esize === 2) return BigInt(view.getInt16(i * 2, true));
+        if (esize === 4) return BigInt(view.getInt32(i * 4, true));
+        return view.getBigInt64(i * 8, true);
+      };
+      const getU = (view, i) => {
+        if (esize === 1) return BigInt(view.getUint8(i));
+        if (esize === 2) return BigInt(view.getUint16(i * 2, true));
+        if (esize === 4) return BigInt(view.getUint32(i * 4, true));
+        return view.getBigUint64(i * 8, true);
+      };
+      const put = (i, val) => {
+        const m = BigInt.asUintN(esize * 8, val);
+        if (esize === 1) dView.setUint8(i, Number(m));
+        else if (esize === 2) dView.setUint16(i * 2, Number(m), true);
+        else if (esize === 4) dView.setUint32(i * 4, Number(m), true);
+        else dView.setBigUint64(i * 8, m, true);
+      };
+      const bits2 = BigInt(esize * 8);
+      const sMax = (1n << bits2 - 1n) - 1n, sMin = -(1n << bits2 - 1n);
+      const uMax = (1n << bits2) - 1n;
+      const clampS = (x) => x > sMax ? sMax : x < sMin ? sMin : x;
+      const clampU = (x) => x > uMax ? uMax : x < 0n ? 0n : x;
+      const putScalar = (val, wbytes) => {
+        const m = BigInt.asUintN(wbytes * 8, val);
+        if (wbytes === 1) dView.setUint8(0, Number(m));
+        else if (wbytes === 2) dView.setUint16(0, Number(m), true);
+        else if (wbytes === 4) dView.setUint32(0, Number(m), true);
+        else dView.setBigUint64(0, m, true);
+      };
       switch (op) {
+        case SIMD_ADDV: {
+          let s = 0n;
+          for (let i = 0; i < elems; i++) s += getU(aView, i);
+          putScalar(s, esize);
+          break;
+        }
+        case SIMD_SADDLV: {
+          let s = 0n;
+          for (let i = 0; i < elems; i++) s += getS(aView, i);
+          putScalar(s, esize * 2);
+          break;
+        }
+        case SIMD_UADDLV: {
+          let s = 0n;
+          for (let i = 0; i < elems; i++) s += getU(aView, i);
+          putScalar(s, esize * 2);
+          break;
+        }
+        case SIMD_SMAXV: {
+          let s = getS(aView, 0);
+          for (let i = 1; i < elems; i++) {
+            const x = getS(aView, i);
+            if (x > s) s = x;
+          }
+          putScalar(s, esize);
+          break;
+        }
+        case SIMD_SMINV: {
+          let s = getS(aView, 0);
+          for (let i = 1; i < elems; i++) {
+            const x = getS(aView, i);
+            if (x < s) s = x;
+          }
+          putScalar(s, esize);
+          break;
+        }
+        case SIMD_UMAXV: {
+          let s = getU(aView, 0);
+          for (let i = 1; i < elems; i++) {
+            const x = getU(aView, i);
+            if (x > s) s = x;
+          }
+          putScalar(s, esize);
+          break;
+        }
+        case SIMD_UMINV: {
+          let s = getU(aView, 0);
+          for (let i = 1; i < elems; i++) {
+            const x = getU(aView, i);
+            if (x < s) s = x;
+          }
+          putScalar(s, esize);
+          break;
+        }
+        case SIMD_FMAXV:
+        case SIMD_FMINV: {
+          const getF = (i) => esize === 4 ? aView.getFloat32(i * 4, true) : aView.getFloat64(i * 8, true);
+          let s = getF(0);
+          for (let i = 1; i < elems; i++) {
+            const x = getF(i);
+            s = op === SIMD_FMAXV ? Math.max(s, x) : Math.min(s, x);
+          }
+          if (esize === 4) dView.setFloat32(0, s, true);
+          else dView.setFloat64(0, s, true);
+          break;
+        }
+        case SIMD_MUL:
+          for (let i = 0; i < elems; i++) put(i, getU(aView, i) * getU(bView, i));
+          break;
+        case SIMD_SMAX:
+          for (let i = 0; i < elems; i++) {
+            const x = getS(aView, i), y = getS(bView, i);
+            put(i, x > y ? x : y);
+          }
+          break;
+        case SIMD_SMIN:
+          for (let i = 0; i < elems; i++) {
+            const x = getS(aView, i), y = getS(bView, i);
+            put(i, x < y ? x : y);
+          }
+          break;
+        case SIMD_UMAX:
+          for (let i = 0; i < elems; i++) {
+            const x = getU(aView, i), y = getU(bView, i);
+            put(i, x > y ? x : y);
+          }
+          break;
+        case SIMD_UMIN:
+          for (let i = 0; i < elems; i++) {
+            const x = getU(aView, i), y = getU(bView, i);
+            put(i, x < y ? x : y);
+          }
+          break;
+        case SIMD_SQADD:
+          for (let i = 0; i < elems; i++) put(i, clampS(getS(aView, i) + getS(bView, i)));
+          break;
+        case SIMD_SQSUB:
+          for (let i = 0; i < elems; i++) put(i, clampS(getS(aView, i) - getS(bView, i)));
+          break;
+        case SIMD_UQADD:
+          for (let i = 0; i < elems; i++) put(i, clampU(getU(aView, i) + getU(bView, i)));
+          break;
+        case SIMD_UQSUB:
+          for (let i = 0; i < elems; i++) put(i, clampU(getU(aView, i) - getU(bView, i)));
+          break;
         case SIMD_ADD:
           for (let i = 0; i < elems; i++) {
             if (esize === 1) dView.setUint8(i, aView.getUint8(i) + bView.getUint8(i) & 255);
@@ -2274,7 +1623,9 @@
             else if (esize === 2) gt = aView.getInt16(i * 2, true) > bView.getInt16(i * 2, true);
             else if (esize === 4) gt = aView.getInt32(i * 4, true) > bView.getInt32(i * 4, true);
             else gt = aView.getBigInt64(i * 8, true) > bView.getBigInt64(i * 8, true);
-            if (esize <= 4) dView.setUint32(i * esize, gt ? esize === 1 ? 255 : esize === 2 ? 65535 : 4294967295 : 0, true);
+            if (esize === 1) dView.setUint8(i, gt ? 255 : 0);
+            else if (esize === 2) dView.setUint16(i * 2, gt ? 65535 : 0, true);
+            else if (esize === 4) dView.setUint32(i * 4, gt ? 4294967295 : 0, true);
             else dView.setBigUint64(i * 8, gt ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
           }
           break;
@@ -2285,16 +1636,13 @@
             else if (esize === 2) hi = aView.getUint16(i * 2, true) > bView.getUint16(i * 2, true);
             else if (esize === 4) hi = aView.getUint32(i * 4, true) > bView.getUint32(i * 4, true);
             else hi = aView.getBigUint64(i * 8, true) > bView.getBigUint64(i * 8, true);
-            if (esize <= 4) {
-              const mask = esize === 1 ? 255 : esize === 2 ? 65535 : 4294967295;
-              if (esize === 1) dView.setUint8(i, hi ? 255 : 0);
-              else if (esize === 2) dView.setUint16(i * 2, hi ? 65535 : 0, true);
-              else dView.setUint32(i * 4, hi ? 4294967295 : 0, true);
-            } else dView.setBigUint64(i * 8, hi ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
+            if (esize === 1) dView.setUint8(i, hi ? 255 : 0);
+            else if (esize === 2) dView.setUint16(i * 2, hi ? 65535 : 0, true);
+            else if (esize === 4) dView.setUint32(i * 4, hi ? 4294967295 : 0, true);
+            else dView.setBigUint64(i * 8, hi ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
           }
           break;
         case SIMD_CMGE:
-        // signed >=
         case SIMD_CMHS:
           for (let i = 0; i < elems; i++) {
             let ge;
@@ -2315,37 +1663,21 @@
             else dView.setBigUint64(i * 8, ge ? 0xFFFFFFFFFFFFFFFFn : 0n, true);
           }
           break;
-        case SIMD_UMAXP: {
-          const total = elems * 2;
+        case SIMD_UMAXP:
+        case SIMD_UMINP: {
+          const wantMax = op === SIMD_UMAXP;
           const all = new Uint8Array(32);
           all.set(a.subarray(0, bytes), 0);
           all.set(b_.subarray(0, bytes), bytes);
           const allView = new DataView(all.buffer);
+          const pick = (v1, v2) => wantMax ? v1 > v2 ? v1 : v2 : v1 < v2 ? v1 : v2;
           for (let i = 0; i < elems; i++) {
             const off1 = i * 2 * esize;
             const off2 = off1 + esize;
-            let v1, v2, mx;
-            if (esize === 1) {
-              v1 = allView.getUint8(off1);
-              v2 = allView.getUint8(off2);
-              mx = v1 > v2 ? v1 : v2;
-              dView.setUint8(i, mx);
-            } else if (esize === 2) {
-              v1 = allView.getUint16(off1, true);
-              v2 = allView.getUint16(off2, true);
-              mx = v1 > v2 ? v1 : v2;
-              dView.setUint16(i * 2, mx, true);
-            } else if (esize === 4) {
-              v1 = allView.getUint32(off1, true);
-              v2 = allView.getUint32(off2, true);
-              mx = v1 > v2 ? v1 : v2;
-              dView.setUint32(i * 4, mx, true);
-            } else {
-              v1 = allView.getBigUint64(off1, true);
-              v2 = allView.getBigUint64(off2, true);
-              mx = v1 > v2 ? v1 : v2;
-              dView.setBigUint64(i * 8, mx, true);
-            }
+            if (esize === 1) dView.setUint8(i, pick(allView.getUint8(off1), allView.getUint8(off2)));
+            else if (esize === 2) dView.setUint16(i * 2, pick(allView.getUint16(off1, true), allView.getUint16(off2, true)), true);
+            else if (esize === 4) dView.setUint32(i * 4, pick(allView.getUint32(off1, true), allView.getUint32(off2, true)), true);
+            else dView.setBigUint64(i * 8, pick(allView.getBigUint64(off1, true), allView.getBigUint64(off2, true)), true);
           }
           break;
         }
@@ -2364,7 +1696,8 @@
           }
           break;
         }
-        case SIMD_TBL: {
+        case SIMD_TBL:
+        case SIMD_TBX: {
           const len = extra;
           const tableSize = (len + 1) * 16;
           const table = new Uint8Array(tableSize);
@@ -2372,9 +1705,11 @@
             const vr = V_OFFSET + (rn + r & 31) * 16;
             table.set(buf.subarray(vr, vr + 16), r * 16);
           }
+          if (op === SIMD_TBX) dst.set(buf.subarray(vd, vd + bytes));
           for (let i = 0; i < bytes; i++) {
             const idx = b_[i];
-            dst[i] = idx < tableSize ? table[idx] : 0;
+            if (idx < tableSize) dst[i] = table[idx];
+            else if (op === SIMD_TBL) dst[i] = 0;
           }
           break;
         }
@@ -2444,3125 +1779,167 @@
         }
       }
       buf.set(dst.subarray(0, bytes), vd);
-      if (!Q) {
-        buf.fill(0, vd + 8, vd + 16);
-      }
+      if (!Q) buf.fill(0, vd + 8, vd + 16);
       return 0n;
     };
   }
-  var NEXT_PC_LOCAL = REG_COUNT + 4;
-  var ITER_LOCAL = REG_COUNT + 5;
-  function translateBlock(block, memory2) {
-    const b = new WasmModuleBuilder();
-    b.addMemoryImport("env", "memory", 256);
-    const helpers = setupHelperImports(b);
-    const typeIdx = b.addFuncType([], [126 /* I64 */]);
-    b.beginFunction(typeIdx);
-    const firstLocal = b.addLocals(126 /* I64 */, REG_COUNT + 6);
-    const TMP0 = REG_COUNT;
-    const TMP1 = REG_COUNT + 1;
-    const TMP2 = REG_COUNT + 2;
-    const TMP3 = REG_COUNT + 3;
-    const usage = analyzeRegUsage(block.insns);
-    const allUsed = /* @__PURE__ */ new Set([...usage.reads, ...usage.writes]);
-    emitPrologue(b, allUsed);
-    b.i64_const(HALT_PC);
-    b.local_set(NEXT_PC_LOCAL);
-    if (block.isSelfLoop) {
-      emitSelfLoopBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers);
-    } else {
-      emitLinearBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers);
-      emitEpilogue(b, usage.writes);
-    }
-    b.local_get(NEXT_PC_LOCAL);
-    b.endFunction();
-    b.exportFunction("run");
-    const bytes = b.finalize();
-    const mod = new WebAssembly.Module(bytes);
-    return instantiateBlock(
-      { module: mod, startPC: block.startPC, endPC: block.endPC, insnCount: block.insns.length, isSelfLoop: block.isSelfLoop },
-      memory2
-    );
-  }
-  function instantiateBlock(compiled, memory2) {
+  function createEnv(memory2, regBase) {
     const env = { memory: memory2, ...helperFunctions, simd_op: createSimdOp(memory2) };
-    const instance = new WebAssembly.Instance(compiled.module, { env });
-    return {
-      run: instance.exports.run,
-      startPC: compiled.startPC,
-      endPC: compiled.endPC,
-      insnCount: compiled.insnCount,
-      isSelfLoop: compiled.isSelfLoop
+    if (regBase) env.reg_base = regBase;
+    return env;
+  }
+
+  // src/zig-translator.ts
+  var import_meta = {};
+  var HAS_PROCESS = typeof process !== "undefined" && !!process.env;
+  var JIT_DUMP_PC = HAS_PROCESS ? process.env.JIT_DUMP_PC ?? "" : "";
+  var JIT_DEBUG = HAS_PROCESS ? !!process.env.JIT_DEBUG : false;
+  var dbgWrite = (s) => {
+    if (HAS_PROCESS) process.stderr.write(s);
+  };
+  var exports_ = null;
+  var autoloadTried = false;
+  function initZigTranslator(wasmBytes) {
+    const bytes = wasmBytes instanceof Uint8Array ? wasmBytes : new Uint8Array(wasmBytes);
+    initZigTranslatorModule(new WebAssembly.Module(bytes));
+  }
+  function initZigTranslatorModule(mod) {
+    const instance = new WebAssembly.Instance(mod);
+    exports_ = instance.exports;
+  }
+  function ensureInit() {
+    if (exports_) return true;
+    if (autoloadTried) return false;
+    autoloadTried = true;
+    if (typeof process === "undefined" || !process.versions?.node) return false;
+    try {
+      const fs = process.getBuiltinModule("fs");
+      const path = process.getBuiltinModule("path");
+      const url = process.getBuiltinModule("url");
+      const here = path.dirname(url.fileURLToPath(import_meta.url));
+      const bytes = fs.readFileSync(path.join(here, "..", "engine", "zig-out", "bin", "translator.wasm"));
+      initZigTranslator(new Uint8Array(bytes));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function readGuestBytes(view, pc, maxBytes) {
+    const baseOffset = Number(pc) + GUEST_MEM_BASE;
+    const memSize = view.byteLength;
+    const limit = Math.min(maxBytes, memSize - baseOffset);
+    if (limit <= 0) return new Uint8Array(0);
+    return new Uint8Array(view.buffer, baseOffset, limit).slice();
+  }
+  function translateRegionZig(view, entryPC, memory2, shadowBase, singleBlock = false, threaded2 = false, regBase = null) {
+    if (!ensureInit()) return null;
+    let codeBytes;
+    const basePC = entryPC;
+    if (singleBlock) {
+      const block = detectBlock(view, entryPC);
+      codeBytes = readGuestBytes(view, entryPC, block.insns.length * 4);
+    } else {
+      codeBytes = readGuestBytes(view, entryPC, 4096);
+    }
+    if (codeBytes.length < 4) return null;
+    const ex = exports_;
+    const tbuf = new Uint8Array(ex.memory.buffer);
+    const inOff = ex.translator_input_buf_offset();
+    tbuf.set(codeBytes, inOff);
+    ex.translator_reset();
+    const basePCLo = Number(basePC & 0xffffffffn);
+    const basePCHi = Number(basePC >> 32n & 0xffffffffn);
+    const entryLo = Number(entryPC & 0xffffffffn);
+    const entryHi = Number(entryPC >> 32n & 0xffffffffn);
+    const rc = ex.translator_translate_region(basePCLo, basePCHi, entryLo, entryHi, codeBytes.length, shadowBase, threaded2 ? 1 : 0);
+    if (rc !== 0) return null;
+    const outLen = ex.translator_result_len();
+    const outOff = ex.translator_result_offset();
+    const moduleBytes = new Uint8Array(outLen);
+    const tbufFresh = new Uint8Array(ex.memory.buffer);
+    moduleBytes.set(tbufFresh.subarray(outOff, outOff + outLen));
+    let mod;
+    try {
+      mod = new WebAssembly.Module(moduleBytes);
+    } catch {
+      return null;
+    }
+    if (JIT_DUMP_PC && entryPC.toString(16) === JIT_DUMP_PC) {
+      dbgWrite(`zig dump for pc=0x${entryPC.toString(16)} module bytes:
+`);
+      let hex = "";
+      for (let i = 0; i < moduleBytes.length; i++) hex += moduleBytes[i].toString(16).padStart(2, "0");
+      dbgWrite(hex + "\n");
+      dbgWrite("source bytes:\n");
+      let src = "";
+      for (let i = 0; i < codeBytes.length && i < 64; i++) src += codeBytes[i].toString(16).padStart(2, "0");
+      dbgWrite(src + "\n");
+    }
+    let inst;
+    try {
+      inst = new WebAssembly.Instance(mod, { env: createEnv(memory2, regBase) });
+    } catch {
+      return null;
+    }
+    const runZig = inst.exports.run;
+    const pcSlot = (regBase ? regBase.value : 0) + PC_OFFSET;
+    let callCount = 0;
+    const region = {
+      run: () => {
+        const packed = runZig();
+        const reason = Number(packed >> 32n & 0xffffn);
+        region.lastExitReason = reason;
+        const view2 = new DataView(memory2.buffer);
+        const nextPC = view2.getBigUint64(pcSlot, true);
+        callCount++;
+        if (JIT_DEBUG && callCount <= 200) {
+          dbgWrite(`#${callCount} zig entry=0x${entryPC.toString(16)} reason=${reason} -> 0x${nextPC.toString(16)}
+`);
+        }
+        switch (reason) {
+          case 0:
+            return HALT_PC;
+          case 1:
+            return SVC_PC;
+          default:
+            return nextPC;
+        }
+      },
+      entryPC,
+      blockPCs: [entryPC]
+      // we don't expose per-block PCs from zig yet; entry only
     };
-  }
-  function emitPrologue(b, allUsed) {
-    for (const local of allUsed) {
-      if (local === NZCV_LOCAL) {
-        b.i32_const(NZCV_OFFSET);
-        b.i64_load(3, 0);
-        b.local_set(NZCV_LOCAL);
-      } else if (local === SP_LOCAL) {
-        b.i32_const(SP_OFFSET);
-        b.i64_load(3, 0);
-        b.local_set(SP_LOCAL);
-      } else if (local >= 0 && local <= 30) {
-        b.i32_const(local * 8);
-        b.i64_load(3, 0);
-        b.local_set(local);
-      }
-    }
-  }
-  function emitLinearBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers) {
-    const startPC = Number(block.startPC);
-    for (let i = 0; i < block.insns.length; i++) {
-      const pc = startPC + i * 4;
-      emitInsn(b, block.insns[i], pc, TMP0, TMP1, TMP2, TMP3, helpers);
-    }
-    b.i32_const(ITER_OFFSET);
-    b.i64_const(BigInt(block.insns.length));
-    b.i64_store(3, 0);
-  }
-  function emitSelfLoopBlock(b, block, TMP0, TMP1, TMP2, TMP3, helpers) {
-    const startPC = Number(block.startPC);
-    const insns = block.insns;
-    const lastInsn = insns[insns.length - 1];
-    const penult = insns.length >= 2 ? insns[insns.length - 2] : null;
-    const canFuse = lastInsn.kind === "b_cond" && penult !== null && (penult.kind === "sub_reg" && penult.setFlags && penult.rd === 31 || penult.kind === "sub_imm" && penult.setFlags && penult.rd === 31) && !insnsAccessNZCV(insns.slice(0, insns.length - 2));
-    b.block(BLOCKTYPE_VOID);
-    b.loop(BLOCKTYPE_VOID);
-    b.local_get(ITER_LOCAL);
-    b.i64_const(1n);
-    b.i64_add();
-    b.local_set(ITER_LOCAL);
-    const safetyExitPC = startPC + insns.length * 4;
-    b.local_get(ITER_LOCAL);
-    b.i64_const(BigInt(1e7));
-    b.i64_gt_u();
-    b.if_(BLOCKTYPE_VOID);
-    b.i64_const(BigInt(safetyExitPC));
-    b.local_set(NEXT_PC_LOCAL);
-    b.br(2);
-    b.end();
-    const skipLast = canFuse ? 2 : 1;
-    for (let i = 0; i < insns.length - skipLast; i++) {
-      const pc = startPC + i * 4;
-      emitInsn(b, insns[i], pc, TMP0, TMP1, TMP2, TMP3, helpers);
-    }
-    const lastPC = startPC + (insns.length - 1) * 4;
-    if (canFuse && lastInsn.kind === "b_cond") {
-      const cmpInsn = penult;
-      emitFusedCmpBranch(b, cmpInsn, lastInsn.cond);
-    } else if (lastInsn.kind === "b") {
-      b.br(0);
-    } else if (lastInsn.kind === "b_cond") {
-      emitConditionTest(b, lastInsn.cond, NZCV_LOCAL);
-      b.br_if(0);
-    } else if (lastInsn.kind === "cbz") {
-      b.local_get(regLocal(lastInsn.rt));
-      b.i64_eqz();
-      b.br_if(0);
-    } else if (lastInsn.kind === "cbnz") {
-      b.local_get(regLocal(lastInsn.rt));
-      b.i64_const(0n);
-      b.i64_ne();
-      b.br_if(0);
-    } else if (lastInsn.kind === "tbz") {
-      b.local_get(regLocal(lastInsn.rt));
-      b.i64_const(BigInt(lastInsn.bit));
-      b.i64_shr_u();
-      b.i64_const(1n);
-      b.i64_and();
-      b.i64_eqz();
-      b.br_if(0);
-    } else if (lastInsn.kind === "tbnz") {
-      b.local_get(regLocal(lastInsn.rt));
-      b.i64_const(BigInt(lastInsn.bit));
-      b.i64_shr_u();
-      b.i64_const(1n);
-      b.i64_and();
-      b.i64_const(0n);
-      b.i64_ne();
-      b.br_if(0);
-    }
-    const exitPC = lastPC + 4;
-    b.i64_const(BigInt(exitPC));
-    b.local_set(NEXT_PC_LOCAL);
-    if (canFuse) {
-      const cmpInsn = penult;
-      if (cmpInsn.kind === "sub_reg") {
-        emitGetReg(b, cmpInsn.rn, cmpInsn.sf);
-        b.local_tee(TMP0);
-        emitGetReg(b, cmpInsn.rm, cmpInsn.sf);
-        emitShift(b, cmpInsn.shift, cmpInsn.amount, cmpInsn.sf);
-        if (cmpInsn.sf === 0) {
-          b.i64_const(0xFFFFFFFFn);
-          b.i64_and();
-        }
-        b.local_tee(TMP1);
-        b.i64_sub();
-        if (cmpInsn.sf === 0) {
-          b.i64_const(0xFFFFFFFFn);
-          b.i64_and();
-        }
-        b.local_set(TMP2);
-      } else if (cmpInsn.kind === "sub_imm") {
-        emitGetRegSP(b, cmpInsn.rn, cmpInsn.sf);
-        b.local_tee(TMP0);
-        b.i64_const(BigInt(cmpInsn.imm));
-        b.local_tee(TMP1);
-        b.i64_sub();
-        if (cmpInsn.sf === 0) {
-          b.i64_const(0xFFFFFFFFn);
-          b.i64_and();
-        }
-        b.local_set(TMP2);
-      }
-      emitComputeFlags(b, false, penult.sf, TMP0, TMP1, TMP2);
-    }
-    b.br(1);
-    b.end();
-    b.unreachable();
-    b.end();
-    b.i32_const(ITER_OFFSET);
-    b.local_get(ITER_LOCAL);
-    b.i64_store(3, 0);
-    const usage = analyzeRegUsage(block.insns);
-    emitEpilogue(b, usage.writes);
-  }
-  function insnsAccessNZCV(insns) {
-    for (const insn of insns) {
-      const usage = analyzeRegUsage([insn]);
-      if (usage.reads.has(NZCV_LOCAL) || usage.writes.has(NZCV_LOCAL)) return true;
-    }
-    return false;
-  }
-  function emitFusedCmpBranch(b, cmpInsn, cond) {
-    if (cmpInsn.kind === "sub_reg") {
-      emitGetReg(b, cmpInsn.rn, cmpInsn.sf);
-    } else {
-      emitGetRegSP(b, cmpInsn.rn, cmpInsn.sf);
-    }
-    if (cmpInsn.kind === "sub_reg") {
-      emitGetReg(b, cmpInsn.rm, cmpInsn.sf);
-      emitShift(b, cmpInsn.shift, cmpInsn.amount, cmpInsn.sf);
-      if (cmpInsn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-    } else {
-      b.i64_const(BigInt(cmpInsn.imm));
-    }
-    emitCondCompare(b, cond);
-    b.br_if(0);
-  }
-  function emitCondCompare(b, cond) {
-    switch (cond) {
-      case 0:
-        b.i64_eq();
-        break;
-      // EQ: Rn == Op2
-      case 1:
-        b.i64_ne();
-        break;
-      // NE: Rn != Op2
-      case 2:
-        b.i64_ge_u();
-        break;
-      // CS/HS: Rn >=u Op2
-      case 3:
-        b.i64_lt_u();
-        break;
-      // CC/LO: Rn <u Op2
-      case 8:
-        b.i64_gt_u();
-        break;
-      // HI: Rn >u Op2
-      case 9:
-        b.i64_le_u();
-        break;
-      // LS: Rn <=u Op2
-      case 10:
-        b.i64_ge_s();
-        break;
-      // GE: Rn >=s Op2
-      case 11:
-        b.i64_lt_s();
-        break;
-      // LT: Rn <s Op2
-      case 12:
-        b.i64_gt_s();
-        break;
-      // GT: Rn >s Op2
-      case 13:
-        b.i64_le_s();
-        break;
-      // LE: Rn <=s Op2
-      default:
-        b.i64_sub();
-        b.drop();
-        b.i32_const(0);
-        break;
-    }
-  }
-  function emitEpilogue(b, writes) {
-    for (const local of writes) {
-      if (local === NZCV_LOCAL) {
-        b.i32_const(NZCV_OFFSET);
-        b.local_get(NZCV_LOCAL);
-        b.i64_store(3, 0);
-      } else if (local === SP_LOCAL) {
-        b.i32_const(SP_OFFSET);
-        b.local_get(SP_LOCAL);
-        b.i64_store(3, 0);
-      } else if (local >= 0 && local <= 30) {
-        b.i32_const(local * 8);
-        b.local_get(local);
-        b.i64_store(3, 0);
-      }
-    }
-  }
-  function emitInsn(b, insn, pc, TMP0, TMP1, TMP2, TMP3, helpers) {
-    switch (insn.kind) {
-      case "add_imm":
-        emitAddSubImm(b, insn, true, TMP0, TMP1, TMP2);
-        break;
-      case "sub_imm":
-        emitAddSubImm(b, insn, false, TMP0, TMP1, TMP2);
-        break;
-      case "add_reg":
-        emitAddSubReg(b, insn, true, TMP0, TMP1, TMP2);
-        break;
-      case "sub_reg":
-        emitAddSubReg(b, insn, false, TMP0, TMP1, TMP2);
-        break;
-      case "adc":
-      case "sbc":
-        emitAdcSbc(b, insn, TMP0);
-        break;
-      case "orr_reg":
-        emitLogicalReg(b, insn, TMP0);
-        break;
-      case "eor_reg":
-        emitLogicalReg(b, insn, TMP0);
-        break;
-      case "and_reg":
-        emitLogicalReg(b, insn, TMP0);
-        break;
-      case "and_imm":
-        emitLogicalImm(b, insn, TMP0);
-        break;
-      case "orr_imm":
-        emitLogicalImm(b, insn, TMP0);
-        break;
-      case "eor_imm":
-        emitLogicalImm(b, insn, TMP0);
-        break;
-      case "movz":
-        emitMovz(b, insn);
-        break;
-      case "movk":
-        emitMovk(b, insn);
-        break;
-      case "movn":
-        emitMovn(b, insn);
-        break;
-      case "madd":
-        emitMadd(b, insn);
-        break;
-      case "msub":
-        emitMsub(b, insn);
-        break;
-      case "smaddl":
-      case "smsubl":
-      case "umaddl":
-      case "umsubl":
-        emitMulLong(b, insn);
-        break;
-      case "sdiv":
-        emitDiv(b, insn, true);
-        break;
-      case "udiv":
-        emitDiv(b, insn, false);
-        break;
-      case "smulh": {
-        emitGetReg(b, insn.rn, 1);
-        emitGetReg(b, insn.rm, 1);
-        b.call(helpers.smulhIdx);
-        emitSetReg(b, insn.rd, 1);
-        break;
-      }
-      case "umulh": {
-        emitGetReg(b, insn.rn, 1);
-        emitGetReg(b, insn.rm, 1);
-        b.call(helpers.umulhIdx);
-        emitSetReg(b, insn.rd, 1);
-        break;
-      }
-      case "sbfm":
-        emitBitfield(b, insn);
-        break;
-      case "ubfm":
-        emitBitfield(b, insn);
-        break;
-      case "bfm":
-        emitBitfield(b, insn);
-        break;
-      case "csel":
-        emitCondSelect(b, insn);
-        break;
-      case "ldr_imm":
-        emitLdrImm(b, insn);
-        break;
-      case "str_imm":
-        emitStrImm(b, insn);
-        break;
-      case "ldrb_imm":
-        emitSubwordLoadImm(b, insn, 1, false);
-        break;
-      case "strb_imm":
-        emitSubwordStoreImm(b, insn, 1);
-        break;
-      case "ldrh_imm":
-        emitSubwordLoadImm(b, insn, 2, false);
-        break;
-      case "strh_imm":
-        emitSubwordStoreImm(b, insn, 2);
-        break;
-      case "ldrsb_imm":
-        emitSubwordLoadImm(b, insn, 1, true);
-        break;
-      case "ldrsh_imm":
-        emitSubwordLoadImm(b, insn, 2, true);
-        break;
-      case "ldrsw_imm":
-        emitSubwordLoadImm(b, insn, 4, true);
-        break;
-      case "ldr_reg":
-        emitLdrReg(b, insn);
-        break;
-      case "str_reg":
-        emitStrReg(b, insn);
-        break;
-      case "ldp":
-        emitLdp(b, insn);
-        break;
-      case "stp":
-        emitStp(b, insn);
-        break;
-      case "adr": {
-        b.i64_const(BigInt(pc) + BigInt(insn.imm));
-        emitSetReg(b, insn.rd, 1);
-        break;
-      }
-      case "adrp": {
-        b.i64_const(BigInt(pc & ~4095) + BigInt(insn.imm));
-        emitSetReg(b, insn.rd, 1);
-        break;
-      }
-      // Sub-word register-offset loads/stores
-      case "ldrb_reg":
-        emitSubwordRegLoad(b, insn, 1, false);
-        break;
-      case "strb_reg":
-        emitSubwordRegStore(b, insn, 1);
-        break;
-      case "ldrh_reg":
-        emitSubwordRegLoad(b, insn, 2, false);
-        break;
-      case "strh_reg":
-        emitSubwordRegStore(b, insn, 2);
-        break;
-      case "ldrsb_reg":
-        emitSubwordRegLoad(b, insn, 1, true);
-        break;
-      case "ldrsh_reg":
-        emitSubwordRegLoad(b, insn, 2, true);
-        break;
-      case "ldrsw_reg":
-        emitSubwordRegLoad(b, insn, 4, true);
-        break;
-      // Load literal (PC-relative)
-      case "ldr_lit": {
-        const addr = pc + insn.offset;
-        emitGuestAddr(b, BigInt(addr));
-        if (insn.sf) {
-          b.i64_load(3, 0);
-        } else {
-          b.i64_load32_u(2, 0);
-        }
-        emitSetReg(b, insn.rt, 1);
-        break;
-      }
-      case "ldrsw_lit": {
-        const addr = pc + insn.offset;
-        emitGuestAddr(b, BigInt(addr));
-        b.i64_load32_s(2, 0);
-        emitSetReg(b, insn.rt, 1);
-        break;
-      }
-      // CLZ: count leading zeros (native WASM)
-      case "clz": {
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.sf === 0) {
-          b.i64_const(32n);
-          b.i64_shl();
-          b.i64_clz();
-        } else {
-          b.i64_clz();
-        }
-        emitSetReg(b, insn.rd, insn.sf);
-        break;
-      }
-      // CLS: count leading sign bits = clz(x ^ (x >> 1)) - 1
-      case "cls": {
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.sf === 0) {
-          b.i64_const(32n);
-          b.i64_shl();
-          b.i64_const(32n);
-          b.i64_shr_s();
-          b.local_tee(TMP0);
-          b.i64_const(1n);
-          b.i64_shr_s();
-          b.local_get(TMP0);
-          b.i64_xor();
-          b.i64_const(32n);
-          b.i64_shl();
-          b.i64_clz();
-        } else {
-          b.local_tee(TMP0);
-          b.i64_const(1n);
-          b.i64_shr_s();
-          b.local_get(TMP0);
-          b.i64_xor();
-          b.i64_clz();
-        }
-        b.i64_const(1n);
-        b.i64_sub();
-        emitSetReg(b, insn.rd, insn.sf);
-        break;
-      }
-      // RBIT: reverse bits — use JS helper via shift/mask
-      case "rbit":
-        emitRbit(b, insn, TMP0);
-        break;
-      // REV: reverse bytes
-      case "rev":
-        emitRev(b, insn, TMP0, TMP1);
-        break;
-      // REV16: reverse bytes in each 16-bit halfword
-      case "rev16":
-        emitRev16(b, insn, TMP0, TMP1);
-        break;
-      // REV32: reverse bytes in each 32-bit word (64-bit only)
-      case "rev32":
-        emitRev32(b, insn, TMP0, TMP1);
-        break;
-      // EXTR: extract from pair of registers
-      case "extr":
-        emitExtr(b, insn);
-        break;
-      // CCMP/CCMN: conditional compare
-      case "ccmp":
-        emitCcmpCcmn(b, insn, false, TMP0, TMP1, TMP2);
-        break;
-      case "ccmn":
-        emitCcmpCcmn(b, insn, true, TMP0, TMP1, TMP2);
-        break;
-      // Load/store exclusive (treated as plain load/store, single-threaded)
-      case "ldxr": {
-        emitGetReg(b, insn.rn, 1);
-        emitAddGuestBase(b);
-        if (insn.sf) {
-          b.i64_load(3, 0);
-        } else {
-          b.i64_load32_u(2, 0);
-        }
-        emitSetReg(b, insn.rt, 1);
-        break;
-      }
-      case "stxr": {
-        emitGetReg(b, insn.rn, 1);
-        emitAddGuestBase(b);
-        emitGetReg(b, insn.rt, insn.sf);
-        if (insn.sf) {
-          b.i64_store(3, 0);
-        } else {
-          b.i64_store32(2, 0);
-        }
-        b.i64_const(0n);
-        emitSetReg(b, insn.rs, 0);
-        break;
-      }
-      // MRS: read system register
-      case "mrs":
-        emitMrs(b, insn);
-        break;
-      // MSR: write system register
-      case "msr":
-        emitMsr(b, insn);
-        break;
-      // Add/sub extended register
-      case "add_ext":
-        emitAddSubExt(b, insn, true, TMP0, TMP1, TMP2);
-        break;
-      case "sub_ext":
-        emitAddSubExt(b, insn, false, TMP0, TMP1, TMP2);
-        break;
-      // Branch instructions (block terminators)
-      // Store target PC to NEXT_PC_LOCAL instead of return_()
-      // so the epilogue (register writeback) always runs
-      case "b": {
-        const target = pc + insn.offset;
-        b.i64_const(BigInt(target));
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "bl": {
-        b.i64_const(BigInt(pc + 4));
-        b.local_set(regLocal(30));
-        const target = pc + insn.offset;
-        b.i64_const(BigInt(target));
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "b_cond": {
-        emitConditionTest(b, insn.cond, NZCV_LOCAL);
-        b.if_(126 /* I64 */);
-        b.i64_const(BigInt(pc + insn.offset));
-        b.else_();
-        b.i64_const(BigInt(pc + 4));
-        b.end();
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "cbz": {
-        emitGetReg(b, insn.rt, insn.sf);
-        b.i64_eqz();
-        b.if_(126 /* I64 */);
-        b.i64_const(BigInt(pc + insn.offset));
-        b.else_();
-        b.i64_const(BigInt(pc + 4));
-        b.end();
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "cbnz": {
-        emitGetReg(b, insn.rt, insn.sf);
-        b.i64_const(0n);
-        b.i64_ne();
-        b.if_(126 /* I64 */);
-        b.i64_const(BigInt(pc + insn.offset));
-        b.else_();
-        b.i64_const(BigInt(pc + 4));
-        b.end();
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "tbz": {
-        b.local_get(regLocal(insn.rt));
-        b.i64_const(BigInt(insn.bit));
-        b.i64_shr_u();
-        b.i64_const(1n);
-        b.i64_and();
-        b.i64_eqz();
-        b.if_(126 /* I64 */);
-        b.i64_const(BigInt(pc + insn.offset));
-        b.else_();
-        b.i64_const(BigInt(pc + 4));
-        b.end();
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "tbnz": {
-        b.local_get(regLocal(insn.rt));
-        b.i64_const(BigInt(insn.bit));
-        b.i64_shr_u();
-        b.i64_const(1n);
-        b.i64_and();
-        b.i64_const(0n);
-        b.i64_ne();
-        b.if_(126 /* I64 */);
-        b.i64_const(BigInt(pc + insn.offset));
-        b.else_();
-        b.i64_const(BigInt(pc + 4));
-        b.end();
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "br": {
-        b.local_get(regLocal(insn.rn));
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "blr": {
-        b.i64_const(BigInt(pc + 4));
-        b.local_set(regLocal(30));
-        b.local_get(regLocal(insn.rn));
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "ret": {
-        b.local_get(regLocal(insn.rn));
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "svc": {
-        b.i32_const(PC_OFFSET);
-        b.i64_const(BigInt(pc));
-        b.i64_store(3, 0);
-        b.i64_const(SVC_PC);
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      case "brk": {
-        b.i64_const(HALT_PC);
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      // Variable shifts
-      case "lslv":
-      case "lsrv":
-      case "asrv":
-      case "rorv": {
-        if (insn.kind === "asrv" && insn.sf === 0) {
-          emitGetReg(b, insn.rn, 0);
-          b.i64_const(32n);
-          b.i64_shl();
-          b.i64_const(32n);
-          b.i64_shr_s();
-          emitGetReg(b, insn.rm, 0);
-          b.i64_const(31n);
-          b.i64_and();
-          b.i64_shr_s();
-          b.i64_const(0xFFFFFFFFn);
-          b.i64_and();
-        } else if (insn.kind === "rorv" && insn.sf === 0) {
-          emitGetReg(b, insn.rn, 0);
-          b.local_tee(TMP0);
-          emitGetReg(b, insn.rm, 0);
-          b.i64_const(31n);
-          b.i64_and();
-          b.local_tee(TMP1);
-          b.i64_shr_u();
-          b.local_get(TMP0);
-          b.i64_const(32n);
-          b.local_get(TMP1);
-          b.i64_sub();
-          b.i64_shl();
-          b.i64_or();
-          b.i64_const(0xFFFFFFFFn);
-          b.i64_and();
-        } else {
-          emitGetReg(b, insn.rn, insn.sf);
-          emitGetReg(b, insn.rm, insn.sf);
-          b.i64_const(BigInt(insn.sf ? 63 : 31));
-          b.i64_and();
-          switch (insn.kind) {
-            case "lslv":
-              b.i64_shl();
-              break;
-            case "lsrv":
-              b.i64_shr_u();
-              break;
-            case "asrv":
-              b.i64_shr_s();
-              break;
-            case "rorv":
-              b.i64_rotr();
-              break;
-          }
-          if (insn.sf === 0) {
-            b.i64_const(0xFFFFFFFFn);
-            b.i64_and();
-          }
-        }
-        emitSetReg(b, insn.rd, insn.sf);
-        break;
-      }
-      // SIMD/FP load/store (Q = 128-bit)
-      case "str_simd": {
-        if (insn.size === 16) {
-          emitSimdStore128(b, insn, TMP0);
-        } else {
-          emitSimdStoreSmall(b, insn, TMP0);
-        }
-        break;
-      }
-      case "ldr_simd": {
-        if (insn.size === 16) {
-          emitSimdLoad128(b, insn, TMP0);
-        } else {
-          emitSimdLoadSmall(b, insn, TMP0);
-        }
-        break;
-      }
-      case "stp_simd": {
-        if (insn.size === 16) {
-          emitSimdStorePair128(b, insn, TMP0);
-        } else {
-          emitSimdStorePairSmall(b, insn, TMP0);
-        }
-        break;
-      }
-      case "ldp_simd": {
-        if (insn.size === 16) {
-          emitSimdLoadPair128(b, insn, TMP0);
-        } else {
-          emitSimdLoadPairSmall(b, insn, TMP0);
-        }
-        break;
-      }
-      // SIMD DUP from general register
-      case "simd_dup_gpr": {
-        emitSimdDupGpr(b, insn);
-        break;
-      }
-      // SIMD DUP from element
-      case "simd_dup_elem": {
-        emitSimdDupElem(b, insn, TMP0);
-        break;
-      }
-      // SIMD UMOV (extract to GPR)
-      case "simd_umov": {
-        emitSimdUmov(b, insn);
-        break;
-      }
-      // SIMD MOVI (move immediate to vector)
-      case "simd_movi": {
-        emitSimdMovi(b, insn);
-        break;
-      }
-      // SIMD INS from GPR
-      case "simd_ins_gpr": {
-        emitSimdInsGpr(b, insn);
-        break;
-      }
-      // FMOV GPR → FP register
-      case "fmov_to_fp": {
-        emitFmovToFp(b, insn);
-        break;
-      }
-      // FMOV FP register → GPR
-      case "fmov_from_fp": {
-        emitFmovFromFp(b, insn);
-        break;
-      }
-      // FMOV GPR → top half of 128-bit FP register
-      case "fmov_top_to_fp": {
-        const vdOff = vregOffset(insn.vd);
-        b.i32_const(vdOff + 8);
-        emitGetReg(b, insn.rn, 1);
-        b.i64_store(3, 0);
-        break;
-      }
-      // FMOV top half of 128-bit FP register → GPR
-      case "fmov_top_from_fp": {
-        const vnOff = vregOffset(insn.vn);
-        b.i32_const(vnOff + 8);
-        b.i64_load(3, 0);
-        emitSetReg(b, insn.rd, 1);
-        break;
-      }
-      // FMOV between FP registers
-      case "fmov_fp": {
-        emitFmovFp(b, insn);
-        break;
-      }
-      // FP <-> integer conversions
-      case "scvtf_int":
-      case "ucvtf_int":
-      case "fcvtzs_int":
-      case "fcvtzu_int": {
-        emitFpIntConv(b, insn, TMP0, helpers);
-        break;
-      }
-      // FP arithmetic (2-source)
-      case "fmul":
-      case "fdiv":
-      case "fadd":
-      case "fsub": {
-        emitFpArith2(b, insn, TMP0, helpers);
-        break;
-      }
-      // FP misc (1-source)
-      case "fabs":
-      case "fneg": {
-        emitFpMisc1(b, insn, TMP0, helpers);
-        break;
-      }
-      // FP precision conversion
-      case "fcvt": {
-        emitFcvt(b, insn, TMP0, helpers);
-        break;
-      }
-      // FP immediate
-      case "fmov_imm": {
-        emitFmovImm(b, insn);
-        break;
-      }
-      // FP compare
-      case "fcmp": {
-        emitFpCmp(b, insn, helpers);
-        break;
-      }
-      // FP fused multiply-add/subtract (3-source)
-      case "fmadd":
-      case "fmsub":
-      case "fnmadd":
-      case "fnmsub": {
-        emitFpMulAdd(b, insn, TMP0, helpers);
-        break;
-      }
-      // SIMD ORR (vector, register) / MOV (vector)
-      case "simd_orr_reg": {
-        const rnOff = vregOffset(insn.rn);
-        const rmOff = vregOffset(insn.rm);
-        const rdOff = vregOffset(insn.rd);
-        b.i32_const(rdOff);
-        b.i32_const(rnOff);
-        b.i64_load(3, 0);
-        b.i32_const(rmOff);
-        b.i64_load(3, 0);
-        b.i64_or();
-        b.i64_store(3, 0);
-        if (insn.Q) {
-          b.i32_const(rdOff + 8);
-          b.i32_const(rnOff + 8);
-          b.i64_load(3, 0);
-          b.i32_const(rmOff + 8);
-          b.i64_load(3, 0);
-          b.i64_or();
-          b.i64_store(3, 0);
-        } else {
-          b.i32_const(rdOff + 8);
-          b.i64_const(0n);
-          b.i64_store(3, 0);
-        }
-        break;
-      }
-      // SIMD NOT (bitwise complement)
-      case "simd_not": {
-        const rnOff = vregOffset(insn.rn);
-        const rdOff = vregOffset(insn.rd);
-        b.i32_const(rdOff);
-        b.i32_const(rnOff);
-        b.i64_load(3, 0);
-        b.i64_const(-1n);
-        b.i64_xor();
-        b.i64_store(3, 0);
-        b.i32_const(rdOff + 8);
-        if (insn.Q) {
-          b.i32_const(rnOff + 8);
-          b.i64_load(3, 0);
-          b.i64_const(-1n);
-          b.i64_xor();
-        } else {
-          b.i64_const(0n);
-        }
-        b.i64_store(3, 0);
-        break;
-      }
-      // SIMD NEG, ABS, CNT, CLS, CLZ (two-reg misc) — use JS helper
-      case "simd_neg":
-      case "simd_abs":
-      case "simd_cnt":
-      case "simd_cls_vec":
-      case "simd_clz_vec": {
-        b.i64_const(HALT_PC);
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-      }
-      // SIMD bitwise operations (AND, BIC, EOR)
-      case "simd_and_reg":
-      case "simd_bic_reg":
-      case "simd_eor_reg": {
-        const rnOff = vregOffset(insn.rn);
-        const rmOff = vregOffset(insn.rm);
-        const rdOff = vregOffset(insn.rd);
-        const op = insn.kind === "simd_and_reg" ? "and" : insn.kind === "simd_bic_reg" ? "bic" : "eor";
-        b.i32_const(rdOff);
-        b.i32_const(rnOff);
-        b.i64_load(3, 0);
-        b.i32_const(rmOff);
-        b.i64_load(3, 0);
-        if (op === "bic") {
-          b.i64_const(-1n);
-          b.i64_xor();
-          b.i64_and();
-        } else if (op === "and") {
-          b.i64_and();
-        } else {
-          b.i64_xor();
-        }
-        b.i64_store(3, 0);
-        b.i32_const(rdOff + 8);
-        if (insn.Q) {
-          b.i32_const(rnOff + 8);
-          b.i64_load(3, 0);
-          b.i32_const(rmOff + 8);
-          b.i64_load(3, 0);
-          if (op === "bic") {
-            b.i64_const(-1n);
-            b.i64_xor();
-            b.i64_and();
-          } else if (op === "and") {
-            b.i64_and();
-          } else {
-            b.i64_xor();
-          }
-        } else {
-          b.i64_const(0n);
-        }
-        b.i64_store(3, 0);
-        break;
-      }
-      // SIMD integer ADD/SUB — element-wise via helper function
-      case "simd_add":
-      case "simd_sub":
-      case "simd_cmeq_reg":
-      case "simd_cmgt_reg":
-      case "simd_cmhi_reg":
-      case "simd_cmge_reg":
-      case "simd_cmhs_reg":
-      case "simd_umaxp":
-      case "simd_addp":
-      case "simd_tbl":
-      case "simd_zip1":
-      case "simd_zip2":
-      case "simd_uzp1":
-      case "simd_uzp2":
-      case "simd_trn1":
-      case "simd_trn2": {
-        emitSimdThreeSameGeneric(b, insn, TMP0, helpers);
-        break;
-      }
-      // SIMD shift by immediate
-      case "simd_sshll":
-      case "simd_ushll": {
-        emitSimdShiftLong(b, insn, TMP0);
-        break;
-      }
-      case "nop":
-        break;
-      default:
-        b.i64_const(HALT_PC);
-        b.local_set(NEXT_PC_LOCAL);
-        break;
-    }
-  }
-  function emitGetReg(b, r, sf) {
-    if (r === 31) {
-      b.i64_const(0n);
-    } else {
-      b.local_get(regLocal(r));
-      if (sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-    }
-  }
-  function emitGetRegSP(b, r, sf) {
-    if (r === 31) {
-      b.local_get(SP_LOCAL);
-    } else {
-      b.local_get(regLocal(r));
-    }
-    if (sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-  }
-  function emitSetReg(b, r, sf) {
-    if (r === 31) {
-      b.drop();
-      return;
-    }
-    if (sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.local_set(regLocal(r));
-  }
-  function emitSetRegSP(b, r, sf) {
-    if (r === 31) {
-      if (sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.local_set(SP_LOCAL);
-      return;
-    }
-    emitSetReg(b, r, sf);
-  }
-  function emitAddSubImm(b, insn, isAdd, TMP0, TMP1, TMP2) {
-    if (insn.setFlags) {
-      emitGetRegSP(b, insn.rn, insn.sf);
-      b.local_tee(TMP0);
-      b.i64_const(BigInt(insn.imm));
-      b.local_tee(TMP1);
-      if (isAdd) b.i64_add();
-      else b.i64_sub();
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.local_tee(TMP2);
-      emitSetReg(b, insn.rd, insn.sf);
-      emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
-    } else {
-      emitGetRegSP(b, insn.rn, insn.sf);
-      b.i64_const(BigInt(insn.imm));
-      if (isAdd) b.i64_add();
-      else b.i64_sub();
-      emitSetRegSP(b, insn.rd, insn.sf);
-    }
-  }
-  function emitAddSubReg(b, insn, isAdd, TMP0, TMP1, TMP2) {
-    if (insn.setFlags) {
-      emitGetReg(b, insn.rn, insn.sf);
-      b.local_tee(TMP0);
-      emitGetReg(b, insn.rm, insn.sf);
-      emitShift(b, insn.shift, insn.amount, insn.sf);
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.local_tee(TMP1);
-      if (isAdd) b.i64_add();
-      else b.i64_sub();
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.local_tee(TMP2);
-      emitSetReg(b, insn.rd, insn.sf);
-      emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
-    } else {
-      emitGetReg(b, insn.rn, insn.sf);
-      emitGetReg(b, insn.rm, insn.sf);
-      emitShift(b, insn.shift, insn.amount, insn.sf);
-      if (isAdd) b.i64_add();
-      else b.i64_sub();
-      emitSetReg(b, insn.rd, insn.sf);
-    }
-  }
-  function emitAdcSbc(b, insn, TMP0) {
-    const isSbc = insn.kind === "sbc";
-    const mask = insn.sf ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
-    b.local_get(NZCV_LOCAL);
-    b.i64_const(1n);
-    b.i64_shr_u();
-    b.i64_const(1n);
-    b.i64_and();
-    b.local_set(TMP0);
-    emitGetReg(b, insn.rn, insn.sf);
-    emitGetReg(b, insn.rm, insn.sf);
-    if (isSbc) {
-      b.i64_const(-1n);
-      b.i64_xor();
-      if (insn.sf === 0) {
-        b.i64_const(mask);
-        b.i64_and();
-      }
-    }
-    b.i64_add();
-    b.local_get(TMP0);
-    b.i64_add();
-    if (insn.sf === 0) {
-      b.i64_const(mask);
-      b.i64_and();
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitShift(b, shift, amount, sf = 1) {
-    if (amount === 0) return;
-    if (sf === 0 && shift === "asr") {
-      b.i64_const(32n);
-      b.i64_shl();
-      b.i64_const(BigInt(32 + amount));
-      b.i64_shr_s();
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-      return;
-    }
-    if (sf === 0 && shift === "ror") {
-      const TMP = REG_COUNT + 3;
-      b.local_tee(TMP);
-      b.i64_const(32n);
-      b.i64_shl();
-      b.local_get(TMP);
-      b.i64_or();
-      b.i64_const(BigInt(amount));
-      b.i64_rotr();
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-      return;
-    }
-    b.i64_const(BigInt(amount));
-    switch (shift) {
-      case "lsl":
-        b.i64_shl();
-        break;
-      case "lsr":
-        b.i64_shr_u();
-        break;
-      case "asr":
-        b.i64_shr_s();
-        break;
-      case "ror":
-        b.i64_rotr();
-        break;
-    }
-  }
-  function emitLogicalReg(b, insn, TMP0) {
-    emitGetReg(b, insn.rn, insn.sf);
-    emitGetReg(b, insn.rm, insn.sf);
-    emitShift(b, insn.shift, insn.amount, insn.sf);
-    if (insn.invert) {
-      b.i64_const(-1n);
-      b.i64_xor();
-    }
-    switch (insn.kind) {
-      case "orr_reg":
-        b.i64_or();
-        break;
-      case "eor_reg":
-        b.i64_xor();
-        break;
-      case "and_reg":
-        b.i64_and();
-        break;
-    }
-    const isAnds = insn.kind === "and_reg" && insn.setFlags;
-    if (isAnds) {
-      b.local_tee(TMP0);
-      emitSetReg(b, insn.rd, insn.sf);
-      const bits2 = insn.sf ? 64 : 32;
-      b.local_get(TMP0);
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.i64_const(BigInt(bits2 - 1));
-      b.i64_shr_u();
-      b.i64_const(1n);
-      b.i64_and();
-      b.i64_const(3n);
-      b.i64_shl();
-      b.local_get(TMP0);
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.i64_eqz();
-      b.i64_extend_i32_u();
-      b.i64_const(2n);
-      b.i64_shl();
-      b.i64_or();
-      b.local_set(NZCV_LOCAL);
-    } else {
-      emitSetReg(b, insn.rd, insn.sf);
-    }
-  }
-  function emitLogicalImm(b, insn, TMP0) {
-    emitGetReg(b, insn.rn, insn.sf);
-    b.i64_const(insn.imm);
-    switch (insn.kind) {
-      case "and_imm":
-        b.i64_and();
-        break;
-      case "orr_imm":
-        b.i64_or();
-        break;
-      case "eor_imm":
-        b.i64_xor();
-        break;
-    }
-    const isAnds = insn.kind === "and_imm" && insn.setFlags;
-    if (isAnds) {
-      b.local_tee(TMP0);
-      emitSetReg(b, insn.rd, insn.sf);
-      const bits2 = insn.sf ? 64 : 32;
-      b.local_get(TMP0);
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.i64_const(BigInt(bits2 - 1));
-      b.i64_shr_u();
-      b.i64_const(1n);
-      b.i64_and();
-      b.i64_const(3n);
-      b.i64_shl();
-      b.local_get(TMP0);
-      if (insn.sf === 0) {
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-      }
-      b.i64_eqz();
-      b.i64_extend_i32_u();
-      b.i64_const(2n);
-      b.i64_shl();
-      b.i64_or();
-      b.local_set(NZCV_LOCAL);
-    } else {
-      emitSetRegSP(b, insn.rd, insn.sf);
-    }
-  }
-  function emitMovz(b, insn) {
-    const value = BigInt(insn.imm16) << BigInt(insn.hw * 16);
-    b.i64_const(value);
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitMovk(b, insn) {
-    const shift = insn.hw * 16;
-    const mask = ~(0xFFFFn << BigInt(shift));
-    const newBits = BigInt(insn.imm16) << BigInt(shift);
-    b.local_get(regLocal(insn.rd));
-    b.i64_const(mask);
-    b.i64_and();
-    b.i64_const(newBits);
-    b.i64_or();
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitMovn(b, insn) {
-    const value = BigInt(insn.imm16) << BigInt(insn.hw * 16);
-    b.i64_const(~value);
-    if (insn.sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitMadd(b, insn) {
-    emitGetReg(b, insn.ra, insn.sf);
-    emitGetReg(b, insn.rn, insn.sf);
-    emitGetReg(b, insn.rm, insn.sf);
-    b.i64_mul();
-    b.i64_add();
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitMsub(b, insn) {
-    emitGetReg(b, insn.ra, insn.sf);
-    emitGetReg(b, insn.rn, insn.sf);
-    emitGetReg(b, insn.rm, insn.sf);
-    b.i64_mul();
-    b.i64_sub();
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitMulLong(b, insn) {
-    const isSigned = insn.kind === "smaddl" || insn.kind === "smsubl";
-    const isSub = insn.kind === "smsubl" || insn.kind === "umsubl";
-    emitGetReg(b, insn.rn, 0);
-    if (isSigned) {
-      b.i64_const(32n);
-      b.i64_shl();
-      b.i64_const(32n);
-      b.i64_shr_s();
-    } else {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    emitGetReg(b, insn.rm, 0);
-    if (isSigned) {
-      b.i64_const(32n);
-      b.i64_shl();
-      b.i64_const(32n);
-      b.i64_shr_s();
-    } else {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.i64_mul();
-    if (isSub) {
-      const tmpLocal = regLocal(insn.rd);
-      b.local_set(tmpLocal);
-      emitGetReg(b, insn.ra, 1);
-      b.local_get(tmpLocal);
-      b.i64_sub();
-    } else {
-      emitGetReg(b, insn.ra, 1);
-      b.i64_add();
-    }
-    emitSetReg(b, insn.rd, 1);
-  }
-  function emitDiv(b, insn, isSigned) {
-    emitGetReg(b, insn.rm, insn.sf);
-    b.i64_eqz();
-    b.if_(126 /* I64 */);
-    b.i64_const(0n);
-    b.else_();
-    emitGetReg(b, insn.rn, insn.sf);
-    emitGetReg(b, insn.rm, insn.sf);
-    if (isSigned) b.i64_div_s();
-    else b.i64_div_u();
-    b.end();
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitBitfield(b, insn) {
-    const regSize = insn.sf ? 64 : 32;
-    if (insn.kind === "ubfm") {
-      if (insn.imms + 1 === regSize) {
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.immr > 0) {
-          b.i64_const(BigInt(insn.immr));
-          b.i64_shr_u();
-        }
-      } else if (insn.imms < insn.immr) {
-        const width = insn.imms + 1;
-        const lsb = regSize - insn.immr;
-        emitGetReg(b, insn.rn, insn.sf);
-        const mask = (1n << BigInt(width)) - 1n;
-        b.i64_const(mask);
-        b.i64_and();
-        b.i64_const(BigInt(lsb));
-        b.i64_shl();
-      } else {
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.immr > 0) {
-          b.i64_const(BigInt(insn.immr));
-          b.i64_shr_u();
-        }
-        const width = insn.imms - insn.immr + 1;
-        const mask = (1n << BigInt(width)) - 1n;
-        b.i64_const(mask);
-        b.i64_and();
-      }
-    } else if (insn.kind === "sbfm") {
-      if (insn.imms + 1 === regSize) {
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.sf === 0) {
-          b.i64_const(32n);
-          b.i64_shl();
-          b.i64_const(32n);
-          b.i64_shr_s();
-        }
-        if (insn.immr > 0) {
-          b.i64_const(BigInt(insn.immr));
-          b.i64_shr_s();
-        }
-      } else if (insn.immr === 0) {
-        emitGetReg(b, insn.rn, insn.sf);
-        const bits2 = insn.imms + 1;
-        const shift = BigInt(64 - bits2);
-        b.i64_const(shift);
-        b.i64_shl();
-        b.i64_const(shift);
-        b.i64_shr_s();
-      } else if (insn.imms < insn.immr) {
-        const width = insn.imms + 1;
-        const lsb = regSize - insn.immr;
-        emitGetReg(b, insn.rn, insn.sf);
-        const signExtShift = BigInt(64 - width);
-        b.i64_const(signExtShift);
-        b.i64_shl();
-        b.i64_const(signExtShift);
-        b.i64_shr_s();
-        if (lsb > 0) {
-          b.i64_const(BigInt(lsb));
-          b.i64_shl();
-        }
-      } else {
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.immr > 0) {
-          b.i64_const(BigInt(insn.immr));
-          b.i64_shr_u();
-        }
-        const width = insn.imms - insn.immr + 1;
-        const shift = BigInt(64 - width);
-        b.i64_const(shift);
-        b.i64_shl();
-        b.i64_const(shift);
-        b.i64_shr_s();
-      }
-    } else {
-      if (insn.imms < insn.immr) {
-        const width = insn.imms + 1;
-        const lsb = regSize - insn.immr;
-        const mask = (1n << BigInt(width)) - 1n << BigInt(lsb);
-        emitGetReg(b, insn.rd, insn.sf);
-        b.i64_const(~mask);
-        b.i64_and();
-        emitGetReg(b, insn.rn, insn.sf);
-        b.i64_const(BigInt(lsb));
-        b.i64_shl();
-        b.i64_const(mask);
-        b.i64_and();
-        b.i64_or();
-      } else {
-        const width = insn.imms - insn.immr + 1;
-        const mask = (1n << BigInt(width)) - 1n;
-        emitGetReg(b, insn.rd, insn.sf);
-        b.i64_const(~mask);
-        b.i64_and();
-        emitGetReg(b, insn.rn, insn.sf);
-        if (insn.immr > 0) {
-          b.i64_const(BigInt(insn.immr));
-          b.i64_shr_u();
-        }
-        b.i64_const(mask);
-        b.i64_and();
-        b.i64_or();
-      }
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitCondSelect(b, insn) {
-    emitConditionTest(b, insn.cond, NZCV_LOCAL);
-    b.if_(126 /* I64 */);
-    emitGetReg(b, insn.rn, insn.sf);
-    b.else_();
-    switch (insn.variant) {
-      case "csel":
-        emitGetReg(b, insn.rm, insn.sf);
-        break;
-      case "csinc":
-        emitGetReg(b, insn.rm, insn.sf);
-        b.i64_const(1n);
-        b.i64_add();
-        break;
-      case "csinv":
-        emitGetReg(b, insn.rm, insn.sf);
-        b.i64_const(-1n);
-        b.i64_xor();
-        break;
-      case "csneg":
-        b.i64_const(0n);
-        emitGetReg(b, insn.rm, insn.sf);
-        b.i64_sub();
-        break;
-    }
-    b.end();
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitLdrImm(b, insn) {
-    const guestMemBase2 = 65536;
-    if (insn.mode === "pre") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      b.local_tee(insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn));
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset + guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    }
-    if (insn.sf === 1) {
-      b.i64_load(3, 0);
-    } else {
-      b.i64_load32_u(2, 0);
-    }
-    emitSetReg(b, insn.rt, insn.sf);
-    if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-  }
-  function emitStrImm(b, insn) {
-    const guestMemBase2 = 65536;
-    if (insn.mode === "pre") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      b.local_tee(insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn));
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset + guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    }
-    emitGetReg(b, insn.rt, insn.sf);
-    if (insn.sf === 1) {
-      b.i64_store(3, 0);
-    } else {
-      b.i64_store32(2, 0);
-    }
-    if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-  }
-  function emitSubwordLoadImm(b, insn, byteWidth, signExtend2) {
-    const guestMemBase2 = 65536;
-    if (insn.mode === "pre") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      b.local_tee(insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn));
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset + guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    }
-    if (byteWidth === 1) {
-      if (signExtend2) b.i64_load8_s(0, 0);
-      else b.i64_load8_u(0, 0);
-    } else if (byteWidth === 2) {
-      if (signExtend2) b.i64_load16_s(1, 0);
-      else b.i64_load16_u(1, 0);
-    } else {
-      if (signExtend2) b.i64_load32_s(2, 0);
-      else b.i64_load32_u(2, 0);
-    }
-    const sf = "sf" in insn ? insn.sf : 1;
-    if (sf === 0 && !signExtend2) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    const rt = insn.rt;
-    if (rt !== 31) b.local_set(regLocal(rt));
-    else b.drop();
-    if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-  }
-  function emitSubwordStoreImm(b, insn, byteWidth) {
-    const guestMemBase2 = 65536;
-    if (insn.mode === "pre") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      b.local_tee(insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn));
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    } else {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset + guestMemBase2));
-      b.i64_add();
-      b.i32_wrap_i64();
-    }
-    if (insn.rt === 31) b.i64_const(0n);
-    else b.local_get(regLocal(insn.rt));
-    if (byteWidth === 1) b.i64_store8(0, 0);
-    else b.i64_store16(1, 0);
-    if (insn.mode === "post") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-  }
-  function emitExtendReg(b, rm, extend, shift) {
-    if (rm === 31) {
-      b.i64_const(0n);
-    } else {
-      b.local_get(regLocal(rm));
-    }
-    switch (extend) {
-      case "uxtw":
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-        break;
-      case "sxtw":
-        b.i64_const(32n);
-        b.i64_shl();
-        b.i64_const(32n);
-        b.i64_shr_s();
-        break;
-      case "sxtx":
-        break;
-      case "lsl":
-      default:
-        break;
-    }
-    if (shift > 0) {
-      b.i64_const(BigInt(shift));
-      b.i64_shl();
-    }
-  }
-  function emitLdrReg(b, insn) {
-    const guestMemBase2 = 65536;
-    emitGetRegSP(b, insn.rn, 1);
-    emitExtendReg(b, insn.rm, insn.extend, insn.shift);
-    b.i64_add();
-    b.i64_const(BigInt(guestMemBase2));
-    b.i64_add();
-    b.i32_wrap_i64();
-    if (insn.sf === 1) b.i64_load(3, 0);
-    else b.i64_load32_u(2, 0);
-    emitSetReg(b, insn.rt, insn.sf);
-  }
-  function emitStrReg(b, insn) {
-    const guestMemBase2 = 65536;
-    emitGetRegSP(b, insn.rn, 1);
-    emitExtendReg(b, insn.rm, insn.extend, insn.shift);
-    b.i64_add();
-    b.i64_const(BigInt(guestMemBase2));
-    b.i64_add();
-    b.i32_wrap_i64();
-    emitGetReg(b, insn.rt, insn.sf);
-    if (insn.sf === 1) b.i64_store(3, 0);
-    else b.i64_store32(2, 0);
-  }
-  function emitLdp(b, insn) {
-    const guestMemBase2 = 65536;
-    const regSize = insn.sf === 1 ? 8 : 4;
-    const TMP_BASE = REG_COUNT;
-    const rnLocal = insn.rn === 31 ? SP_LOCAL : regLocal(insn.rn);
-    const hasAlias = insn.rt !== 31 && regLocal(insn.rt) === rnLocal || insn.rt2 !== 31 && regLocal(insn.rt2) === rnLocal;
-    if (insn.mode === "pre") {
-      emitGetRegSP(b, insn.rn, 1);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-    if (hasAlias) {
-      emitGetRegSP(b, insn.rn, 1);
-      b.local_set(TMP_BASE);
-    }
-    function emitEffAddr(extraOffset) {
-      if (hasAlias) {
-        b.local_get(TMP_BASE);
-      } else {
-        emitGetRegSP(b, insn.rn, 1);
-      }
-      if (insn.mode === "post") {
-        b.i64_const(BigInt(guestMemBase2 + extraOffset));
-      } else if (insn.mode === "pre") {
-        b.i64_const(BigInt(guestMemBase2 + extraOffset));
-      } else {
-        b.i64_const(BigInt(insn.offset + guestMemBase2 + extraOffset));
-      }
-      b.i64_add();
-      b.i32_wrap_i64();
-    }
-    emitEffAddr(0);
-    if (insn.sf === 1) b.i64_load(3, 0);
-    else b.i64_load32_u(2, 0);
-    emitSetReg(b, insn.rt, insn.sf);
-    emitEffAddr(regSize);
-    if (insn.sf === 1) b.i64_load(3, 0);
-    else b.i64_load32_u(2, 0);
-    emitSetReg(b, insn.rt2, insn.sf);
-    if (insn.mode === "post") {
-      if (hasAlias) {
-        b.local_get(TMP_BASE);
-      } else {
-        emitGetRegSP(b, insn.rn, 1);
-      }
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-  }
-  function emitStp(b, insn) {
-    const guestMemBase2 = 65536;
-    const regSize = insn.sf === 1 ? 8 : 4;
-    const TMP_BASE = REG_COUNT;
-    emitGetRegSP(b, insn.rn, 1);
-    if (insn.mode !== "post") {
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-    }
-    b.local_set(TMP_BASE);
-    b.local_get(TMP_BASE);
-    b.i64_const(BigInt(guestMemBase2));
-    b.i64_add();
-    b.i32_wrap_i64();
-    emitGetReg(b, insn.rt, insn.sf);
-    if (insn.sf === 1) b.i64_store(3, 0);
-    else b.i64_store32(2, 0);
-    b.local_get(TMP_BASE);
-    b.i64_const(BigInt(guestMemBase2 + regSize));
-    b.i64_add();
-    b.i32_wrap_i64();
-    emitGetReg(b, insn.rt2, insn.sf);
-    if (insn.sf === 1) b.i64_store(3, 0);
-    else b.i64_store32(2, 0);
-    if (insn.mode === "pre") {
-      b.local_get(TMP_BASE);
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    } else if (insn.mode === "post") {
-      b.local_get(TMP_BASE);
-      b.i64_const(BigInt(insn.offset));
-      b.i64_add();
-      if (insn.rn === 31) b.local_set(SP_LOCAL);
-      else b.local_set(regLocal(insn.rn));
-    }
-  }
-  function emitGuestAddr(b, guestAddr) {
-    b.i32_const(Number(guestAddr) + GUEST_MEM_BASE);
-  }
-  function emitAddGuestBase(b) {
-    b.i64_const(BigInt(GUEST_MEM_BASE));
-    b.i64_add();
-    b.i32_wrap_i64();
-  }
-  function emitSubwordRegLoad(b, insn, byteWidth, signExtend2) {
-    emitGetRegSP(b, insn.rn, 1);
-    emitExtendReg(b, insn.rm, insn.extend, insn.shift);
-    b.i64_add();
-    b.i64_const(BigInt(GUEST_MEM_BASE));
-    b.i64_add();
-    b.i32_wrap_i64();
-    switch (byteWidth) {
-      case 1:
-        signExtend2 ? b.i64_load8_s(0, 0) : b.i64_load8_u(0, 0);
-        break;
-      case 2:
-        signExtend2 ? b.i64_load16_s(1, 0) : b.i64_load16_u(1, 0);
-        break;
-      case 4:
-        b.i64_load32_s(2, 0);
-        break;
-    }
-    const sf = "sf" in insn ? insn.sf : 1;
-    emitSetReg(b, insn.rt, sf);
-  }
-  function emitSubwordRegStore(b, insn, byteWidth) {
-    emitGetRegSP(b, insn.rn, 1);
-    emitExtendReg(b, insn.rm, insn.extend, insn.shift);
-    b.i64_add();
-    b.i64_const(BigInt(GUEST_MEM_BASE));
-    b.i64_add();
-    b.i32_wrap_i64();
-    emitGetReg(b, insn.rt, 1);
-    switch (byteWidth) {
-      case 1:
-        b.i64_store8(0, 0);
-        break;
-      case 2:
-        b.i64_store16(1, 0);
-        break;
-    }
-  }
-  function emitRbit(b, insn, TMP0) {
-    const bits2 = insn.sf ? 64 : 32;
-    emitGetReg(b, insn.rn, insn.sf);
-    if (insn.sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.local_tee(TMP0);
-    b.i64_const(1n);
-    b.i64_shr_u();
-    b.i64_const(0x5555555555555555n);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x5555555555555555n);
-    b.i64_and();
-    b.i64_const(1n);
-    b.i64_shl();
-    b.i64_or();
-    b.local_tee(TMP0);
-    b.i64_const(2n);
-    b.i64_shr_u();
-    b.i64_const(0x3333333333333333n);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x3333333333333333n);
-    b.i64_and();
-    b.i64_const(2n);
-    b.i64_shl();
-    b.i64_or();
-    b.local_tee(TMP0);
-    b.i64_const(4n);
-    b.i64_shr_u();
-    b.i64_const(0x0F0F0F0F0F0F0F0Fn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x0F0F0F0F0F0F0F0Fn);
-    b.i64_and();
-    b.i64_const(4n);
-    b.i64_shl();
-    b.i64_or();
-    b.local_tee(TMP0);
-    b.i64_const(8n);
-    b.i64_shr_u();
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.i64_const(8n);
-    b.i64_shl();
-    b.i64_or();
-    b.local_tee(TMP0);
-    b.i64_const(16n);
-    b.i64_shr_u();
-    b.i64_const(0x0000FFFF0000FFFFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x0000FFFF0000FFFFn);
-    b.i64_and();
-    b.i64_const(16n);
-    b.i64_shl();
-    b.i64_or();
-    if (bits2 === 64) {
-      b.local_tee(TMP0);
-      b.i64_const(32n);
-      b.i64_shr_u();
-      b.local_get(TMP0);
-      b.i64_const(32n);
-      b.i64_shl();
-      b.i64_or();
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitRev(b, insn, TMP0, TMP1) {
-    emitGetReg(b, insn.rn, insn.sf);
-    if (insn.sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.local_tee(TMP0);
-    b.i64_const(8n);
-    b.i64_shr_u();
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.i64_const(8n);
-    b.i64_shl();
-    b.i64_or();
-    b.local_tee(TMP0);
-    b.i64_const(16n);
-    b.i64_shr_u();
-    b.i64_const(0x0000FFFF0000FFFFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x0000FFFF0000FFFFn);
-    b.i64_and();
-    b.i64_const(16n);
-    b.i64_shl();
-    b.i64_or();
-    if (insn.sf === 1) {
-      b.local_tee(TMP0);
-      b.i64_const(32n);
-      b.i64_shr_u();
-      b.local_get(TMP0);
-      b.i64_const(32n);
-      b.i64_shl();
-      b.i64_or();
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitRev16(b, insn, TMP0, _TMP1) {
-    emitGetReg(b, insn.rn, insn.sf);
-    b.local_tee(TMP0);
-    b.i64_const(8n);
-    b.i64_shr_u();
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.i64_const(8n);
-    b.i64_shl();
-    b.i64_or();
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitRev32(b, insn, TMP0, _TMP1) {
-    emitGetReg(b, insn.rn, 1);
-    b.local_tee(TMP0);
-    b.i64_const(8n);
-    b.i64_shr_u();
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x00FF00FF00FF00FFn);
-    b.i64_and();
-    b.i64_const(8n);
-    b.i64_shl();
-    b.i64_or();
-    b.local_tee(TMP0);
-    b.i64_const(16n);
-    b.i64_shr_u();
-    b.i64_const(0x0000FFFF0000FFFFn);
-    b.i64_and();
-    b.local_get(TMP0);
-    b.i64_const(0x0000FFFF0000FFFFn);
-    b.i64_and();
-    b.i64_const(16n);
-    b.i64_shl();
-    b.i64_or();
-    emitSetReg(b, insn.rd, 1);
-  }
-  function emitExtr(b, insn) {
-    if (insn.imms === 0) {
-      emitGetReg(b, insn.rm, insn.sf);
-    } else if (insn.rn === insn.rm) {
-      emitGetReg(b, insn.rn, insn.sf);
-      b.i64_const(BigInt(insn.imms));
-      b.i64_rotr();
-    } else {
-      const regSize = insn.sf ? 64 : 32;
-      emitGetReg(b, insn.rn, insn.sf);
-      b.i64_const(BigInt(regSize - insn.imms));
-      b.i64_shl();
-      emitGetReg(b, insn.rm, insn.sf);
-      b.i64_const(BigInt(insn.imms));
-      b.i64_shr_u();
-      b.i64_or();
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitCcmpCcmn(b, insn, isAdd, TMP0, TMP1, TMP2) {
-    emitConditionTest(b, insn.cond, NZCV_LOCAL);
-    b.if_(BLOCKTYPE_VOID);
-    emitGetReg(b, insn.rn, insn.sf);
-    b.local_set(TMP0);
-    if (insn.isImm) {
-      b.i64_const(BigInt(insn.rm_imm));
-    } else {
-      emitGetReg(b, insn.rm_imm, insn.sf);
-    }
-    b.local_set(TMP1);
-    b.local_get(TMP0);
-    b.local_get(TMP1);
-    if (isAdd) {
-      b.i64_add();
-    } else {
-      b.i64_sub();
-    }
-    b.local_set(TMP2);
-    emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
-    b.else_();
-    b.i64_const(BigInt(insn.nzcv));
-    b.local_set(NZCV_LOCAL);
-    b.end();
-  }
-  function emitMrs(b, insn) {
-    switch (insn.sysreg) {
-      case "tpidr_el0":
-        b.i32_const(TPIDR_OFFSET);
-        b.i64_load(3, 0);
-        break;
-      case "nzcv":
-        b.local_get(NZCV_LOCAL);
-        b.i64_const(28n);
-        b.i64_shl();
-        break;
-      case "fpcr":
-        b.i64_const(0n);
-        break;
-      case "cntfrq_el0":
-        b.i64_const(1000000n);
-        break;
-      case "cntvct_el0":
-        b.i64_const(0n);
-        break;
-      default:
-        b.i64_const(0n);
-        break;
-    }
-    emitSetReg(b, insn.rt, 1);
-  }
-  function emitMsr(b, insn) {
-    switch (insn.sysreg) {
-      case "tpidr_el0":
-        b.i32_const(TPIDR_OFFSET);
-        emitGetReg(b, insn.rt, 1);
-        b.i64_store(3, 0);
-        break;
-      case "nzcv":
-        emitGetReg(b, insn.rt, 1);
-        b.i64_const(28n);
-        b.i64_shr_u();
-        b.i64_const(0xFn);
-        b.i64_and();
-        b.local_set(NZCV_LOCAL);
-        break;
-      default:
-        break;
-    }
-  }
-  function emitAddSubExt(b, insn, isAdd, TMP0, TMP1, TMP2) {
-    emitGetRegSP(b, insn.rn, 1);
-    if (insn.setFlags) b.local_tee(TMP0);
-    emitGetReg(b, insn.rm, 1);
-    switch (insn.extend) {
-      case "uxtb":
-        b.i64_const(0xFFn);
-        b.i64_and();
-        break;
-      case "uxth":
-        b.i64_const(0xFFFFn);
-        b.i64_and();
-        break;
-      case "uxtw":
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-        break;
-      case "uxtx":
-        break;
-      // no-op for 64-bit
-      case "sxtb":
-        b.i64_const(56n);
-        b.i64_shl();
-        b.i64_const(56n);
-        b.i64_shr_s();
-        break;
-      case "sxth":
-        b.i64_const(48n);
-        b.i64_shl();
-        b.i64_const(48n);
-        b.i64_shr_s();
-        break;
-      case "sxtw":
-        b.i64_const(32n);
-        b.i64_shl();
-        b.i64_const(32n);
-        b.i64_shr_s();
-        break;
-      case "sxtx":
-        break;
-    }
-    if (insn.amount > 0) {
-      b.i64_const(BigInt(insn.amount));
-      b.i64_shl();
-    }
-    if (insn.setFlags) b.local_tee(TMP1);
-    if (isAdd) {
-      b.i64_add();
-    } else {
-      b.i64_sub();
-    }
-    if (insn.setFlags) {
-      b.local_tee(TMP2);
-      emitComputeFlags(b, isAdd, insn.sf, TMP0, TMP1, TMP2);
-    }
-    if (insn.sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    if (insn.rd === 31) {
-      if (insn.setFlags) {
-        b.drop();
-      } else {
-        b.local_set(SP_LOCAL);
-      }
-    } else {
-      b.local_set(regLocal(insn.rd));
-    }
-  }
-  function emitComputeFlags(b, isAdd, sf, TMP_OP1, TMP_OP2, TMP_RESULT) {
-    const signBit = sf ? 63 : 31;
-    b.local_get(TMP_RESULT);
-    b.i64_const(BigInt(signBit));
-    b.i64_shr_u();
-    b.i64_const(1n);
-    b.i64_and();
-    b.i64_const(3n);
-    b.i64_shl();
-    b.local_get(TMP_RESULT);
-    if (sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.i64_eqz();
-    b.i64_extend_i32_u();
-    b.i64_const(2n);
-    b.i64_shl();
-    b.i64_or();
-    if (isAdd) {
-      if (sf === 0) {
-        b.local_get(TMP_OP1);
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-        b.local_get(TMP_OP2);
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-        b.i64_add();
-        b.i64_const(32n);
-        b.i64_shr_u();
-        b.i64_const(1n);
-        b.i64_and();
-      } else {
-        b.local_get(TMP_RESULT);
-        b.local_get(TMP_OP1);
-        b.i64_lt_u();
-        b.i64_extend_i32_u();
-      }
-    } else {
-      if (sf === 0) {
-        b.local_get(TMP_OP1);
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-        b.local_get(TMP_OP2);
-        b.i64_const(0xFFFFFFFFn);
-        b.i64_and();
-        b.i64_ge_u();
-        b.i64_extend_i32_u();
-      } else {
-        b.local_get(TMP_OP1);
-        b.local_get(TMP_OP2);
-        b.i64_ge_u();
-        b.i64_extend_i32_u();
-      }
-    }
-    b.i64_const(1n);
-    b.i64_shl();
-    b.i64_or();
-    if (isAdd) {
-      b.local_get(TMP_OP1);
-      b.local_get(TMP_RESULT);
-      b.i64_xor();
-      b.local_get(TMP_OP2);
-      b.local_get(TMP_RESULT);
-      b.i64_xor();
-      b.i64_and();
-    } else {
-      b.local_get(TMP_OP1);
-      b.local_get(TMP_OP2);
-      b.i64_xor();
-      b.local_get(TMP_OP1);
-      b.local_get(TMP_RESULT);
-      b.i64_xor();
-      b.i64_and();
-    }
-    b.i64_const(BigInt(signBit));
-    b.i64_shr_u();
-    b.i64_const(1n);
-    b.i64_and();
-    b.i64_or();
-    b.local_set(NZCV_LOCAL);
-  }
-  function emitConditionTest(b, cond, nzcvLocal) {
-    switch (cond & 14) {
-      // bottom bit inverts
-      case 0:
-        b.local_get(nzcvLocal);
-        b.i64_const(4n);
-        b.i64_and();
-        b.i64_const(0n);
-        b.i64_ne();
-        break;
-      case 2:
-        b.local_get(nzcvLocal);
-        b.i64_const(2n);
-        b.i64_and();
-        b.i64_const(0n);
-        b.i64_ne();
-        break;
-      case 4:
-        b.local_get(nzcvLocal);
-        b.i64_const(8n);
-        b.i64_and();
-        b.i64_const(0n);
-        b.i64_ne();
-        break;
-      case 6:
-        b.local_get(nzcvLocal);
-        b.i64_const(1n);
-        b.i64_and();
-        b.i64_const(0n);
-        b.i64_ne();
-        break;
-      case 8:
-        b.local_get(nzcvLocal);
-        b.i64_const(2n);
-        b.i64_and();
-        b.i64_const(0n);
-        b.i64_ne();
-        b.local_get(nzcvLocal);
-        b.i64_const(4n);
-        b.i64_and();
-        b.i64_eqz();
-        b.i32_add();
-        b.i32_const(2);
-        b.i32_eq();
-        break;
-      case 10:
-        b.local_get(nzcvLocal);
-        b.i64_const(8n);
-        b.i64_and();
-        b.i64_const(3n);
-        b.i64_shr_u();
-        b.local_get(nzcvLocal);
-        b.i64_const(1n);
-        b.i64_and();
-        b.i64_eq();
-        break;
-      case 12:
-        b.local_get(nzcvLocal);
-        b.i64_const(4n);
-        b.i64_and();
-        b.i64_eqz();
-        b.local_get(nzcvLocal);
-        b.i64_const(8n);
-        b.i64_and();
-        b.i64_const(3n);
-        b.i64_shr_u();
-        b.local_get(nzcvLocal);
-        b.i64_const(1n);
-        b.i64_and();
-        b.i64_eq();
-        b.i32_add();
-        b.i32_const(2);
-        b.i32_eq();
-        break;
-      case 14:
-        b.i32_const(1);
-        break;
-    }
-    if (cond & 1) {
-      b.i32_eqz();
-    }
-  }
-  var BLOCK_ID_LOCAL = REG_COUNT + 6;
-  var guestMemBase = GUEST_MEM_BASE;
-  function emitSimdEffAddr(b, rn, offset, mode, TMP0) {
-    if (mode === "pre") {
-      emitGetRegSP(b, rn, 1);
-      b.i64_const(BigInt(offset));
-      b.i64_add();
-      b.local_tee(TMP0);
-      emitSetRegSP(b, rn, 1);
-      b.local_get(TMP0);
-    } else if (mode === "post") {
-      emitGetRegSP(b, rn, 1);
-      b.local_tee(TMP0);
-      b.local_get(TMP0);
-      b.i64_const(BigInt(offset));
-      b.i64_add();
-      emitSetRegSP(b, rn, 1);
-      b.local_get(TMP0);
-    } else {
-      emitGetRegSP(b, rn, 1);
-      if (offset !== 0) {
-        b.i64_const(BigInt(offset));
-        b.i64_add();
-      }
-    }
-    b.i64_const(BigInt(guestMemBase));
-    b.i64_add();
-  }
-  function emitSimdStore128(b, insn, TMP0) {
-    const vOff = vregOffset(insn.rt);
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(vOff);
-    b.i64_load(3, 0);
-    b.i64_store(3, 0);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(vOff + 8);
-    b.i64_load(3, 0);
-    b.i64_store(3, 8);
-  }
-  function emitSimdStoreSmall(b, insn, TMP0) {
-    const vOff = vregOffset(insn.rt);
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(vOff);
-    b.i64_load(3, 0);
-    switch (insn.size) {
-      case 1:
-        b.i64_store8(0, 0);
-        break;
-      case 2:
-        b.i64_store16(1, 0);
-        break;
-      case 4:
-        b.i64_store32(2, 0);
-        break;
-      case 8:
-        b.i64_store(3, 0);
-        break;
-    }
-  }
-  function emitSimdLoadSmall(b, insn, TMP0) {
-    const vOff = vregOffset(insn.rt);
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.i32_const(vOff);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    switch (insn.size) {
-      case 1:
-        b.i64_load8_u(0, 0);
-        break;
-      case 2:
-        b.i64_load16_u(1, 0);
-        break;
-      case 4:
-        b.i64_load32_u(2, 0);
-        break;
-      case 8:
-        b.i64_load(3, 0);
-        break;
-    }
-    b.i64_store(3, 0);
-    b.i32_const(vOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitSimdLoad128(b, insn, TMP0) {
-    const vOff = vregOffset(insn.rt);
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.i32_const(vOff);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i64_load(3, 0);
-    b.i64_store(3, 0);
-    b.i32_const(vOff + 8);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i64_load(3, 8);
-    b.i64_store(3, 0);
-  }
-  function emitSimdStorePair128(b, insn, TMP0) {
-    const v1Off = vregOffset(insn.rt);
-    const v2Off = vregOffset(insn.rt2);
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(v1Off);
-    b.i64_load(3, 0);
-    b.i64_store(3, 0);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(v1Off + 8);
-    b.i64_load(3, 0);
-    b.i64_store(3, 8);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(v2Off);
-    b.i64_load(3, 0);
-    b.i64_store(3, 16);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(v2Off + 8);
-    b.i64_load(3, 0);
-    b.i64_store(3, 24);
-  }
-  function emitSimdLoadPair128(b, insn, TMP0) {
-    const v1Off = vregOffset(insn.rt);
-    const v2Off = vregOffset(insn.rt2);
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.i32_const(v1Off);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i64_load(3, 0);
-    b.i64_store(3, 0);
-    b.i32_const(v1Off + 8);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i64_load(3, 8);
-    b.i64_store(3, 0);
-    b.i32_const(v2Off);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i64_load(3, 16);
-    b.i64_store(3, 0);
-    b.i32_const(v2Off + 8);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i64_load(3, 24);
-    b.i64_store(3, 0);
-  }
-  function emitSimdStorePairSmall(b, insn, TMP0) {
-    const v1Off = vregOffset(insn.rt);
-    const v2Off = vregOffset(insn.rt2);
-    const size = insn.size;
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(v1Off);
-    b.i64_load(3, 0);
-    if (size === 4) {
-      b.i64_store32(2, 0);
-    } else {
-      b.i64_store(3, 0);
-    }
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    b.i32_const(v2Off);
-    b.i64_load(3, 0);
-    if (size === 4) {
-      b.i64_store32(2, size);
-    } else {
-      b.i64_store(3, size);
-    }
-  }
-  function emitSimdLoadPairSmall(b, insn, TMP0) {
-    const v1Off = vregOffset(insn.rt);
-    const v2Off = vregOffset(insn.rt2);
-    const size = insn.size;
-    emitSimdEffAddr(b, insn.rn, insn.offset, insn.mode, TMP0);
-    b.local_set(TMP0);
-    b.i32_const(v1Off);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    if (size === 4) {
-      b.i64_load32_u(2, 0);
-    } else {
-      b.i64_load(3, 0);
-    }
-    b.i64_store(3, 0);
-    b.i32_const(v1Off + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-    b.i32_const(v2Off);
-    b.local_get(TMP0);
-    b.i32_wrap_i64();
-    if (size === 4) {
-      b.i64_load32_u(2, size);
-    } else {
-      b.i64_load(3, size);
-    }
-    b.i64_store(3, 0);
-    b.i32_const(v2Off + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitSimdDupGpr(b, insn) {
-    const vOff = vregOffset(insn.rd);
-    const esize = insn.esize;
-    const TMP0 = REG_COUNT;
-    emitGetReg(b, insn.rn, esize >= 8 ? 1 : 0);
-    if (esize === 1) {
-      b.i64_const(0xFFn);
-      b.i64_and();
-      b.i64_const(0x0101010101010101n);
-      b.i64_mul();
-    } else if (esize === 2) {
-      b.i64_const(0xFFFFn);
-      b.i64_and();
-      b.i64_const(0x0001000100010001n);
-      b.i64_mul();
-    } else if (esize === 4) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-      b.i64_const(0x0000000100000001n);
-      b.i64_mul();
-    }
-    b.local_set(TMP0);
-    b.i32_const(vOff);
-    b.local_get(TMP0);
-    b.i64_store(3, 0);
-    b.i32_const(vOff + 8);
-    if (insn.Q) {
-      b.local_get(TMP0);
-    } else {
-      b.i64_const(0n);
-    }
-    b.i64_store(3, 0);
-  }
-  function emitSimdDupElem(b, insn, TMP0) {
-    const srcOff = vregOffset(insn.rn);
-    const dstOff = vregOffset(insn.rd);
-    const esize = insn.esize;
-    const index = insn.index;
-    const bytePos = index * esize;
-    const qwordIdx = bytePos < 8 ? 0 : 1;
-    const bitPos = bytePos % 8 * 8;
-    const mask = esize === 8 ? 0xFFFFFFFFFFFFFFFFn : (1n << BigInt(esize * 8)) - 1n;
-    b.i32_const(srcOff + qwordIdx * 8);
-    b.i64_load(3, 0);
-    if (bitPos > 0) {
-      b.i64_const(BigInt(bitPos));
-      b.i64_shr_u();
-    }
-    b.i64_const(mask);
-    b.i64_and();
-    if (esize === 1) {
-      b.i64_const(0x0101010101010101n);
-      b.i64_mul();
-    } else if (esize === 2) {
-      b.i64_const(0x0001000100010001n);
-      b.i64_mul();
-    } else if (esize === 4) {
-      b.i64_const(0x0000000100000001n);
-      b.i64_mul();
-    }
-    b.local_set(TMP0);
-    b.i32_const(dstOff);
-    b.local_get(TMP0);
-    b.i64_store(3, 0);
-    if (insn.Q) {
-      b.i32_const(dstOff + 8);
-      b.local_get(TMP0);
-      b.i64_store(3, 0);
-    } else {
-      b.i32_const(dstOff + 8);
-      b.i64_const(0n);
-      b.i64_store(3, 0);
-    }
-  }
-  function emitSimdUmov(b, insn) {
-    const srcOff = vregOffset(insn.rn);
-    const esize = insn.esize;
-    const index = insn.index;
-    const bytePos = index * esize;
-    const qwordIdx = bytePos < 8 ? 0 : 1;
-    const bitPos = bytePos % 8 * 8;
-    b.i32_const(srcOff + qwordIdx * 8);
-    b.i64_load(3, 0);
-    if (bitPos > 0) {
-      b.i64_const(BigInt(bitPos));
-      b.i64_shr_u();
-    }
-    if (esize < 8) {
-      const mask = (1n << BigInt(esize * 8)) - 1n;
-      b.i64_const(mask);
-      b.i64_and();
-    }
-    emitSetReg(b, insn.rd, esize === 8 ? 1 : 0);
-  }
-  function emitSimdMovi(b, insn) {
-    const vOff = vregOffset(insn.rd);
-    const pattern = expandSimdImm(insn.imm8, insn.cmode, insn.op);
-    b.i32_const(vOff);
-    b.i64_const(pattern);
-    b.i64_store(3, 0);
-    if (insn.Q) {
-      b.i32_const(vOff + 8);
-      b.i64_const(pattern);
-      b.i64_store(3, 0);
-    } else {
-      b.i32_const(vOff + 8);
-      b.i64_const(0n);
-      b.i64_store(3, 0);
-    }
-  }
-  function expandSimdImm(imm8, cmode, op) {
-    const cmodeH = cmode >> 1;
-    if (op === 0) {
-      switch (cmodeH) {
-        case 0: {
-          const val = BigInt(imm8);
-          return val | val << 32n;
-        }
-        case 1: {
-          const val = BigInt(imm8) << 8n;
-          return val | val << 32n;
-        }
-        case 2: {
-          const val = BigInt(imm8) << 16n;
-          return val | val << 32n;
-        }
-        case 3: {
-          const val = BigInt(imm8) << 24n;
-          return val | val << 32n;
-        }
-        case 4: {
-          const val = BigInt(imm8);
-          return val | val << 16n | val << 32n | val << 48n;
-        }
-        case 5: {
-          const val = BigInt(imm8) << 8n;
-          return val | val << 16n | val << 32n | val << 48n;
-        }
-        case 7: {
-          let val = BigInt(imm8);
-          val |= val << 8n;
-          val |= val << 16n;
-          val |= val << 32n;
-          return val;
-        }
-        default: {
-          let val = BigInt(imm8);
-          val |= val << 8n;
-          val |= val << 16n;
-          val |= val << 32n;
-          return val;
-        }
-      }
-    } else {
-      if (cmodeH <= 3) {
-        const base = expandSimdImm(imm8, cmode, 0);
-        return ~base & 0xFFFFFFFFFFFFFFFFn;
-      }
-      return 0n;
-    }
-  }
-  function emitSimdInsGpr(b, insn) {
-    const vOff = vregOffset(insn.rd);
-    const esize = insn.esize;
-    const index = insn.index;
-    const bytePos = index * esize;
-    const qwordIdx = bytePos < 8 ? 0 : 1;
-    const bitPos = bytePos % 8 * 8;
-    const mask = esize === 8 ? 0xFFFFFFFFFFFFFFFFn : (1n << BigInt(esize * 8)) - 1n;
-    if (esize === 8) {
-      b.i32_const(vOff + qwordIdx * 8);
-      emitGetReg(b, insn.rn, 1);
-      b.i64_store(3, 0);
-    } else {
-      const addr = vOff + qwordIdx * 8;
-      b.i32_const(addr);
-      b.i32_const(addr);
-      b.i64_load(3, 0);
-      b.i64_const(~(mask << BigInt(bitPos)) & 0xFFFFFFFFFFFFFFFFn);
-      b.i64_and();
-      emitGetReg(b, insn.rn, esize >= 4 ? 1 : 0);
-      b.i64_const(mask);
-      b.i64_and();
-      if (bitPos > 0) {
-        b.i64_const(BigInt(bitPos));
-        b.i64_shl();
-      }
-      b.i64_or();
-      b.i64_store(3, 0);
-    }
-  }
-  function emitFmovToFp(b, insn) {
-    const vOff = vregOffset(insn.vd);
-    b.i32_const(vOff);
-    emitGetReg(b, insn.rn, insn.sf);
-    if (insn.sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.i64_store(3, 0);
-    b.i32_const(vOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitFmovFromFp(b, insn) {
-    const vOff = vregOffset(insn.vn);
-    b.i32_const(vOff);
-    b.i64_load(3, 0);
-    if (insn.sf === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    emitSetReg(b, insn.rd, insn.sf);
-  }
-  function emitFmovFp(b, insn) {
-    const srcOff = vregOffset(insn.vn);
-    const dstOff = vregOffset(insn.vd);
-    b.i32_const(dstOff);
-    b.i32_const(srcOff);
-    b.i64_load(3, 0);
-    if (insn.ftype === 0) {
-      b.i64_const(0xFFFFFFFFn);
-      b.i64_and();
-    }
-    b.i64_store(3, 0);
-    b.i32_const(dstOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitFpIntConv(b, insn, TMP0, helpers) {
-    if (!helpers) return;
-    if (insn.kind === "scvtf_int" || insn.kind === "ucvtf_int") {
-      emitGetReg(b, insn.rn, insn.sf);
-      if (insn.kind === "scvtf_int") {
-        b.call(insn.sf ? helpers.f64_from_s64Idx : helpers.f64_from_s32Idx);
-      } else {
-        b.call(insn.sf ? helpers.f64_from_u64Idx : helpers.f64_from_u32Idx);
-      }
-      b.local_set(TMP0);
-      const vOff = vregOffset(insn.vd);
-      b.i32_const(vOff);
-      if (insn.ftype === 0) {
-        b.local_get(TMP0);
-        b.call(helpers.f64_to_f32Idx);
-      } else {
-        b.local_get(TMP0);
-      }
-      b.i64_store(3, 0);
-      b.i32_const(vOff + 8);
-      b.i64_const(0n);
-      b.i64_store(3, 0);
-    } else {
-      const vOff = vregOffset(insn.vn);
-      b.i32_const(vOff);
-      b.i64_load(3, 0);
-      if (insn.ftype === 0) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      if (insn.kind === "fcvtzs_int") {
-        b.call(insn.sf ? helpers.f64_to_s64Idx : helpers.f64_to_s32Idx);
-      } else {
-        b.call(insn.sf ? helpers.f64_to_u64Idx : helpers.f64_to_u32Idx);
-      }
-      emitSetReg(b, insn.rd, insn.sf);
-    }
-  }
-  function emitFpArith2(b, insn, TMP0, helpers) {
-    if (!helpers) return;
-    const vnOff = vregOffset(insn.vn);
-    const vmOff = vregOffset(insn.vm);
-    const vdOff = vregOffset(insn.vd);
-    b.i32_const(vnOff);
-    b.i64_load(3, 0);
-    if (insn.ftype === 0) {
-      b.call(helpers.f32_to_f64Idx);
-    }
-    b.i32_const(vmOff);
-    b.i64_load(3, 0);
-    if (insn.ftype === 0) {
-      b.call(helpers.f32_to_f64Idx);
-    }
-    switch (insn.kind) {
-      case "fmul":
-        b.call(helpers.f64_mulIdx);
-        break;
-      case "fdiv":
-        b.call(helpers.f64_divIdx);
-        break;
-      case "fadd":
-        b.call(helpers.f64_addIdx);
-        break;
-      case "fsub":
-        b.call(helpers.f64_subIdx);
-        break;
-    }
-    b.local_set(TMP0);
-    b.i32_const(vdOff);
-    if (insn.ftype === 0) {
-      b.local_get(TMP0);
-      b.call(helpers.f64_to_f32Idx);
-    } else {
-      b.local_get(TMP0);
-    }
-    b.i64_store(3, 0);
-    b.i32_const(vdOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitFpMisc1(b, insn, TMP0, helpers) {
-    if (!helpers) return;
-    const vnOff = vregOffset(insn.vn);
-    const vdOff = vregOffset(insn.vd);
-    b.i32_const(vnOff);
-    b.i64_load(3, 0);
-    if (insn.ftype === 0) {
-      b.call(helpers.f32_to_f64Idx);
-    }
-    switch (insn.kind) {
-      case "fabs":
-        b.call(helpers.f64_absIdx);
-        break;
-      case "fneg":
-        b.call(helpers.f64_negIdx);
-        break;
-    }
-    b.local_set(TMP0);
-    b.i32_const(vdOff);
-    if (insn.ftype === 0) {
-      b.local_get(TMP0);
-      b.call(helpers.f64_to_f32Idx);
-    } else {
-      b.local_get(TMP0);
-    }
-    b.i64_store(3, 0);
-    b.i32_const(vdOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitFcvt(b, insn, TMP0, helpers) {
-    if (!helpers) return;
-    const vnOff = vregOffset(insn.vn);
-    const vdOff = vregOffset(insn.vd);
-    b.i32_const(vnOff);
-    b.i64_load(3, 0);
-    if (insn.ftype === 0) {
-      b.call(helpers.f32_to_f64Idx);
-    }
-    b.local_set(TMP0);
-    b.i32_const(vdOff);
-    if (insn.destFtype === 0) {
-      b.local_get(TMP0);
-      b.call(helpers.f64_to_f32Idx);
-    } else {
-      b.local_get(TMP0);
-    }
-    b.i64_store(3, 0);
-    b.i32_const(vdOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitSimdThreeSameGeneric(b, insn, TMP0, helpers) {
-    if (!helpers) return;
-    let op = 0, size = 0, extra = 0;
-    switch (insn.kind) {
-      case "simd_add":
-        op = SIMD_ADD;
-        break;
-      case "simd_sub":
-        op = SIMD_SUB;
-        break;
-      case "simd_cmeq_reg":
-        op = SIMD_CMEQ;
-        break;
-      case "simd_cmgt_reg":
-        op = SIMD_CMGT;
-        break;
-      case "simd_cmhi_reg":
-        op = SIMD_CMHI;
-        break;
-      case "simd_cmge_reg":
-        op = SIMD_CMGE;
-        break;
-      case "simd_cmhs_reg":
-        op = SIMD_CMHS;
-        break;
-      case "simd_umaxp":
-        op = SIMD_UMAXP;
-        break;
-      case "simd_addp":
-        op = SIMD_ADDP;
-        break;
-      case "simd_tbl":
-        op = SIMD_TBL;
-        extra = insn.len ?? 0;
-        break;
-      case "simd_zip1":
-        op = SIMD_ZIP1;
-        break;
-      case "simd_zip2":
-        op = SIMD_ZIP2;
-        break;
-      case "simd_uzp1":
-        op = SIMD_UZP1;
-        break;
-      case "simd_uzp2":
-        op = SIMD_UZP2;
-        break;
-      case "simd_trn1":
-        op = SIMD_TRN1;
-        break;
-      case "simd_trn2":
-        op = SIMD_TRN2;
-        break;
-      default:
-        return;
-    }
-    size = insn.size ?? 0;
-    const packed = BigInt(op) << 56n | BigInt(insn.Q) << 48n | BigInt(size) << 40n | BigInt(extra) << 32n | BigInt(insn.rd) << 24n | BigInt(insn.rn) << 16n | BigInt(insn.rm) << 8n;
-    b.i64_const(packed);
-    b.i64_const(0n);
-    b.call(helpers.simd_opIdx);
-    b.drop();
-  }
-  function emitFmovImm(b, insn) {
-    const vdOff = vregOffset(insn.vd);
-    b.i32_const(vdOff);
-    b.i64_const(insn.bits);
-    b.i64_store(3, 0);
-    b.i32_const(vdOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitFpCmp(b, insn, helpers) {
-    if (!helpers) return;
-    const vnOff = vregOffset(insn.vn);
-    b.i32_const(vnOff);
-    b.i64_load(3, 0);
-    if (insn.ftype === 0) {
-      b.call(helpers.f32_to_f64Idx);
-    }
-    if (insn.withZero) {
-      b.i64_const(0n);
-    } else {
-      const vmOff = vregOffset(insn.vm);
-      b.i32_const(vmOff);
-      b.i64_load(3, 0);
-      if (insn.ftype === 0) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-    }
-    b.call(helpers.f64_cmpIdx);
-    b.local_set(NZCV_LOCAL);
-  }
-  function emitFpMulAdd(b, insn, TMP0, helpers) {
-    if (!helpers) return;
-    const vnOff = vregOffset(insn.vn);
-    const vmOff = vregOffset(insn.vm);
-    const vaOff = vregOffset(insn.va);
-    const vdOff = vregOffset(insn.vd);
-    const isF32 = insn.ftype === 0;
-    if (insn.kind === "fnmsub") {
-      b.i32_const(vnOff);
-      b.i64_load(3, 0);
-      if (isF32) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      b.i32_const(vmOff);
-      b.i64_load(3, 0);
-      if (isF32) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      b.call(helpers.f64_mulIdx);
-      b.i32_const(vaOff);
-      b.i64_load(3, 0);
-      if (isF32) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      b.call(helpers.f64_subIdx);
-    } else {
-      b.i32_const(vaOff);
-      b.i64_load(3, 0);
-      if (isF32) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      b.i32_const(vnOff);
-      b.i64_load(3, 0);
-      if (isF32) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      b.i32_const(vmOff);
-      b.i64_load(3, 0);
-      if (isF32) {
-        b.call(helpers.f32_to_f64Idx);
-      }
-      b.call(helpers.f64_mulIdx);
-      if (insn.kind === "fmadd" || insn.kind === "fnmadd") {
-        b.call(helpers.f64_addIdx);
-      } else {
-        b.call(helpers.f64_subIdx);
-      }
-      if (insn.kind === "fnmadd") {
-        b.call(helpers.f64_negIdx);
-      }
-    }
-    b.local_set(TMP0);
-    b.i32_const(vdOff);
-    if (isF32) {
-      b.local_get(TMP0);
-      b.call(helpers.f64_to_f32Idx);
-    } else {
-      b.local_get(TMP0);
-    }
-    b.i64_store(3, 0);
-    b.i32_const(vdOff + 8);
-    b.i64_const(0n);
-    b.i64_store(3, 0);
-  }
-  function emitSimdShiftLong(b, insn, TMP0) {
-    const srcOff = vregOffset(insn.rn);
-    const dstOff = vregOffset(insn.rd);
-    const esize = insn.esize;
-    const dstEsize = esize * 2;
-    const shift = insn.shift;
-    const signed = insn.kind === "simd_sshll";
-    const srcBits = esize * 8;
-    const dstBits = dstEsize * 8;
-    const numElems = insn.Q === 0 ? 8 / esize : 8 / esize;
-    const srcBase = insn.Q === 0 ? 0 : 8;
-    for (let i = numElems - 1; i >= 0; i--) {
-      const srcBytePos = srcBase + i * esize;
-      const dstBytePos = i * dstEsize;
-      const srcQword = srcBytePos < 8 ? 0 : 1;
-      const srcBitPos = srcBytePos % 8 * 8;
-      const dstQword = dstBytePos < 8 ? 0 : 1;
-      const dstBitPos = dstBytePos % 8 * 8;
-      b.i32_const(srcOff + srcQword * 8);
-      b.i64_load(3, 0);
-      if (srcBitPos > 0) {
-        b.i64_const(BigInt(srcBitPos));
-        b.i64_shr_u();
-      }
-      if (esize < 8) {
-        const mask = (1n << BigInt(srcBits)) - 1n;
-        b.i64_const(mask);
-        b.i64_and();
-      }
-      if (signed && esize < 8) {
-        const extShift = BigInt(64 - srcBits);
-        b.i64_const(extShift);
-        b.i64_shl();
-        b.i64_const(extShift);
-        b.i64_shr_s();
-      }
-      if (shift > 0) {
-        b.i64_const(BigInt(shift));
-        b.i64_shl();
-      }
-      if (dstEsize < 8) {
-        const dstMask = (1n << BigInt(dstBits)) - 1n;
-        b.i64_const(dstMask);
-        b.i64_and();
-      }
-      b.local_set(TMP0);
-      if (dstBitPos === 0 && dstEsize >= 8) {
-        b.i32_const(dstOff + dstQword * 8);
-        b.local_get(TMP0);
-        b.i64_store(3, 0);
-      } else {
-        const dstMask = (1n << BigInt(dstBits)) - 1n;
-        const addr = dstOff + dstQword * 8;
-        b.i32_const(addr);
-        b.i32_const(addr);
-        b.i64_load(3, 0);
-        b.i64_const(~(dstMask << BigInt(dstBitPos)) & 0xFFFFFFFFFFFFFFFFn);
-        b.i64_and();
-        b.local_get(TMP0);
-        if (dstBitPos > 0) {
-          b.i64_const(BigInt(dstBitPos));
-          b.i64_shl();
-        }
-        b.i64_or();
-        b.i64_store(3, 0);
-      }
-    }
+    return region;
   }
 
   // src/syscall.ts
+  function bytesToBase64(data) {
+    const chunk = 32768;
+    let s = "";
+    for (let i = 0; i < data.length; i += chunk) {
+      s += String.fromCharCode.apply(null, data.subarray(i, i + chunk));
+    }
+    return btoa(s);
+  }
   var ENOSYS = 38;
   var EBADF = 9;
   var EINVAL = 22;
   var ENOENT = 2;
   var EPERM = 1;
+  var EMFILE = 24;
   var ENOTDIR = 20;
   var ECHILD = 10;
   var ESPIPE = 29;
   var EAGAIN = 11;
+  var EFAULT = 14;
+  var EACCES = 13;
+  var ENOMEM = 12;
   var MAX_FDS = 1024;
+  var MAX_PROCESS_BYTES = 1610612736;
   var O_NONBLOCK = 2048;
   var SIG_DFL = 0n;
   var SIG_IGN = 1n;
+  var SIGALRM = 14;
   var SIGPIPE = 13;
   var SIGCHLD = 17;
   var SIGNAL_TRAMPOLINE = 4096;
@@ -5581,13 +1958,77 @@
   var F_DUPFD_CLOEXEC = 1030;
   var SyscallHandler = class {
     brk;
-    mmapBase = 0x2000000n;
-    // mmap region starts at 32MB
+    // the exclusive-monitor shadow lives at ZIG_SHADOW_BASE (32MB) and is tiny
+    // (1 byte per 512 guest bytes, so <=256KB for a 128MB guest). reserve [32MB,33MB)
+    // for it and start the mmap arena above, so mmap'd shared libraries (ld.so mmaps
+    // libc.so.6) don't collide with the shadow. mmap grows up toward the shadow_base
+    // ceiling of the top-of-memory shadow... here shadow is low, so cap mmap well above.
+    mmapBase = 0x2100000n;
+    // 33MB — just above the 1MB shadow reservation
+    // brk/mmap ceiling. a threaded process uses a lower ceiling (its shared memory places the per-thread
+    // register blocks + atomics shadow just above this, and the shared reservation is bounded so several
+    // threaded processes can coexist). single-threaded processes keep the full 1.5 GiB.
+    maxBytes = MAX_PROCESS_BYTES;
+    // MAP_SHARED regions (guest offsets). shared across fork: a child's writes to these
+    // must survive the parent-memory restore in the serialized fork model.
+    sharedRegions = [];
+    // guest ranges mapped PROT_NONE (inaccessible). a user pointer landing here faults with
+    // EFAULT, which is how LTP's tst_get_bad_addr() probes are built.
+    protNone = [];
     cwd = "/";
     tpidr = 0n;
     umask = 18;
     fdCloexec = /* @__PURE__ */ new Set();
     fdSig = /* @__PURE__ */ new Map();
+    // nanosecond clock. Date.now() is millisecond-resolution; performance.now() gives sub-ms
+    // where the host allows it (browsers/WKWebView clamp it to ~1ms for spectre mitigation,
+    // which is fine). posix only requires CLOCK_MONOTONIC to be non-decreasing, not strictly
+    // increasing, so we allow equal consecutive reads and clamp only to defend against the
+    // clock actually running backwards (performance.now() shouldn't, but Date.now() can under
+    // ntp/settimeofday). no artificial per-read increment: that would distort measured
+    // elapsed time under tight loops, which is the one thing a clock must get right.
+    clkHasPerf = typeof performance !== "undefined";
+    clkPerfBase = this.clkHasPerf ? performance.now() : Date.now();
+    clkRealBaseNs = BigInt(Date.now()) * 1000000n;
+    clkLastMonoNs = 0n;
+    monoNs() {
+      const elapsedMs = (this.clkHasPerf ? performance.now() : Date.now()) - this.clkPerfBase;
+      let ns = BigInt(Math.round(elapsedMs * 1e6));
+      if (ns < this.clkLastMonoNs) ns = this.clkLastMonoNs;
+      else this.clkLastMonoNs = ns;
+      return ns;
+    }
+    clockNs(clkId) {
+      const mono = this.monoNs();
+      if (clkId === 1 || clkId === 4 || clkId === 7 || clkId === 2 || clkId === 3) return mono;
+      return this.clkRealBaseNs + mono;
+    }
+    // ITIMER_REAL: monotonic ms deadline at which SIGALRM fires, 0 = disarmed. interval is
+    // the auto-rearm period (0 = one-shot). used by alarm()/setitimer() and by busybox
+    // timeout, which is how the ltp driver bounds each test. checked by the exec loops via
+    // checkTimers() so it fires even in a syscall-less spin.
+    itimerRealDeadlineMs = 0;
+    itimerRealIntervalMs = 0;
+    // RLIMIT_NOFILE soft limit: the highest fd number a process may allocate. set via
+    // prlimit64/setrlimit; enforced at fd-allocating syscalls (open/dup/...) -> EMFILE.
+    nofileLimit = 1024;
+    nowMs() {
+      return this.monoNs() / 1000000n;
+    }
+    /** raise SIGALRM if the real interval timer has expired; rearm or disarm. returns true if it fired. */
+    checkTimers() {
+      if (this.itimerRealDeadlineMs === 0) return false;
+      if (Number(this.nowMs()) < this.itimerRealDeadlineMs) return false;
+      this.raiseSignal(SIGALRM);
+      if (this.itimerRealIntervalMs > 0) this.itimerRealDeadlineMs += this.itimerRealIntervalMs;
+      else this.itimerRealDeadlineMs = 0;
+      return true;
+    }
+    /** ms until the real timer fires, or 0 if disarmed (for getitimer / wait timeouts). */
+    timerRemainingMs() {
+      if (this.itimerRealDeadlineMs === 0) return 0;
+      return Math.max(0, this.itimerRealDeadlineMs - Number(this.nowMs()));
+    }
     pendingSignals = [];
     // queue of signals to deliver
     epollSets;
@@ -5597,6 +2038,21 @@
     bridgeAvailable = false;
     currentPid = 1;
     currentPpid = 0;
+    /** thread-group id: 0 for a normal process (getpid == currentPid); for a thread it's the
+     * process pid so getpid()==tgid while gettid()==currentPid(==tid). */
+    tgid = 0;
+    /** mark this handler as belonging to a thread: gettid returns `tid`, getpid returns `tgid`. */
+    setThreadIds(tid, tgid) {
+      this.currentPid = tid;
+      this.tgid = tgid;
+    }
+    // process credentials. real/effective/saved uid+gid. start as root (0).
+    ruid = 0;
+    euid = 0;
+    suid = 0;
+    rgid = 0;
+    egid = 0;
+    sgid = 0;
     termCols = 80;
     termRows = 24;
     vfs;
@@ -5608,8 +2064,6 @@
     // unified fd table
     nativeRefs = /* @__PURE__ */ new Map();
     // nativeFd -> refcount
-    nextFd = 3;
-    // next available fd (0-2 are stdio)
     // Stat cache: populated from getdents, consumed by fs_stat. Avoids N+1 bridge calls for ls -l.
     // Path → {mode, size, nlink, mtime, expiresAt (ms since epoch)}
     statCache = /* @__PURE__ */ new Map();
@@ -5626,6 +2080,10 @@
       this.fdTable.set(0, { type: "stdio", fd: 0 });
       this.fdTable.set(1, { type: "stdio", fd: 1 });
       this.fdTable.set(2, { type: "stdio", fd: 2 });
+      if (this.vfs) {
+        this.vfs.fdAllocator = () => this.allocFd();
+        this.vfs.credsProvider = () => ({ ruid: this.ruid, euid: this.euid, rgid: this.rgid, egid: this.egid });
+      }
     }
     /**
      * Check if a guest path should be routed to the native Swift filesystem.
@@ -5655,6 +2113,26 @@
         return null;
       }
       return resolved;
+    }
+    // resolve a (possibly relative) path to a normalized absolute path against the current cwd.
+    // used for execve so the worker reads the binary from the right place (a bare "./prog" must
+    // become "/cwd/prog"), matching how the kernel resolves the exec pathname.
+    absolutizePath(path) {
+      let resolved = path;
+      if (!path.startsWith("/")) {
+        const cwd = this.vfs?.getcwd() ?? this.cwd;
+        resolved = cwd === "/" ? "/" + path : cwd + "/" + path;
+      }
+      const parts = [];
+      for (const p of resolved.split("/")) {
+        if (p === "" || p === ".") continue;
+        if (p === "..") {
+          parts.pop();
+          continue;
+        }
+        parts.push(p);
+      }
+      return "/" + parts.join("/");
     }
     setTermSize(cols, rows) {
       this.termCols = cols;
@@ -5700,6 +2178,11 @@
       view.setBigUint64(frameBase + 256, cpu2.getPC(), true);
       view.setBigUint64(frameBase + 264, cpu2.getNZCV(), true);
       view.setUint32(frameBase + 272, signum, true);
+      view.setBigUint64(frameBase + 280, this.signalMask ?? 0n, true);
+      const flags = handler?.flags ?? 0n;
+      let newMask = (this.signalMask ?? 0n) | (handler?.mask ?? 0n);
+      if ((flags & 0x40000000n) === 0n) newMask |= 1n << BigInt(signum - 1);
+      this.signalMask = newMask;
       cpu2.setSP(frameSP);
       cpu2.setPC(handlerAddr);
       cpu2.setReg(0, BigInt(signum));
@@ -5717,6 +2200,7 @@
       const savedSP = view.getBigUint64(frameBase + 248, true);
       const savedPC = view.getBigUint64(frameBase + 256, true);
       const savedNZCV = view.getBigUint64(frameBase + 264, true);
+      this.signalMask = view.getBigUint64(frameBase + 280, true);
       cpu2.setSP(savedSP);
       cpu2.setNZCV(savedNZCV);
       return savedPC;
@@ -5724,6 +2208,16 @@
     /** Queue a signal for delivery. */
     raiseSignal(signum) {
       this.pendingSignals.push(signum);
+    }
+    /** True if any queued signal has an SA_RESTART handler — the interrupted restartable syscall
+     *  (wait4, blocking read) should then be re-executed instead of returning EINTR. */
+    anyPendingRestart() {
+      if (!this.signalHandlers) return false;
+      for (const sig of this.pendingSignals) {
+        const h = this.signalHandlers.get(sig);
+        if (h && h.handler !== SIG_DFL && h.handler !== SIG_IGN && (h.flags & 0x10000000n) !== 0n) return true;
+      }
+      return false;
     }
     /** Check if a custom signal handler is installed (not SIG_DFL or SIG_IGN). */
     hasSignalHandler(signum) {
@@ -5777,7 +2271,32 @@
     /** Register an fd entry directly (used by Worker for kernel pipe fds). */
     registerFd(fd, entry) {
       this.fdTable.set(fd, entry);
-      if (fd >= this.nextFd) this.nextFd = fd + 1;
+    }
+    // the resolved path backing a native fd, used as the key for cross-process record locks. a
+    // non-native fd (pipe, vfs) returns null: those have no on-disk identity to lock against.
+    fdPath(fd) {
+      const e = this.fdTable.get(fd);
+      return e && e.type === "native" ? e.path : null;
+    }
+    // fd offset / file size for resolving SEEK_CUR / SEEK_END lock ranges. native fds keep their
+    // offset and size on the Swift side, so these are best-effort (0) until a bridge query is added;
+    // SEEK_SET locks (the common case) are unaffected.
+    fdOffset(_fd) {
+      return 0;
+    }
+    fdSize(_fd) {
+      return 0;
+    }
+    /** Set process identity (used when a fork continues as the child). */
+    setIdentity(pid, ppid) {
+      this.currentPid = pid;
+      this.currentPpid = ppid;
+    }
+    // the current process credentials, threaded into NativeFS path-op bridge calls so the native
+    // side can enforce emulated POSIX ownership/permissions against this process's identity.
+    // (supplementary groups aren't tracked yet — setgroups is a no-op — so groups is empty for now.)
+    getCreds() {
+      return { ruid: this.ruid, euid: this.euid, rgid: this.rgid, egid: this.egid, umask: this.umask, groups: [] };
     }
     /** Get state for process snapshot */
     getState() {
@@ -5788,7 +2307,12 @@
         fdFlags: new Map(this.fdFlags),
         fdTable: new Map(this.fdTable),
         nativeRefs: new Map(this.nativeRefs),
-        nextFd: this.nextFd,
+        currentPid: this.currentPid,
+        currentPpid: this.currentPpid,
+        creds: { ruid: this.ruid, euid: this.euid, suid: this.suid, rgid: this.rgid, egid: this.egid, sgid: this.sgid },
+        sharedRegions: this.sharedRegions.map((r) => ({ ...r })),
+        protNone: this.protNone.map((r) => ({ ...r })),
+        nofileLimit: this.nofileLimit,
         vfsFdSnapshot: this.vfs ? this.vfs.snapshotFds() : void 0
       };
     }
@@ -5796,32 +2320,79 @@
     restoreState(state) {
       this.brk = state.brk;
       this.mmapBase = state.mmapBase;
+      this.cwd = state.cwd;
       if (this.vfs) {
-        this.vfs.chdir(state.cwd);
+        this.vfs.setCwd(state.cwd);
         if (state.vfsFdSnapshot) this.vfs.restoreFds(state.vfsFdSnapshot);
-      } else {
-        this.cwd = state.cwd;
       }
       this.fdFlags = new Map(state.fdFlags);
       if (state.fdTable) this.fdTable = new Map(state.fdTable);
       if (state.nativeRefs) this.nativeRefs = new Map(state.nativeRefs);
-      if (state.nextFd !== void 0) this.nextFd = state.nextFd;
+      if (state.currentPid !== void 0) this.currentPid = state.currentPid;
+      if (state.currentPpid !== void 0) this.currentPpid = state.currentPpid;
+      if (state.creds) {
+        this.ruid = state.creds.ruid;
+        this.euid = state.creds.euid;
+        this.suid = state.creds.suid;
+        this.rgid = state.creds.rgid;
+        this.egid = state.creds.egid;
+        this.sgid = state.creds.sgid;
+      }
+      if (state.sharedRegions !== void 0) this.sharedRegions = state.sharedRegions.map((r) => ({ ...r }));
+      if (state.protNone !== void 0) this.protNone = state.protNone.map((r) => ({ ...r }));
+      if (state.nofileLimit !== void 0) this.nofileLimit = state.nofileLimit;
     }
-    /** Reset state for execve (new process image) */
-    resetForExec(brkStart) {
+    /**
+     * After fork, native fds in the inherited fdTable still reference the parent's
+     * swift filehandles. dup each one so the child owns independent fds — otherwise
+     * parent close() kills the child's view of the file.
+     */
+    dupNativeFdsAfterFork(dupFn) {
+      for (const [guestFd, entry] of this.fdTable) {
+        if (entry.type !== "native") continue;
+        const newFd = dupFn(entry.nativeFd);
+        if (newFd < 0) continue;
+        this.fdTable.set(guestFd, { type: "native", nativeFd: newFd, path: entry.path });
+      }
+    }
+    /**
+     * Close every native (Swift-backed) fd this process still holds. real kernels close a
+     * process's fds when it exits; jitter never did, so a Worker that runs many pooled tenants
+     * leaks Swift file handles until the device fd budget is exhausted and NativeFS starts failing
+     * opens. call this on process exit / before pool reuse. stdio and non-native fds are ignored.
+     */
+    closeNativeFds(closeFn) {
+      for (const [, entry] of this.fdTable) {
+        if (entry.type === "native") closeFn(entry.nativeFd);
+      }
+    }
+    resetForExec(brkStart, closeFn) {
       this.brk = brkStart;
-      this.mmapBase = 0x2000000n;
+      this.mmapBase = 0x2100000n;
       const preserved = /* @__PURE__ */ new Map();
       for (const [fd, entry] of this.fdTable) {
         if (fd <= 2) preserved.set(fd, entry);
+        else if (entry.type === "native" && closeFn) closeFn(entry.nativeFd);
       }
       this.fdTable = preserved;
-      this.nextFd = 3;
       if (this.vfs) this.vfs.closeAllExcept(0, 1, 2);
     }
     /** Allocate next available fd */
+    // lowest-numbered unused guest fd >= min, per posix. the guest fd namespace is
+    // shared: pipe/native/socket/tty fds live in fdTable, vfs-backed fds live in the
+    // vfs (where the guest fd is also the vfs internal fd). scan both so the two
+    // allocators never hand out the same number.
+    lowestFreeFd(min) {
+      let fd = min;
+      while (this.fdTable.has(fd) || (this.vfs?.hasFd(fd) ?? false)) fd++;
+      return fd;
+    }
     allocFd() {
-      return this.nextFd++;
+      return this.lowestFreeFd(3);
+    }
+    /** true if a new fd (>= min) can be allocated within RLIMIT_NOFILE. */
+    fdAvailable(min = 3) {
+      return this.lowestFreeFd(min) < this.nofileLimit;
     }
     /** Resolve fd: check fdTable for overrides (dup2'd pipes, etc.), else fall through to default */
     getFdEntry(fd) {
@@ -5829,6 +2400,19 @@
     }
     isNonBlocking(fd) {
       return ((this.fdFlags.get(fd) ?? 0) & O_NONBLOCK) !== 0;
+    }
+    /** public view of a fd's O_NONBLOCK flag (the worker needs it for kernel-pipe write blocking). */
+    isNonBlockingFd(fd) {
+      return this.isNonBlocking(fd);
+    }
+    // a user pointer faults if it is out of the guest-addressable region (badGuestPtr) or lands
+    // in a range that was mapped PROT_NONE.
+    ptrFaults(bytes, addr, len = 1) {
+      if (badGuestPtr(bytes, addr, len)) return true;
+      for (const r of this.protNone) {
+        if (addr < r.end && addr + len > r.start) return true;
+      }
+      return false;
     }
     /** Whether the fd has data available for read without blocking. */
     isFdReadable(fd) {
@@ -5959,7 +2543,7 @@
             envpPtrs.push(readGuestString(bytes, ptr));
             envpAddr += 8;
           }
-          return { status: "execve", path: pathname, argv: argvPtrs, envp: envpPtrs };
+          return { status: "execve", path: this.absolutizePath(pathname), argv: argvPtrs, envp: envpPtrs };
         }
         case 95: {
           const WNOHANG = 1;
@@ -6167,7 +2751,7 @@
             }
             if (writeEntry.type === "native") {
               const writeData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-              const b64 = btoa(String.fromCharCode(...writeData));
+              const b64 = bytesToBase64(writeData);
               this.statCache.delete(writeEntry.path);
               return {
                 status: "bridge",
@@ -6184,7 +2768,7 @@
             }
             if (writeEntry.type === "socket") {
               const sockWriteData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-              const sockB64 = btoa(String.fromCharCode(...sockWriteData));
+              const sockB64 = bytesToBase64(sockWriteData);
               return {
                 status: "bridge",
                 method: "net_write",
@@ -6247,7 +2831,7 @@
               combined.set(bytes.slice(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
               off += len;
             }
-            const b64 = btoa(String.fromCharCode(...combined));
+            const b64 = bytesToBase64(combined);
             return {
               status: "bridge",
               method: "net_write",
@@ -6271,7 +2855,7 @@
               combined.set(bytes.slice(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
               off += len;
             }
-            const b64 = btoa(String.fromCharCode(...combined));
+            const b64 = bytesToBase64(combined);
             return {
               status: "bridge",
               method: "fs_write",
@@ -6387,8 +2971,8 @@
           const pipefdAddr = Number(a0);
           const pipe = { data: [], writeClosed: false, readClosed: false };
           const readFd = this.allocFd();
-          const writeFd = this.allocFd();
           this.fdTable.set(readFd, { type: "pipe_read", pipe });
+          const writeFd = this.allocFd();
           this.fdTable.set(writeFd, { type: "pipe_write", pipe });
           view.setInt32(pipefdAddr + GUEST_MEM_BASE, readFd, true);
           view.setInt32(pipefdAddr + GUEST_MEM_BASE + 4, writeFd, true);
@@ -6398,15 +2982,21 @@
         case 23: {
           const oldfd = Number(a0);
           const oldEntry = this.fdTable.get(oldfd);
+          if (!oldEntry && !(this.vfs && this.vfs.hasFd(oldfd))) {
+            ret = -BigInt(EBADF);
+            break;
+          }
+          if (!this.fdAvailable()) {
+            ret = -BigInt(EMFILE);
+            break;
+          }
           if (oldEntry) {
             const newfd = this.allocFd();
             if (oldEntry.type === "vfs" && this.vfs) {
-              const vfsFd = this.vfs.dup(oldEntry.fd);
-              if (vfsFd < 0) {
-                ret = BigInt(vfsFd);
+              if (this.vfs.dupTo(oldEntry.fd, newfd) < 0) {
+                ret = -BigInt(EBADF);
                 break;
               }
-              this.fdTable.set(newfd, { type: "vfs", fd: vfsFd });
             } else if (oldEntry.type === "native") {
               this.fdTable.set(newfd, { ...oldEntry });
               this.nativeRefs.set(oldEntry.nativeFd, (this.nativeRefs.get(oldEntry.nativeFd) ?? 1) + 1);
@@ -6415,13 +3005,11 @@
             }
             ret = BigInt(newfd);
           } else if (this.vfs && this.vfs.hasFd(oldfd)) {
-            const vfsFd = this.vfs.dup(oldfd);
-            if (vfsFd < 0) {
-              ret = BigInt(vfsFd);
+            const newfd = this.allocFd();
+            if (this.vfs.dupTo(oldfd, newfd) < 0) {
+              ret = -BigInt(EBADF);
               break;
             }
-            const newfd = this.allocFd();
-            this.fdTable.set(newfd, { type: "vfs", fd: vfsFd });
             ret = BigInt(newfd);
           } else {
             ret = -BigInt(EBADF);
@@ -6456,16 +3044,16 @@
               else this.nativeRefs.set(existingEntry.nativeFd, refs);
             }
             this.fdTable.delete(newfd);
+          } else if (this.vfs && this.vfs.hasFd(newfd)) {
+            this.vfs.close(newfd);
           }
           const srcEntry = this.fdTable.get(oldfd);
           if (srcEntry) {
             if (srcEntry.type === "vfs" && this.vfs) {
-              const vfsFd = this.vfs.dup(srcEntry.fd);
-              if (vfsFd < 0) {
-                ret = BigInt(vfsFd);
+              if (this.vfs.dupTo(srcEntry.fd, newfd) < 0) {
+                ret = -BigInt(EBADF);
                 break;
               }
-              this.fdTable.set(newfd, { type: "vfs", fd: vfsFd });
             } else if (srcEntry.type === "native") {
               this.fdTable.set(newfd, { ...srcEntry });
               this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
@@ -6474,12 +3062,10 @@
             }
             ret = BigInt(newfd);
           } else if (this.vfs && this.vfs.hasFd(oldfd)) {
-            const vfsFd = this.vfs.dup(oldfd);
-            if (vfsFd < 0) {
-              ret = BigInt(vfsFd);
+            if (this.vfs.dupTo(oldfd, newfd) < 0) {
+              ret = -BigInt(EBADF);
               break;
             }
-            this.fdTable.set(newfd, { type: "vfs", fd: vfsFd });
             ret = BigInt(newfd);
           } else {
             ret = -BigInt(EBADF);
@@ -6510,7 +3096,6 @@
               apply: (resp) => {
                 if (resp.ret < 0) {
                   cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-                  this.nextFd--;
                 } else {
                   this.fdTable.set(guestFd, { type: "native", nativeFd: resp.ret, path: bp56 });
                   this.nativeRefs.set(resp.ret, 1);
@@ -6535,6 +3120,8 @@
         case 57: {
           const fd = Number(a0);
           const closeEntry = this.fdTable.get(fd);
+          this.fdFlags.delete(fd);
+          this.fdCloexec.delete(fd);
           if (closeEntry) {
             if (closeEntry.type === "pipe_write") closeEntry.pipe.writeClosed = true;
             if (closeEntry.type === "pipe_read") closeEntry.pipe.readClosed = true;
@@ -6571,8 +3158,6 @@
             }
             if (closeEntry.type === "epoll") this.epollSets?.delete(fd);
             this.fdTable.delete(fd);
-            this.fdFlags.delete(fd);
-            this.fdCloexec.delete(fd);
             ret = 0n;
           } else if (this.vfs && this.vfs.hasFd(fd)) {
             ret = BigInt(this.vfs.close(fd));
@@ -6646,6 +3231,10 @@
         case 80: {
           const fd = Number(a0);
           const statBuf = Number(a1);
+          if (this.ptrFaults(bytes, statBuf, 128)) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const fstatEntry = this.getFdEntry(fd);
           if (fstatEntry) {
             if (fstatEntry.type === "stdio" || fstatEntry.type === "tty" || fstatEntry.type === "pipe_read" || fstatEntry.type === "pipe_write" || fstatEntry.type === "inotify" || fstatEntry.type === "timerfd" || fstatEntry.type === "eventfd" || fstatEntry.type === "epoll") {
@@ -6680,11 +3269,15 @@
         case 79: {
           const path = readGuestString(bytes, Number(a1));
           const statBuf79 = Number(a2);
+          if (this.ptrFaults(bytes, statBuf79, 128)) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const bp79 = this.bridgePath(path);
           if (bp79 !== null) {
             const cached = this.statCache.get(bp79);
             if (cached && cached.expiresAt > Date.now()) {
-              writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime] });
+              writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime, cached.uid, cached.gid] });
               ret = 0n;
               break;
             }
@@ -6703,6 +3296,8 @@
                       size: resp._meta[1],
                       nlink: resp._meta[2],
                       mtime: resp._meta[3],
+                      uid: resp._meta[4] ?? 0,
+                      gid: resp._meta[5] ?? 0,
                       expiresAt: Date.now() + this.STAT_CACHE_TTL_MS
                     });
                   }
@@ -6752,6 +3347,8 @@
                       nlink: entry.type === 4 ? 2 : 1,
                       // DT_DIR=4
                       mtime: entry.mtime ?? 0,
+                      uid: entry.uid ?? 0,
+                      gid: entry.gid ?? 0,
                       expiresAt: cacheExpiry
                     });
                   }
@@ -6802,7 +3399,15 @@
           break;
         }
         case 35: {
+          if (this.ptrFaults(bytes, Number(a1))) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const path = readGuestString(bytes, Number(a1));
+          if (path === "") {
+            ret = -BigInt(ENOENT);
+            break;
+          }
           const bp35 = this.bridgePath(path);
           if (bp35 !== null) {
             this.statCache.delete(bp35);
@@ -6828,11 +3433,7 @@
           if (this.vfs) {
             const fmt = mode & 61440;
             if (fmt === 4096) {
-              ret = BigInt(this.vfs.open(path, 64 | 512, mode & 4095));
-              if (ret >= 0n) {
-                this.vfs.close(Number(ret));
-                ret = 0n;
-              }
+              ret = BigInt(this.vfs.mkfifo(path, mode & 4095));
             } else if (fmt === 32768 || fmt === 0) {
               ret = BigInt(this.vfs.open(path, 64, mode & 4095));
               if (ret >= 0n) {
@@ -6848,6 +3449,10 @@
           break;
         }
         case 38: {
+          if (this.ptrFaults(bytes, Number(a1)) || this.ptrFaults(bytes, Number(a3))) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const oldpath = readGuestString(bytes, Number(a1));
           const newpath = readGuestString(bytes, Number(a3));
           const bOld = this.bridgePath(oldpath);
@@ -6872,6 +3477,10 @@
           break;
         }
         case 36: {
+          if (this.ptrFaults(bytes, Number(a0)) || this.ptrFaults(bytes, Number(a2))) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const target = readGuestString(bytes, Number(a0));
           const linkpath = readGuestString(bytes, Number(a2));
           const bLink = this.bridgePath(linkpath);
@@ -6893,6 +3502,10 @@
           break;
         }
         case 37: {
+          if (this.ptrFaults(bytes, Number(a1)) || this.ptrFaults(bytes, Number(a3))) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const oldpath = readGuestString(bytes, Number(a1));
           const newpath = readGuestString(bytes, Number(a3));
           if (this.vfs) {
@@ -6922,6 +3535,10 @@
                 } else if (resp.data) {
                   const decoded = Uint8Array.from(atob(resp.data), (c) => c.charCodeAt(0));
                   const len = Math.min(decoded.length, bufsiz);
+                  if (badGuestPtr(bytes, buf, len)) {
+                    cpu2.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+                    return;
+                  }
                   bytes.set(decoded.subarray(0, len), buf + GUEST_MEM_BASE);
                   cpu2.setReg(0, BigInt(len));
                 } else {
@@ -6937,6 +3554,10 @@
             } else {
               const encoded = new TextEncoder().encode(target);
               const len = Math.min(encoded.length, bufsiz);
+              if (badGuestPtr(bytes, buf, len)) {
+                ret = -BigInt(14);
+                break;
+              }
               bytes.set(encoded.subarray(0, len), buf + GUEST_MEM_BASE);
               ret = BigInt(len);
             }
@@ -6946,15 +3567,19 @@
           break;
         }
         case 48: {
+          if (this.ptrFaults(bytes, Number(a1))) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const path = readGuestString(bytes, Number(a1));
           const bp48 = this.bridgePath(path);
           if (bp48 !== null) {
             return {
               status: "bridge",
-              method: "fs_stat",
-              args: { path: bp48 },
+              method: "fs_faccessat",
+              args: { path: bp48, mode: Number(a2) },
               apply: (resp) => {
-                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret < 0 ? resp.ret : 0)));
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
               }
             };
           }
@@ -6965,31 +3590,89 @@
           }
           break;
         }
-        // ── chmod/chown (stubs — we run as root, permissions are a no-op) ──
         case 52: {
           const fchmodFd = Number(a0);
           const fchmodMode = Number(a1);
-          if (this.vfs && this.vfs.hasFd(fchmodFd)) {
-            this.vfs.fchmod(fchmodFd, fchmodMode);
+          const fchmodEntry = this.getFdEntry(fchmodFd);
+          if (fchmodEntry?.type === "native") {
+            this.statCache.delete(fchmodEntry.path);
+            return {
+              status: "bridge",
+              method: "fs_chmod",
+              args: { path: fchmodEntry.path, mode: fchmodMode },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              }
+            };
           }
-          ret = 0n;
+          if (this.vfs && this.vfs.hasFd(fchmodFd)) ret = BigInt(this.vfs.fchmod(fchmodFd, fchmodMode));
+          else if (this.fdTable.has(fchmodFd)) ret = 0n;
+          else ret = -BigInt(EBADF);
           break;
         }
-        case 53:
-        // (unused on aarch64, but keep for safety)
+        case 53: {
+          const fchmodatPath = readGuestString(bytes, Number(a1));
+          const fchmodatMode = Number(a2);
+          const bpChmod = this.bridgePath(fchmodatPath);
+          if (bpChmod !== null) {
+            this.statCache.delete(bpChmod);
+            return {
+              status: "bridge",
+              method: "fs_chmod",
+              args: { path: bpChmod, mode: fchmodatMode },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              }
+            };
+          }
+          ret = this.vfs ? BigInt(this.vfs.chmodPath(fchmodatPath, fchmodatMode)) : -BigInt(ENOENT);
+          break;
+        }
         case 54: {
-          ret = 0n;
+          const fchownFlags = Number(a4);
+          const cOwner = Number(BigInt.asIntN(32, a2));
+          const cGroup = Number(BigInt.asIntN(32, a3));
+          if (fchownFlags & 4096) {
+            const fchownFd = Number(a0);
+            if (this.vfs && this.vfs.hasFd(fchownFd)) ret = BigInt(this.vfs.fchown(fchownFd, cOwner, cGroup));
+            else if (this.fdTable.has(fchownFd)) ret = 0n;
+            else ret = -BigInt(EBADF);
+            break;
+          }
+          const fchownatPath = readGuestString(bytes, Number(a1));
+          const bpChown = this.bridgePath(fchownatPath);
+          if (bpChown !== null) {
+            return {
+              status: "bridge",
+              method: "fs_chown",
+              args: { path: bpChown, uid: cOwner, gid: cGroup },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret ?? 0)));
+              }
+            };
+          }
+          ret = this.vfs ? BigInt(this.vfs.chownPath(fchownatPath, cOwner, cGroup)) : -BigInt(ENOENT);
           break;
         }
         case 55: {
-          const fchownFlags = Number(a4);
-          if (fchownFlags & 4096) {
-            const fchownFd = Number(a0);
-            if (this.vfs && this.vfs.hasFd(fchownFd)) {
-              this.vfs.fchown(fchownFd, Number(BigInt.asIntN(32, a2)), Number(BigInt.asIntN(32, a3)));
-            }
+          const fchownFd = Number(a0);
+          const owner = Number(BigInt.asIntN(32, a1));
+          const group = Number(BigInt.asIntN(32, a2));
+          const ent = this.getFdEntry(fchownFd);
+          if (ent?.type === "native") {
+            this.statCache.delete(ent.path);
+            return {
+              status: "bridge",
+              method: "fs_chown",
+              args: { path: ent.path, uid: owner, gid: group },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret ?? 0)));
+              }
+            };
           }
-          ret = 0n;
+          if (this.vfs && this.vfs.hasFd(fchownFd)) ret = BigInt(this.vfs.fchown(fchownFd, owner, group));
+          else if (this.fdTable.has(fchownFd)) ret = 0n;
+          else ret = -BigInt(EBADF);
           break;
         }
         // ── statfs/fstatfs — return a plausible tmpfs-like result ──
@@ -7063,6 +3746,10 @@
             ret = this.brk;
           } else if (addr >= this.brk) {
             const needed = Number(addr) + GUEST_MEM_BASE;
+            if (needed > this.maxBytes) {
+              ret = this.brk;
+              break;
+            }
             if (needed > memory2.buffer.byteLength) {
               const pagesNeeded = Math.ceil(needed / 65536);
               const currentPages = memory2.buffer.byteLength / 65536;
@@ -7086,6 +3773,19 @@
           const MAP_ANONYMOUS = 32;
           const MAP_FIXED = 16;
           const MAP_SHARED = 1;
+          const mapType = flags & 15;
+          if (length === 0 || mapType !== 1 && mapType !== 2 && mapType !== 3) {
+            ret = -BigInt(EINVAL);
+            break;
+          }
+          if (mmapFd >= 0 && !(flags & MAP_ANONYMOUS) && this.vfs && this.vfs.hasFd(mmapFd)) {
+            const am = this.vfs.fdAccessMode(mmapFd);
+            const PROT_WRITE = 2;
+            if (am === 1 || flags & MAP_SHARED && prot & PROT_WRITE && am === 0) {
+              ret = -BigInt(EACCES);
+              break;
+            }
+          }
           let addr;
           if (a0 !== 0n) {
             addr = a0;
@@ -7096,6 +3796,10 @@
             this.mmapBase += BigInt(aligned);
           }
           const needed = Number(addr) + aligned + GUEST_MEM_BASE;
+          if (needed > this.maxBytes) {
+            ret = -BigInt(ENOMEM);
+            break;
+          }
           if (needed > memory2.buffer.byteLength) {
             const pagesNeeded = Math.ceil(needed / 65536);
             const currentPages = memory2.buffer.byteLength / 65536;
@@ -7111,15 +3815,32 @@
               this.vfs.lseek(mmapFd, savedPos, 0);
             }
           }
+          if (flags & MAP_SHARED) this.sharedRegions.push({ addr: Number(addr), len: aligned });
+          const mmStart = Number(addr), mmEnd = mmStart + aligned;
+          this.protNone = this.protNone.filter((r) => r.end <= mmStart || r.start >= mmEnd);
+          if ((prot & 7) === 0) this.protNone.push({ start: mmStart, end: mmEnd });
           ret = addr;
           break;
         }
-        case 226:
+        case 226: {
+          const mpStart = Number(a0), mpEnd = mpStart + (Number(a1) + 4095 & ~4095);
+          this.protNone = this.protNone.filter((r) => r.end <= mpStart || r.start >= mpEnd);
+          if ((Number(a2) & 7) === 0) this.protNone.push({ start: mpStart, end: mpEnd });
           ret = 0n;
           break;
-        case 215:
+        }
+        case 215: {
+          const unmapLen = Number(a1);
+          const guestMax = BigInt(memory2.buffer.byteLength - GUEST_MEM_BASE);
+          if (unmapLen === 0 || (a0 & 0xFFFn) !== 0n || a0 >= guestMax || a0 + BigInt(unmapLen) > guestMax) {
+            ret = -BigInt(EINVAL);
+            break;
+          }
+          const umStart = Number(a0), umEnd = umStart + (unmapLen + 4095 & ~4095);
+          this.protNone = this.protNone.filter((r) => r.end <= umStart || r.start >= umEnd);
           ret = 0n;
           break;
+        }
         // ── Thread/process ──
         case 96: {
           ret = 1n;
@@ -7130,7 +3851,7 @@
           break;
         // gettid handled with getpid above
         case 172:
-          ret = BigInt(this.currentPid);
+          ret = BigInt(this.tgid || this.currentPid);
           break;
         case 173:
           ret = BigInt(this.currentPpid);
@@ -7139,13 +3860,16 @@
           ret = BigInt(this.currentPid);
           break;
         case 174:
-        // getuid
+          ret = BigInt(this.ruid);
+          break;
         case 175:
-        // geteuid
+          ret = BigInt(this.euid);
+          break;
         case 176:
-        // getgid
+          ret = BigInt(this.rgid);
+          break;
         case 177:
-          ret = 0n;
+          ret = BigInt(this.egid);
           break;
         // ── Signals ──
         case 134: {
@@ -7267,6 +3991,10 @@
         }
         // ── uname ──
         case 160: {
+          if (badGuestPtr(new Uint8Array(memory2.buffer), Number(a0), 6 * 65)) {
+            ret = -BigInt(14);
+            break;
+          }
           const buf = Number(a0) + GUEST_MEM_BASE;
           const fields = ["Linux", "jitter", "6.1.0", "#1", "aarch64", "(none)"];
           for (let i = 0; i < fields.length; i++) {
@@ -7279,21 +4007,21 @@
         // ── Time ──
         case 113: {
           const tp = Number(a1) + GUEST_MEM_BASE;
-          const now = Date.now();
-          const sec = BigInt(Math.floor(now / 1e3));
-          const nsec = BigInt(now % 1e3 * 1e6);
-          view.setBigUint64(tp, sec, true);
-          view.setBigUint64(tp + 8, nsec, true);
+          const ns = this.clockNs(Number(a0));
+          view.setBigUint64(tp, ns / 1000000000n, true);
+          view.setBigUint64(tp + 8, ns % 1000000000n, true);
           ret = 0n;
           break;
         }
         case 169: {
+          if (badGuestPtr(new Uint8Array(memory2.buffer), Number(a0), 16)) {
+            ret = -BigInt(14);
+            break;
+          }
           const tv = Number(a0) + GUEST_MEM_BASE;
-          const now = Date.now();
-          const sec = BigInt(Math.floor(now / 1e3));
-          const usec = BigInt(now % 1e3 * 1e3);
-          view.setBigUint64(tv, sec, true);
-          view.setBigUint64(tv + 8, usec, true);
+          const ns = this.clockNs(0);
+          view.setBigUint64(tv, ns / 1000000000n, true);
+          view.setBigUint64(tv + 8, ns % 1000000000n / 1000n, true);
           ret = 0n;
           break;
         }
@@ -7305,17 +4033,18 @@
             case F_DUPFD:
             case F_DUPFD_CLOEXEC: {
               const minfd = Number(a2);
-              let newfd = minfd;
-              while (this.fdTable.has(newfd)) newfd++;
+              if (!this.fdAvailable(minfd)) {
+                ret = -BigInt(EMFILE);
+                break;
+              }
+              const newfd = this.lowestFreeFd(minfd);
               const srcEntry = this.fdTable.get(fd);
               if (srcEntry) {
                 if (srcEntry.type === "vfs" && this.vfs) {
-                  const vfsFd = this.vfs.dup(srcEntry.fd);
-                  if (vfsFd < 0) {
-                    ret = BigInt(vfsFd);
+                  if (this.vfs.dupTo(srcEntry.fd, newfd) < 0) {
+                    ret = -BigInt(EBADF);
                     break;
                   }
-                  this.fdTable.set(newfd, { type: "vfs", fd: vfsFd });
                 } else if (srcEntry.type === "native") {
                   this.fdTable.set(newfd, { ...srcEntry });
                   this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
@@ -7323,17 +4052,16 @@
                   this.fdTable.set(newfd, { ...srcEntry });
                 }
               } else if (this.vfs && this.vfs.hasFd(fd)) {
-                const vfsFd = this.vfs.dup(fd);
-                if (vfsFd < 0) {
-                  ret = BigInt(vfsFd);
+                if (this.vfs.dupTo(fd, newfd) < 0) {
+                  ret = -BigInt(EBADF);
                   break;
                 }
-                this.fdTable.set(newfd, { type: "vfs", fd: vfsFd });
               } else {
                 ret = -BigInt(EBADF);
                 break;
               }
-              if (newfd >= this.nextFd) this.nextFd = newfd + 1;
+              if (cmd === F_DUPFD_CLOEXEC) this.fdCloexec.add(newfd);
+              else this.fdCloexec.delete(newfd);
               ret = BigInt(newfd);
               break;
             }
@@ -7482,22 +4210,81 @@
         case 131:
           ret = 0n;
           break;
-        case 143:
-        // setregid
-        case 144:
-        // setgid
-        case 145:
-        // setreuid
-        case 146:
-        // setuid
-        case 147:
-        // setresuid
-        case 149:
-        // setresgid
+        case 146: {
+          const uid = Number(BigInt.asIntN(32, a0));
+          if (this.euid === 0) {
+            this.ruid = this.euid = this.suid = uid;
+            ret = 0n;
+          } else if (uid === this.ruid || uid === this.suid) {
+            this.euid = uid;
+            ret = 0n;
+          } else ret = -BigInt(EPERM);
+          break;
+        }
+        case 144: {
+          const gid = Number(BigInt.asIntN(32, a0));
+          if (this.euid === 0) {
+            this.rgid = this.egid = this.sgid = gid;
+            ret = 0n;
+          } else if (gid === this.rgid || gid === this.sgid) {
+            this.egid = gid;
+            ret = 0n;
+          } else ret = -BigInt(EPERM);
+          break;
+        }
+        case 145: {
+          const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1));
+          const unchanged = 4294967295;
+          if (this.euid !== 0) {
+            if (r !== -1 && r >>> 0 !== unchanged && r !== this.ruid && r !== this.euid || e !== -1 && e >>> 0 !== unchanged && e !== this.ruid && e !== this.euid && e !== this.suid) {
+              ret = -BigInt(EPERM);
+              break;
+            }
+          }
+          if (r !== -1 && r >>> 0 !== unchanged) this.ruid = r;
+          if (e !== -1 && e >>> 0 !== unchanged) this.euid = e;
+          if (r !== -1 && r >>> 0 !== unchanged) this.suid = this.euid;
+          ret = 0n;
+          break;
+        }
+        case 147: {
+          const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1)), s = Number(BigInt.asIntN(32, a2));
+          const set = (v) => v !== -1 && v >>> 0 !== 4294967295;
+          if (this.euid !== 0) {
+            const allowed = (v) => v === this.ruid || v === this.euid || v === this.suid;
+            if (set(r) && !allowed(r) || set(e) && !allowed(e) || set(s) && !allowed(s)) {
+              ret = -BigInt(EPERM);
+              break;
+            }
+          }
+          if (set(r)) this.ruid = r;
+          if (set(e)) this.euid = e;
+          if (set(s)) this.suid = s;
+          ret = 0n;
+          break;
+        }
+        case 143: {
+          const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1));
+          if (r !== -1 && r >>> 0 !== 4294967295) this.rgid = r;
+          if (e !== -1 && e >>> 0 !== 4294967295) this.egid = e;
+          ret = 0n;
+          break;
+        }
+        case 149: {
+          const set = (v) => v !== -1 && v >>> 0 !== 4294967295;
+          const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1)), s = Number(BigInt.asIntN(32, a2));
+          if (set(r)) this.rgid = r;
+          if (set(e)) this.egid = e;
+          if (set(s)) this.sgid = s;
+          ret = 0n;
+          break;
+        }
         case 151:
-        // setfsuid
+          ret = BigInt(this.euid);
+          break;
         case 152:
-        // setfsgid
+          ret = BigInt(this.egid);
+          break;
         case 159:
           ret = 0n;
           break;
@@ -7522,7 +4309,6 @@
             apply: (resp) => {
               if (resp.ret < 0) {
                 cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-                this.nextFd--;
               } else {
                 this.fdTable.set(socketFd, { type: "socket", socketId: resp.ret, domain, sockType });
                 if (Number(a1) & 524288) this.fdCloexec.add(socketFd);
@@ -7576,7 +4362,6 @@
             apply: (resp) => {
               if (resp.ret < 0) {
                 cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-                this.nextFd--;
               } else {
                 this.fdTable.set(newFd, { type: "socket", socketId: resp.ret, domain: acceptEntry.domain, sockType: acceptEntry.sockType });
                 cpu2.setReg(0, BigInt(newFd));
@@ -7637,7 +4422,7 @@
           const sendBuf = Number(a1);
           const sendLen = Number(a2);
           const sendData = bytes.slice(sendBuf + GUEST_MEM_BASE, sendBuf + GUEST_MEM_BASE + sendLen);
-          const b64 = btoa(String.fromCharCode(...sendData));
+          const b64 = bytesToBase64(sendData);
           const destAddrPtr = Number(a4);
           const destAddrLen = Number(a5);
           if (destAddrPtr !== 0 && destAddrLen > 0) {
@@ -7743,15 +4528,16 @@
           break;
         }
         case 261: {
+          const resource = Number(a1);
+          const rlNewPtr = Number(a2);
           const rlOldPtr = Number(a3);
           const RLIM_INFINITY = 0xFFFFFFFFFFFFFFFFn;
           if (rlOldPtr !== 0) {
             const base = rlOldPtr + GUEST_MEM_BASE;
-            const resource = Number(a1);
             switch (resource) {
               case 7:
-                view.setBigUint64(base, 1024n, true);
-                view.setBigUint64(base + 8, 1024n, true);
+                view.setBigUint64(base, BigInt(this.nofileLimit), true);
+                view.setBigUint64(base + 8, 1048576n, true);
                 break;
               case 3:
                 view.setBigUint64(base, 8388608n, true);
@@ -7761,6 +4547,10 @@
                 view.setBigUint64(base, RLIM_INFINITY, true);
                 view.setBigUint64(base + 8, RLIM_INFINITY, true);
             }
+          }
+          if (rlNewPtr !== 0 && resource === 7) {
+            const cur = view.getBigUint64(rlNewPtr + GUEST_MEM_BASE, true);
+            this.nofileLimit = cur >= 1048576n ? 1048576 : Number(cur);
           }
           ret = 0n;
           break;
@@ -7798,6 +4588,10 @@
               ret = 0n;
               break;
             case 16:
+              if (badGuestPtr(new Uint8Array(memory2.buffer), Number(a1), 16)) {
+                ret = -BigInt(14);
+                break;
+              }
               const nameBuf = Number(a1) + GUEST_MEM_BASE;
               const name = new TextEncoder().encode("jitter\0");
               new Uint8Array(memory2.buffer).set(name, nameBuf);
@@ -7860,15 +4654,41 @@
         // ── Timer syscalls ──
         case 102: {
           const itvPtr = Number(a1) + GUEST_MEM_BASE;
-          for (let i = 0; i < 32; i += 8) view.setBigUint64(itvPtr + i, 0n, true);
+          const which = Number(a0);
+          const remMs = which === 0 ? this.timerRemainingMs() : 0;
+          const intMs = which === 0 ? this.itimerRealIntervalMs : 0;
+          view.setBigUint64(itvPtr, BigInt(Math.floor(intMs / 1e3)), true);
+          view.setBigUint64(itvPtr + 8, BigInt(intMs % 1e3 * 1e3), true);
+          view.setBigUint64(itvPtr + 16, BigInt(Math.floor(remMs / 1e3)), true);
+          view.setBigUint64(itvPtr + 24, BigInt(remMs % 1e3 * 1e3), true);
           ret = 0n;
           break;
         }
         case 103: {
+          const which = Number(a0);
           const oldPtr = Number(a2);
           if (oldPtr !== 0) {
             const base = oldPtr + GUEST_MEM_BASE;
-            for (let i = 0; i < 32; i += 8) view.setBigUint64(base + i, 0n, true);
+            const remMs = which === 0 ? this.timerRemainingMs() : 0;
+            const intMs = which === 0 ? this.itimerRealIntervalMs : 0;
+            view.setBigUint64(base, BigInt(Math.floor(intMs / 1e3)), true);
+            view.setBigUint64(base + 8, BigInt(intMs % 1e3 * 1e3), true);
+            view.setBigUint64(base + 16, BigInt(Math.floor(remMs / 1e3)), true);
+            view.setBigUint64(base + 24, BigInt(remMs % 1e3 * 1e3), true);
+          }
+          if (which === 0) {
+            const newPtr = Number(a1);
+            if (newPtr === 0) {
+              this.itimerRealDeadlineMs = 0;
+              this.itimerRealIntervalMs = 0;
+              ret = 0n;
+              break;
+            }
+            const nb = newPtr + GUEST_MEM_BASE;
+            const intMs = Number(view.getBigUint64(nb, true)) * 1e3 + Math.floor(Number(view.getBigUint64(nb + 8, true)) / 1e3);
+            const valMs = Number(view.getBigUint64(nb + 16, true)) * 1e3 + Math.floor(Number(view.getBigUint64(nb + 24, true)) / 1e3);
+            this.itimerRealIntervalMs = intMs;
+            this.itimerRealDeadlineMs = valMs > 0 ? Number(this.nowMs()) + valMs : 0;
           }
           ret = 0n;
           break;
@@ -8060,7 +4880,7 @@
             envpPtrs281.push(readGuestString(bytes, ptr));
             envpAddr281 += 8;
           }
-          return { status: "execve", path: pathname281, argv: argvPtrs281, envp: envpPtrs281 };
+          return { status: "execve", path: this.absolutizePath(pathname281), argv: argvPtrs281, envp: envpPtrs281 };
         }
         case 47: {
           ret = 0n;
@@ -8447,7 +5267,7 @@
             combined.set(bytes.subarray(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
             off += len;
           }
-          const smB64 = btoa(String.fromCharCode(...combined));
+          const smB64 = bytesToBase64(combined);
           const namePtr = Number(view.getBigUint64(mhdr, true));
           const nameLen = view.getUint32(mhdr + 8, true);
           if (namePtr !== 0 && nameLen > 0) {
@@ -9030,6 +5850,10 @@
           ret = -BigInt(ENOSYS);
           break;
         case 439: {
+          if (this.ptrFaults(bytes, Number(a1))) {
+            ret = -BigInt(EFAULT);
+            break;
+          }
           const fa2Path = readGuestString(bytes, Number(a1));
           if (this.vfs) {
             ret = BigInt(this.vfs.faccessat(Number(BigInt.asIntN(32, a0)), fa2Path, Number(a2), Number(a3)));
@@ -9148,6 +5972,11 @@
       return { status: "ok" };
     }
   };
+  function badGuestPtr(memory2, guestAddr, len = 1) {
+    if (!Number.isFinite(guestAddr) || guestAddr < 4096) return true;
+    const max = memory2.length - GUEST_MEM_BASE;
+    return guestAddr >= max || guestAddr + len > max;
+  }
   function readGuestString(memory2, guestAddr) {
     const base = guestAddr + GUEST_MEM_BASE;
     let end = base;
@@ -9172,8 +6001,12 @@
     const size = meta ? meta[1] : resp.size ?? 0;
     const nlink = meta ? meta[2] : resp.nlink ?? 1;
     const mtime = meta ? meta[3] : resp.mtime ?? 0;
+    const uid = meta ? meta[4] ?? 0 : resp.uid ?? 0;
+    const gid = meta ? meta[5] ?? 0 : resp.gid ?? 0;
     view.setUint32(base + 16, mode, true);
     view.setUint32(base + 20, nlink, true);
+    view.setUint32(base + 24, uid, true);
+    view.setUint32(base + 28, gid, true);
     view.setBigUint64(base + 48, BigInt(size), true);
     view.setBigUint64(base + 88, BigInt(mtime), true);
   }
@@ -9182,11 +6015,12 @@
   var EPERM2 = 1;
   var ENOENT2 = 2;
   var EBADF2 = 9;
+  var EACCES2 = 13;
   var EEXIST = 17;
   var ENOTDIR2 = 20;
   var EISDIR = 21;
   var EINVAL2 = 22;
-  var EMFILE = 24;
+  var EMFILE2 = 24;
   var ESPIPE2 = 29;
   var ENAMETOOLONG = 36;
   var ENOTEMPTY = 39;
@@ -9201,6 +6035,7 @@
   var O_DIRECTORY = 65536;
   var O_NOFOLLOW = 131072;
   var S_IFMT = 61440;
+  var S_IFIFO = 4096;
   var S_IFCHR = 8192;
   var S_IFDIR = 16384;
   var S_IFREG = 32768;
@@ -9212,20 +6047,46 @@
   var InMemoryVFS = class {
     root;
     openFds = /* @__PURE__ */ new Map();
-    nextFd = 3;
-    // 0=stdin, 1=stdout, 2=stderr
+    // when set (by the syscall handler), fd numbers are drawn from the shared guest
+    // namespace so vfs fds never collide with pipe/native/socket fds. left null for
+    // standalone use, where we fall back to our own lowest-free scan over openFds.
+    fdAllocator = null;
+    // credentials of the calling process, injected by the syscall handler for permission
+    // checks. null (standalone/tests) means "act as root" (all access granted).
+    credsProvider = null;
+    // path-resolution search-permission state. resolve() enforces +x (search) on each directory
+    // component; searchDenied records when a walk failed on a permission (EACCES) vs a missing
+    // entry (ENOENT). searchEff selects effective vs real creds for the walk (access() uses real
+    // by default, most syscalls use effective). set per-resolve.
+    searchDenied = false;
+    searchEff = true;
+    // errno for the most recent failed resolve() (ENOENT/ENOTDIR/EACCES/ELOOP/ENAMETOOLONG).
+    // callers that get a null inode use resolveErrno() to return the correct negative errno.
+    lastResolveErrno = ENOENT2;
     nextIno = 1;
     // inode counter
     cwd = "/";
     cwdInode;
-    constructor() {
+    constructor(opts = {}) {
       this.root = this.makeDir(null, 493);
       this.cwdInode = this.root;
-      this.populateDefaults();
+      this.populateVirtual();
+      if (!opts.bridgeHandlesRealFs) {
+        this.populateNativeFallback();
+      }
     }
     // ── Inode creation helpers ──────────────────────────────────────────────
     now() {
       return Math.floor(Date.now() / 1e3);
+    }
+    // stamp a freshly created inode with its creator's ownership. new files take the
+    // creating process's euid; the gid is inherited from a set-group-ID parent directory,
+    // otherwise the creator's egid. a new directory under a sgid parent is itself sgid.
+    applyCreatorOwnership(inode, parent) {
+      const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+      inode.uid = c.euid;
+      inode.gid = parent.mode & 1024 ? parent.gid : c.egid;
+      if (inode.type === "dir" && parent.mode & 1024) inode.mode |= 1024;
     }
     makeFile(mode, data = new Uint8Array(0)) {
       const t = this.now();
@@ -9245,31 +6106,32 @@
       const t = this.now();
       return { type: "symlink", ino: this.nextIno++, mode: S_IFLNK | 511, nlink: 1, uid: 0, gid: 0, atime: t, mtime: t, ctime: t, target };
     }
+    makeFifo(mode) {
+      const t = this.now();
+      return { type: "fifo", ino: this.nextIno++, mode: S_IFIFO | mode & 4095, nlink: 1, uid: 0, gid: 0, atime: t, mtime: t, ctime: t };
+    }
+    mkfifo(path, mode) {
+      const parent = this.resolveParent(path);
+      if (!parent) return this.resolveErrno();
+      const [dir, name] = parent;
+      if (dir.children.has(name)) return -EEXIST;
+      if (!this.canWrite(dir)) return -EACCES2;
+      const fifo = this.makeFifo(mode);
+      this.applyCreatorOwnership(fifo, dir);
+      dir.children.set(name, fifo);
+      dir.mtime = dir.ctime = this.now();
+      return 0;
+    }
     // ── Default filesystem population ───────────────────────────────────────
-    populateDefaults() {
+    populateVirtual() {
       this.mkdirp("/dev");
-      this.mkdirp("/etc");
       this.mkdirp("/proc/self/fd");
       this.mkdirp("/proc/sys/kernel");
       this.mkdirp("/proc/sys/fs");
-      this.mkdirp("/tmp");
-      this.mkdirp("/root");
-      this.mkdirp("/bin");
-      this.mkdirp("/home");
-      this.mkdirp("/var");
       this.addCharDev("/dev/null", 1, 438);
       this.addCharDev("/dev/zero", 2, 438);
       this.addCharDev("/dev/tty", 3, 438);
       this.addCharDev("/dev/urandom", 4, 292);
-      this.addFileContent(
-        "/etc/passwd",
-        "root:x:0:0:root:/root:/bin/sh\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
-      );
-      this.addFileContent("/etc/group", "root:x:0:\ndaemon:x:1:\nnobody:x:65534:\nnogroup:x:65534:\n");
-      this.addFileContent("/etc/hostname", "jitter\n");
-      this.addFileContent("/etc/shells", "/bin/sh\n");
-      this.addFileContent("/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\n");
-      this.addFileContent("/etc/nsswitch.conf", "hosts: files dns\n");
       this.addSymlinkNode("/proc/self/exe", "/bin/busybox");
       this.addFileContent(
         "/proc/meminfo",
@@ -9288,6 +6150,25 @@
       );
       this.addFileContent("/proc/mounts", "tmpfs / tmpfs rw,relatime 0 0\nproc /proc proc rw,relatime 0 0\n");
       this.addFileContent("/proc/filesystems", "nodev	tmpfs\n");
+    }
+    /// in-memory backing for real paths, used by tests and non-bridged hosts.
+    /// on ipad these paths live on disk via NativeFS instead
+    populateNativeFallback() {
+      this.mkdirp("/etc");
+      this.mkdirp("/tmp");
+      this.mkdirp("/root");
+      this.mkdirp("/bin");
+      this.mkdirp("/home");
+      this.mkdirp("/var");
+      this.addFileContent(
+        "/etc/passwd",
+        "root:x:0:0:root:/root:/bin/sh\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+      );
+      this.addFileContent("/etc/group", "root:x:0:\ndaemon:x:1:\nnobody:x:65534:\nnogroup:x:65534:\n");
+      this.addFileContent("/etc/hostname", "jitter\n");
+      this.addFileContent("/etc/shells", "/bin/sh\n");
+      this.addFileContent("/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\n");
+      this.addFileContent("/etc/nsswitch.conf", "hosts: files dns\n");
     }
     loadBinary(data) {
       this.setFileData("/bin/busybox", data, 493);
@@ -9395,6 +6276,18 @@
     addFileContent(path, content) {
       this.setFileData(path, new TextEncoder().encode(content), 420);
     }
+    // public: inject a file (creating parent directories) with raw bytes. used to seed
+    // the rootfs with binaries like /lib/ld-linux-aarch64.so.1 and /lib/libc.so.6.
+    writeFileBytes(path, data, mode = 493) {
+      const parts = path.split("/").filter((p) => p.length > 0);
+      parts.pop();
+      let dirPath = "";
+      for (const part of parts) {
+        dirPath += "/" + part;
+        this.mkdirp(dirPath);
+      }
+      this.setFileData(path, data, mode);
+    }
     setFileData(path, data, mode) {
       const parts = path.split("/").filter((p) => p.length > 0);
       const name = parts.pop();
@@ -9469,59 +6362,163 @@
      * Resolve a path to an inode, following symlinks per Linux rules.
      * Uses pre-split path components to avoid redundant string splitting.
      */
-    resolve(path, followFinal = true, depth = 0) {
-      if (depth > MAX_SYMLINK_DEPTH) return null;
+    resolve(path, followFinal = true, depth = 0, searchEff = true) {
+      if (depth === 0) {
+        this.searchDenied = false;
+        this.searchEff = searchEff;
+        this.lastResolveErrno = ENOENT2;
+      }
+      if (depth > MAX_SYMLINK_DEPTH) {
+        this.lastResolveErrno = ELOOP;
+        return null;
+      }
       const parts = this.normalizeParts(path);
+      for (const part of parts) {
+        if (part.length > NAME_MAX) {
+          this.lastResolveErrno = ENAMETOOLONG;
+          return null;
+        }
+      }
       return this.resolveFromParts(parts, followFinal, depth);
     }
+    // the errno (negative) for the most recent failed resolve().
+    resolveErrno() {
+      return -this.lastResolveErrno;
+    }
+    // execute (search) permission on a directory: needed to traverse into/through it. root can
+    // always search. non-root needs the x bit for owner/group/other as applicable.
+    canSearch(dir) {
+      const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+      const uid = this.searchEff ? c.euid : c.ruid;
+      const gid = this.searchEff ? c.egid : c.rgid;
+      if (uid === 0) return true;
+      let perms;
+      if (dir.uid === uid) perms = dir.mode >> 6 & 7;
+      else if (dir.gid === gid) perms = dir.mode >> 3 & 7;
+      else perms = dir.mode & 7;
+      return (perms & 1) !== 0;
+    }
+    // normalize a raw list of path segments (which may contain '', '.', '..') into clean
+    // components, resolving '..' against earlier entries. used when splicing a symlink target
+    // into a path mid-resolution, where cwd-prepending must not happen.
+    normalizePartsArray(segments) {
+      const out = [];
+      for (const p of segments) {
+        if (p === "" || p === ".") continue;
+        if (p === "..") out.pop();
+        else out.push(p);
+      }
+      return out;
+    }
+    // write (modify) permission on a directory: needed to create, remove, or rename entries in
+    // it. root bypasses; others need the +w bit for owner/group/other as applicable (effective).
+    canWrite(dir) {
+      const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+      if (c.euid === 0) return true;
+      let perms;
+      if (dir.uid === c.euid) perms = dir.mode >> 6 & 7;
+      else if (dir.gid === c.egid) perms = dir.mode >> 3 & 7;
+      else perms = dir.mode & 7;
+      return (perms & 2) !== 0;
+    }
     resolveFromParts(parts, followFinal, depth) {
+      if (depth > MAX_SYMLINK_DEPTH) {
+        this.lastResolveErrno = ELOOP;
+        return null;
+      }
       if (parts.length === 0) return this.root;
       let current = this.root;
       for (let i = 0; i < parts.length; i++) {
-        if (current.type !== "dir") return null;
+        if (current.type !== "dir") {
+          this.lastResolveErrno = ENOTDIR2;
+          return null;
+        }
+        if (!this.canSearch(current)) {
+          this.searchDenied = true;
+          this.lastResolveErrno = EACCES2;
+          return null;
+        }
         const child = current.children.get(parts[i]);
-        if (!child) return null;
+        if (!child) {
+          this.lastResolveErrno = ENOENT2;
+          return null;
+        }
         const isLast = i === parts.length - 1;
         if (child.type === "symlink" && (followFinal || !isLast)) {
           const target = child.target;
-          const remaining = parts.slice(i + 1);
-          const targetParts = this.normalizeParts(target);
-          if (remaining.length > 0) targetParts.push(...remaining);
-          return this.resolveFromParts(targetParts, followFinal, depth + 1);
+          const base = target.startsWith("/") ? [] : parts.slice(0, i);
+          const combined = [...base, ...target.split("/"), ...parts.slice(i + 1)];
+          return this.resolveFromParts(this.normalizePartsArray(combined), followFinal, depth + 1);
         }
         current = child;
       }
       return current;
     }
-    /** Resolve parent directory of path. Returns [parentDirInode, childName] or null. */
+    /** Resolve parent directory of path. Returns [parentDirInode, childName] or null; on null,
+     *  lastResolveErrno holds the reason (ENOENT/ENOTDIR/ENAMETOOLONG/EACCES/ELOOP). */
     resolveParent(path, depth = 0) {
-      if (depth > MAX_SYMLINK_DEPTH) return null;
+      if (depth === 0) this.lastResolveErrno = ENOENT2;
+      if (depth > MAX_SYMLINK_DEPTH) {
+        this.lastResolveErrno = ELOOP;
+        return null;
+      }
       const resolved = this.resolvePath(path);
       const parts = resolved.split("/").filter((p) => p.length > 0);
       if (parts.length === 0) return null;
       const name = parts.pop();
+      if (name.length > NAME_MAX) {
+        this.lastResolveErrno = ENAMETOOLONG;
+        return null;
+      }
       let dir = this.root;
-      for (const part of parts) {
+      for (let idx = 0; idx < parts.length; idx++) {
+        const part = parts[idx];
+        if (part.length > NAME_MAX) {
+          this.lastResolveErrno = ENAMETOOLONG;
+          return null;
+        }
+        if (!this.canSearch(dir)) {
+          this.searchDenied = true;
+          this.lastResolveErrno = EACCES2;
+          return null;
+        }
         const child = dir.children.get(part);
-        if (!child) return null;
+        if (!child) {
+          this.lastResolveErrno = ENOENT2;
+          return null;
+        }
         if (child.type === "symlink") {
           const target = child.target;
-          const remaining = parts.slice(parts.indexOf(part) + 1).join("/");
+          const remaining = parts.slice(idx + 1).join("/");
           const newPath = remaining ? target + "/" + remaining + "/" + name : target + "/" + name;
           return this.resolveParent(newPath, depth + 1);
         }
-        if (child.type !== "dir") return null;
+        if (child.type !== "dir") {
+          this.lastResolveErrno = ENOTDIR2;
+          return null;
+        }
         dir = child;
+      }
+      if (!this.canSearch(dir)) {
+        this.searchDenied = true;
+        this.lastResolveErrno = EACCES2;
+        return null;
       }
       return [dir, name];
     }
     // ── VFS interface implementation ────────────────────────────────────────
+    takeFd() {
+      if (this.fdAllocator) return this.fdAllocator();
+      let fd = 3;
+      while (this.openFds.has(fd)) fd++;
+      return fd;
+    }
     open(path, flags, mode) {
       if (path.length > PATH_MAX) return -ENAMETOOLONG;
       for (const part of path.split("/")) {
         if (part.length > NAME_MAX) return -ENAMETOOLONG;
       }
-      if (this.nextFd >= MAX_FDS2) return -EMFILE;
+      if (this.openFds.size >= MAX_FDS2) return -EMFILE2;
       const followSymlinks = !(flags & O_NOFOLLOW);
       let inode = this.resolve(path, followSymlinks);
       if (flags & O_NOFOLLOW && !inode) {
@@ -9533,25 +6530,32 @@
       }
       if (!inode && flags & O_CREAT) {
         const parent = this.resolveParent(path);
-        if (!parent) return -ENOENT2;
+        if (!parent) return this.resolveErrno();
         const [dir, name] = parent;
+        if (!this.canWrite(dir)) return -EACCES2;
         const newFile = this.makeFile(mode & 4095);
+        this.applyCreatorOwnership(newFile, dir);
         dir.children.set(name, newFile);
         dir.mtime = dir.ctime = this.now();
         inode = newFile;
       }
-      if (!inode) return -ENOENT2;
+      if (!inode) return this.resolveErrno();
       if (flags & O_DIRECTORY && inode.type !== "dir") return -ENOTDIR2;
       if (inode.type === "dir") {
         if ((flags & O_ACCMODE) !== O_RDONLY) return -EISDIR;
-        const fd2 = this.nextFd++;
+        const fd2 = this.takeFd();
         const entries = [".", "..", ...inode.children.keys()];
         this.openFds.set(fd2, { type: "dir", inode, entries, pos: 0, refcount: 1 });
         return fd2;
       }
       if (inode.type === "chardev") {
-        const fd2 = this.nextFd++;
+        const fd2 = this.takeFd();
         this.openFds.set(fd2, { type: "chardev", inode, refcount: 1 });
+        return fd2;
+      }
+      if (inode.type === "fifo") {
+        const fd2 = this.takeFd();
+        this.openFds.set(fd2, { type: "fifo", inode, accessMode: flags & O_ACCMODE, refcount: 1 });
         return fd2;
       }
       if (inode.type !== "file") return -ENOENT2;
@@ -9559,7 +6563,7 @@
         inode.data = new Uint8Array(0);
         inode.mtime = inode.ctime = this.now();
       }
-      const fd = this.nextFd++;
+      const fd = this.takeFd();
       const accessMode = flags & O_ACCMODE;
       const pos = flags & O_APPEND ? inode.data.length : 0;
       this.openFds.set(fd, { type: "file", inode, pos, flags, accessMode, refcount: 1 });
@@ -9575,11 +6579,27 @@
     hasFd(fd) {
       return this.openFds.has(fd);
     }
+    // the O_RDONLY/O_WRONLY/O_RDWR access mode a file descriptor was opened with, or -1 if
+    // the fd is unknown or has no access mode (e.g. a directory handle).
+    fdAccessMode(fd) {
+      const ofd = this.openFds.get(fd);
+      return ofd && typeof ofd.accessMode === "number" ? ofd.accessMode : -1;
+    }
     dup(fd) {
       const ofd = this.openFds.get(fd);
       if (!ofd) return -EBADF2;
-      if (this.nextFd >= MAX_FDS2) return -EMFILE;
-      const newFd = this.nextFd++;
+      if (this.openFds.size >= MAX_FDS2) return -EMFILE2;
+      const newFd = this.takeFd();
+      ofd.refcount++;
+      this.openFds.set(newFd, ofd);
+      return newFd;
+    }
+    // install a shared duplicate of oldFd at a caller-chosen newFd. the caller owns
+    // the fd namespace (dup2/dup3/F_DUPFD pick the target), so newFd must already be
+    // free. keeps the guest fd == vfs internal fd invariant for dup'd fds.
+    dupTo(oldFd, newFd) {
+      const ofd = this.openFds.get(oldFd);
+      if (!ofd) return -EBADF2;
       ofd.refcount++;
       this.openFds.set(newFd, ofd);
       return newFd;
@@ -9627,6 +6647,8 @@
       if (ofd.type !== "file") return -EBADF2;
       if (ofd.accessMode === O_RDONLY) return -EBADF2;
       if (count === 0) return 0;
+      const guestMax = memory2.buffer.byteLength - GUEST_MEM_BASE;
+      if (buf < 0 || buf >= guestMax || buf + count > guestMax) return -14;
       if (ofd.flags & O_APPEND) {
         ofd.pos = ofd.inode.data.length;
       }
@@ -9645,7 +6667,7 @@
     lseek(fd, offset, whence) {
       const ofd = this.openFds.get(fd);
       if (!ofd) return BigInt(-EBADF2);
-      if (ofd.type === "chardev") return BigInt(-ESPIPE2);
+      if (ofd.type === "chardev" || ofd.type === "fifo") return BigInt(-ESPIPE2);
       if (ofd.type !== "file") return BigInt(-EBADF2);
       let newPos;
       const off = Number(offset);
@@ -9669,12 +6691,44 @@
       ofd.pos = newPos;
       return BigInt(newPos);
     }
+    // only the file's owner (or root) may change its mode; otherwise EPERM.
+    chmodInode(inode, mode) {
+      const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+      if (c.euid !== 0 && c.euid !== inode.uid) return -EPERM2;
+      inode.mode = inode.mode & S_IFMT | mode & 4095;
+      inode.ctime = this.now();
+      return 0;
+    }
     fchmod(fd, mode) {
       const ofd = this.openFds.get(fd);
       if (!ofd) return -EBADF2;
       const inode = ofd.type === "file" ? ofd.inode : ofd.type === "dir" ? ofd.inode : null;
       if (!inode) return -EBADF2;
-      inode.mode = inode.mode & S_IFMT | mode & 4095;
+      return this.chmodInode(inode, mode);
+    }
+    // shared chown logic, matching the kernel's setattr_prepare. -1 (or 0xffffffff) means
+    // "don't change". without CAP_CHOWN (non-root euid): changing the owner requires that the
+    // caller already owns the file and the target uid equals the current one (i.e. no real
+    // change); changing the group requires ownership and that the target gid is one the caller
+    // belongs to (its egid/rgid) or the file's current gid. a successful chown of a non-directory
+    // drops the set-user-ID bit, and the set-group-ID bit for group-executable files.
+    chownInode(inode, uid, gid) {
+      const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+      const noChg = (v) => v === -1 || v === 4294967295;
+      const uidPresent = !noChg(uid);
+      const gidPresent = !noChg(gid);
+      const wantUid = uidPresent ? uid : inode.uid;
+      const wantGid = gidPresent ? gid : inode.gid;
+      if (c.euid !== 0) {
+        if (uidPresent && (inode.uid !== c.euid || wantUid !== inode.uid)) return -EPERM2;
+        if (gidPresent && (inode.uid !== c.euid || wantGid !== c.egid && wantGid !== c.rgid && wantGid !== inode.gid)) return -EPERM2;
+      }
+      inode.uid = wantUid;
+      inode.gid = wantGid;
+      if ((inode.mode & S_IFMT) !== S_IFDIR) {
+        inode.mode &= ~2048;
+        if (inode.mode & 8) inode.mode &= ~1024;
+      }
       inode.ctime = this.now();
       return 0;
     }
@@ -9683,10 +6737,17 @@
       if (!ofd) return -EBADF2;
       const inode = ofd.type === "file" ? ofd.inode : ofd.type === "dir" ? ofd.inode : null;
       if (!inode) return -EBADF2;
-      if (uid !== -1 && uid !== 4294967295) inode.uid = uid;
-      if (gid !== -1 && gid !== 4294967295) inode.gid = gid;
-      inode.ctime = this.now();
-      return 0;
+      return this.chownInode(inode, uid, gid);
+    }
+    chmodPath(path, mode) {
+      const inode = this.resolve(path);
+      if (!inode) return this.resolveErrno();
+      return this.chmodInode(inode, mode);
+    }
+    chownPath(path, uid, gid) {
+      const inode = this.resolve(path);
+      if (!inode) return this.resolveErrno();
+      return this.chownInode(inode, uid, gid);
     }
     ftruncate(fd, length) {
       const ofd = this.openFds.get(fd);
@@ -9720,14 +6781,37 @@
       }
       const follow = !(flags & AT_SYMLINK_NOFOLLOW);
       const inode = this.resolve(path, follow);
-      if (!inode) return -ENOENT2;
+      if (!inode) return this.resolveErrno();
       this.writeStat(memory2, statBuf, inode);
       return 0;
     }
+    // posix access-mode permission check. mode bits: R_OK=4, W_OK=2, X_OK=1, F_OK=0.
+    // returns true if the effective creds may access the inode in the requested mode.
+    // useEffective selects effective vs real uid/gid. access()/faccessat default to the
+    // REAL ids; only faccessat with AT_EACCESS uses the effective ids.
+    permitted(inode, mode, useEffective) {
+      if (mode === 0) return true;
+      const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+      const uid = useEffective ? c.euid : c.ruid;
+      const gid = useEffective ? c.egid : c.rgid;
+      if (uid === 0) {
+        if (mode & 1) return (inode.mode & 73) !== 0;
+        return true;
+      }
+      let perms;
+      if (inode.uid === uid) perms = inode.mode >> 6 & 7;
+      else if (inode.gid === gid) perms = inode.mode >> 3 & 7;
+      else perms = inode.mode & 7;
+      return (perms & mode) === mode;
+    }
     faccessat(dirfd, path, mode, flags) {
-      const inode = this.resolve(path);
-      if (!inode) return -ENOENT2;
-      return 0;
+      const AT_EACCESS = 512;
+      if ((mode & ~7) !== 0) return -EINVAL2;
+      if (path === "") return -ENOENT2;
+      const useEff = (flags & AT_EACCESS) !== 0;
+      const inode = this.resolve(path, true, 0, useEff);
+      if (!inode) return this.resolveErrno();
+      return this.permitted(inode, mode & 7, useEff) ? 0 : -EACCES2;
     }
     getcwd() {
       return this.cwd;
@@ -9782,11 +6866,12 @@
     unlinkat(path, flags) {
       const AT_REMOVEDIR = 512;
       const parent = this.resolveParent(path);
-      if (!parent) return -ENOENT2;
+      if (!parent) return this.resolveErrno();
       const [dir, name] = parent;
       if (name === "." || name === "..") return -EINVAL2;
       const child = dir.children.get(name);
       if (!child) return -ENOENT2;
+      if (!this.canWrite(dir)) return -EACCES2;
       if (flags & AT_REMOVEDIR) {
         if (child.type !== "dir") return -ENOTDIR2;
         if (child.children.size > 0) return -ENOTEMPTY;
@@ -9801,10 +6886,12 @@
     }
     mkdirat(path, mode) {
       const parent = this.resolveParent(path);
-      if (!parent) return -ENOENT2;
+      if (!parent) return this.resolveErrno();
       const [dir, name] = parent;
       if (dir.children.has(name)) return -EEXIST;
+      if (!this.canWrite(dir)) return -EACCES2;
       const newDir = this.makeDir(dir, mode & 4095);
+      this.applyCreatorOwnership(newDir, dir);
       dir.children.set(name, newDir);
       dir.nlink++;
       dir.mtime = dir.ctime = this.now();
@@ -9812,21 +6899,25 @@
     }
     symlinkat(target, linkpath) {
       const parent = this.resolveParent(linkpath);
-      if (!parent) return -ENOENT2;
+      if (!parent) return this.resolveErrno();
       const [dir, name] = parent;
       if (dir.children.has(name)) return -EEXIST;
-      dir.children.set(name, this.makeSymlink(target));
+      if (!this.canWrite(dir)) return -EACCES2;
+      const link = this.makeSymlink(target);
+      this.applyCreatorOwnership(link, dir);
+      dir.children.set(name, link);
       dir.mtime = dir.ctime = this.now();
       return 0;
     }
     linkat(oldpath, newpath) {
       const inode = this.resolve(oldpath);
-      if (!inode) return -ENOENT2;
+      if (!inode) return this.resolveErrno();
       if (inode.type === "dir") return -EPERM2;
       const parent = this.resolveParent(newpath);
-      if (!parent) return -ENOENT2;
+      if (!parent) return this.resolveErrno();
       const [dir, name] = parent;
       if (dir.children.has(name)) return -EEXIST;
+      if (!this.canWrite(dir)) return -EACCES2;
       dir.children.set(name, inode);
       inode.nlink++;
       inode.ctime = this.now();
@@ -9835,12 +6926,12 @@
     }
     rename(oldpath, newpath) {
       const oldParent = this.resolveParent(oldpath);
-      if (!oldParent) return -ENOENT2;
+      if (!oldParent) return this.resolveErrno();
       const [oldDir, oldName] = oldParent;
       const srcNode = oldDir.children.get(oldName);
       if (!srcNode) return -ENOENT2;
       const newParent = this.resolveParent(newpath);
-      if (!newParent) return -ENOENT2;
+      if (!newParent) return this.resolveErrno();
       const [newDir, newName] = newParent;
       const dstNode = newDir.children.get(newName);
       if (dstNode) {
@@ -9920,10 +7011,6 @@
     }
     restoreFds(snap) {
       this.openFds = new Map(snap);
-      this.nextFd = 3;
-      for (const fd of this.openFds.keys()) {
-        if (fd >= this.nextFd) this.nextFd = fd + 1;
-      }
     }
     closeAllExcept(...keep) {
       const keepSet = new Set(keep);
@@ -9971,8 +7058,10 @@
   var EM_AARCH64 = 183;
   var PT_LOAD = 1;
   var PT_DYNAMIC = 2;
+  var PT_INTERP = 3;
   var PT_PHDR = 6;
   var ET_DYN = 3;
+  var INTERP_LOAD_BASE = 0x1000000n;
   var PIE_LOAD_BASE = 0x400000n;
   function loadElf(elfBytes2, memory2) {
     const dv = new DataView(elfBytes2.buffer, elfBytes2.byteOffset, elfBytes2.byteLength);
@@ -10006,6 +7095,7 @@
     let phdrAddr = 0n;
     let dynOffset = 0;
     let dynSize = 0;
+    let interpPath;
     for (let i = 0; i < phnum; i++) {
       const phBase = phoff + i * phentSize;
       const pType = dv.getUint32(phBase, true);
@@ -10019,6 +7109,11 @@
       if (pType === PT_DYNAMIC) {
         dynOffset = pOffset;
         dynSize = pFilesz;
+      }
+      if (pType === PT_INTERP) {
+        let end = pOffset;
+        while (end < pOffset + pFilesz && elfBytes2[end] !== 0) end++;
+        interpPath = new TextDecoder().decode(elfBytes2.subarray(pOffset, end));
       }
       if (pType !== PT_LOAD) continue;
       const guestAddr = Number(pVaddr);
@@ -10053,8 +7148,58 @@
       phentSize,
       phnum,
       brkStart,
-      loadBase
+      loadBase,
+      interpPath
     };
+  }
+  function loadInterp(interpBytes, memory2, base = INTERP_LOAD_BASE) {
+    const dv = new DataView(interpBytes.buffer, interpBytes.byteOffset, interpBytes.byteLength);
+    for (let i = 0; i < 4; i++) if (interpBytes[i] !== ELF_MAGIC[i]) throw new Error("interp not an ELF");
+    const rawEntry = dv.getBigUint64(24, true);
+    const phoff = Number(dv.getBigUint64(32, true));
+    const phentSize = dv.getUint16(54, true);
+    const phnum = dv.getUint16(56, true);
+    let lowestVaddr = 0xFFFFFFFFFFFFFFFFn;
+    for (let i = 0; i < phnum; i++) {
+      const phBase = phoff + i * phentSize;
+      if (dv.getUint32(phBase, true) === PT_LOAD) {
+        const v = dv.getBigUint64(phBase + 16, true);
+        if (v < lowestVaddr) lowestVaddr = v;
+      }
+    }
+    const loadBase = base - lowestVaddr;
+    for (let i = 0; i < phnum; i++) {
+      const phBase = phoff + i * phentSize;
+      if (dv.getUint32(phBase, true) !== PT_LOAD) continue;
+      const pOffset = Number(dv.getBigUint64(phBase + 8, true));
+      const pVaddr = dv.getBigUint64(phBase + 16, true) + loadBase;
+      const pFilesz = Number(dv.getBigUint64(phBase + 32, true));
+      const pMemsz = Number(dv.getBigUint64(phBase + 40, true));
+      const wasmAddr = Number(pVaddr) + GUEST_MEM_BASE;
+      const needed = wasmAddr + pMemsz;
+      if (needed > memory2.buffer.byteLength) {
+        const pagesNeeded = Math.ceil(needed / 65536);
+        const currentPages = memory2.buffer.byteLength / 65536;
+        if (pagesNeeded > currentPages) memory2.grow(pagesNeeded - currentPages);
+      }
+      const freshBytes = new Uint8Array(memory2.buffer);
+      if (pFilesz > 0) freshBytes.set(interpBytes.subarray(pOffset, pOffset + pFilesz), wasmAddr);
+      if (pMemsz > pFilesz) freshBytes.fill(0, wasmAddr + pFilesz, wasmAddr + pMemsz);
+    }
+    return { entry: rawEntry + loadBase, base: loadBase };
+  }
+  function loadProgram(memory2, elfBytes2, argv, envp, readInterp) {
+    const elfInfo = loadElf(elfBytes2, memory2);
+    let startPC = elfInfo.entry;
+    if (elfInfo.interpPath) {
+      const interpBytes = readInterp(elfInfo.interpPath);
+      const { entry: iEntry, base: iBase } = loadInterp(interpBytes, memory2);
+      elfInfo.interpBase = iBase;
+      elfInfo.interpEntry = iEntry;
+      startPC = iEntry;
+    }
+    const sp = setupStack(memory2, elfInfo, argv, envp);
+    return { entry: startPC, sp, brkStart: elfInfo.brkStart, interp: !!elfInfo.interpPath };
   }
   var STACK_TOP = 8388608;
   var AT_NULL = 0;
@@ -10062,12 +7207,21 @@
   var AT_PHENT = 4;
   var AT_PHNUM = 5;
   var AT_PAGESZ = 6;
+  var AT_BASE = 7;
+  var AT_FLAGS = 8;
   var AT_ENTRY = 9;
   var AT_UID = 11;
   var AT_EUID = 12;
   var AT_GID = 13;
   var AT_EGID = 14;
+  var AT_PLATFORM = 15;
+  var AT_HWCAP = 16;
+  var AT_CLKTCK = 17;
+  var AT_SECURE = 23;
   var AT_RANDOM = 25;
+  var AT_EXECFN = 31;
+  var HWCAP_FP = 1 << 0;
+  var HWCAP_ASIMD = 1 << 1;
   function setupStack(memory2, elfInfo, argv, envp) {
     const mem = new DataView(memory2.buffer);
     const bytes = new Uint8Array(memory2.buffer);
@@ -10091,6 +7245,11 @@
     for (let i = 0; i < 16; i++) {
       bytes[sp + GUEST_MEM_BASE + i] = Math.random() * 256 | 0;
     }
+    const platform = new TextEncoder().encode("aarch64\0");
+    sp -= platform.length;
+    const platformAddr = sp;
+    bytes.set(platform, sp + GUEST_MEM_BASE);
+    const execfnAddr = stringAddrs.length > 0 ? stringAddrs[0] : 0;
     sp = sp & ~15;
     const auxv = [
       [AT_PHDR, elfInfo.phdr],
@@ -10098,13 +7257,20 @@
       [AT_PHNUM, BigInt(elfInfo.phnum)],
       [AT_PAGESZ, 4096n],
       [AT_ENTRY, elfInfo.entry],
+      [AT_FLAGS, 0n],
+      [AT_HWCAP, BigInt(HWCAP_FP | HWCAP_ASIMD)],
+      [AT_CLKTCK, 100n],
+      [AT_SECURE, 0n],
       [AT_UID, 0n],
       [AT_EUID, 0n],
       [AT_GID, 0n],
       [AT_EGID, 0n],
-      [AT_RANDOM, BigInt(randomAddr)],
-      [AT_NULL, 0n]
+      [AT_PLATFORM, BigInt(platformAddr)],
+      [AT_EXECFN, BigInt(execfnAddr)],
+      [AT_RANDOM, BigInt(randomAddr)]
     ];
+    if (elfInfo.interpBase !== void 0) auxv.push([AT_BASE, elfInfo.interpBase]);
+    auxv.push([AT_NULL, 0n]);
     const stackEntries = 8 + // argc
     (argv.length + 1) * 8 + // argv + NULL
     (envp.length + 1) * 8 + // envp + NULL
@@ -10151,6 +7317,7 @@
   var PROC_ZOMBIE = 2;
   var PROC_PID = 0;
   var PROC_PPID = 1;
+  var PROC_PGID = 2;
   var PROC_STATE = 3;
   var PROC_EXIT_CODE = 4;
   var PROC_WAIT_FUTEX = 5;
@@ -10167,6 +7334,7 @@
   var PIPE_HEADER_SIZE = 16;
   var PIPE_DATA_SIZE = PIPE_RING_SIZE - PIPE_HEADER_SIZE;
   var STDIN_DATA_SIZE = STDIN_RING_SIZE - PIPE_HEADER_SIZE;
+  var MEM_PAGE_SIZE = 65536;
   function procSlotOffset(slot) {
     return PROC_TABLE_OFFSET + slot * PROC_SLOT_SIZE;
   }
@@ -10236,6 +7404,29 @@
       Atomics.notify(this.i32, PIPE_WRITE_POS);
       return toWrite;
     }
+    /**
+     * Blocking write: keep writing `src` until it is fully in the ring, parking on reader progress
+     * (PIPE_READ_POS) whenever the ring is full. `waiter` is the interruptible park (same one the
+     * blocking read uses): it returns true if a signal interrupted the wait.
+     * Returns bytes written (== src.length on success); if nothing could be written it returns
+     * -1 (all readers closed -> EPIPE) or -2 (interrupted -> EINTR). A partial write that then hits
+     * reader-close/interrupt returns the partial count, per posix.
+     */
+    writeAll(src, waiter) {
+      let written = 0;
+      while (written < src.length) {
+        const n = this.write(src.subarray(written));
+        if (n === -1) return written > 0 ? written : -1;
+        written += n;
+        if (written >= src.length) break;
+        const rp = Atomics.load(this.i32, PIPE_READ_POS);
+        const wp = Atomics.load(this.i32, PIPE_WRITE_POS);
+        if (this.dataSize - 1 - (wp - rp) <= 0) {
+          if (waiter(this.i32, PIPE_READ_POS, rp)) return written > 0 ? written : -2;
+        }
+      }
+      return written;
+    }
     /** Decrement writer refcount. Last close triggers EOF for readers. */
     closeWriter() {
       const remaining = Atomics.sub(this.i32, PIPE_WRITER_CLOSED, 1) - 1;
@@ -10252,11 +7443,17 @@
     /**
      * Read data from the ring into dst. Returns the number of bytes read.
      * Returns 0 for EOF (writer closed and ring empty).
-     * Blocks via Atomics.wait() if the ring is empty and writer is still open.
+     * Returns -1 if `waiter` reported an interruption (EINTR — a pending signal).
+     * Blocks via Atomics.wait() (or `waiter`) if the ring is empty and writer is still open.
+     *
+     * `waiter`, when given, replaces the bare Atomics.wait: it parks on the passed futex and
+     * returns true if the wait should be abandoned because a signal is pending. this keeps the
+     * signal machinery in the Worker while letting the ring own the empty/EOF logic. without it
+     * the read blocks indefinitely, which is un-interruptible by anything but SIGKILL.
      *
      * IMPORTANT: Only call from a Worker thread (Atomics.wait blocks the thread).
      */
-    read(dst) {
+    read(dst, waiter) {
       while (true) {
         const wp = Atomics.load(this.i32, PIPE_WRITE_POS);
         const rp = Atomics.load(this.i32, PIPE_READ_POS);
@@ -10276,7 +7473,11 @@
         if (Atomics.load(this.i32, PIPE_WRITER_CLOSED) === 0) {
           return 0;
         }
-        Atomics.wait(this.i32, PIPE_WRITE_POS, wp);
+        if (waiter) {
+          if (waiter(this.i32, PIPE_WRITE_POS, wp)) return -1;
+        } else {
+          Atomics.wait(this.i32, PIPE_WRITE_POS, wp);
+        }
       }
     }
     /**
@@ -10327,6 +7528,13 @@
   var syscalls;
   var vfs;
   var regionCache = /* @__PURE__ */ new Map();
+  var threaded = false;
+  var stateBase = 0;
+  var regBaseGlobal = null;
+  var clearChildTid = 0;
+  var THREAD_REGS_BASE = 1610612736;
+  var THREADED_SHADOW_BASE = 1614807040;
+  var REGION_CACHE_CAP = 2048;
   var elfBytes;
   var kernelSAB;
   var procTable;
@@ -10336,6 +7544,9 @@
   var kernelPipes = /* @__PURE__ */ new Map();
   var nextLocalFd = 100;
   var stdinRing = null;
+  var workerReady = false;
+  var lastSyscallNr = -1;
+  var ZIG_SHADOW_BASE = 33554432;
   self.onmessage = (e) => {
     const msg = e.data;
     switch (msg.type) {
@@ -10352,6 +7563,12 @@
       case "term_size":
         if (syscalls) syscalls.setTermSize(msg.cols, msg.rows);
         break;
+      case "promote":
+        completePromote(msg.sharedMemory, msg.tid, msg.regBaseAddr, msg.staleHigh);
+        break;
+      case "clone_fail":
+        completePromoteFail();
+        break;
     }
   };
   function init(config) {
@@ -10359,27 +7576,69 @@
     mySlot = config.slot;
     kernelSAB = config.kernelSAB;
     elfBytes = config.elfBytes;
+    if (!workerReady) {
+      if (config.zigTranslatorModule) {
+        initZigTranslatorModule(config.zigTranslatorModule);
+      } else if (config.zigTranslatorBytes) {
+        initZigTranslator(config.zigTranslatorBytes);
+      } else {
+        throw new Error(`[worker ${myPid}] no translator module or bytes in init config`);
+      }
+      memory = new WebAssembly.Memory({ initial: 512, maximum: 65536 });
+      workerReady = true;
+    } else {
+      if (threaded) {
+        memory = new WebAssembly.Memory({ initial: 512, maximum: 65536 });
+        threaded = false;
+        stateBase = 0;
+        regBaseGlobal = null;
+      }
+      const dirtyEnd = Math.min(Number(syscalls.getMmapBase()) + GUEST_MEM_BASE, memory.buffer.byteLength);
+      new Uint8Array(memory.buffer).fill(0, 0, dirtyEnd);
+      regionCache.clear();
+      kernelPipes.clear();
+      nextLocalFd = 100;
+      stdinRing = null;
+    }
     procTable = new Int32Array(kernelSAB);
     myMailbox = new Int32Array(kernelSAB, mailboxSlotOffset(mySlot), MAILBOX_SLOT_SIZE / 4);
-    const initialPages = 1024;
-    memory = new WebAssembly.Memory({ initial: initialPages });
-    vfs = new InMemoryVFS();
-    if (!config.kernelSAB) {
+    const bridgeHandlesRealFs = !!config.kernelSAB;
+    vfs = new InMemoryVFS({ bridgeHandlesRealFs });
+    if (!bridgeHandlesRealFs) {
       vfs.loadBinary(elfBytes);
     }
-    let pc;
-    if (config.memoryBuffer) {
-      const parentBytes = new Uint8Array(config.memoryBuffer);
-      const myBytes = new Uint8Array(memory.buffer);
-      if (parentBytes.length > myBytes.length) {
-        const pagesNeeded = Math.ceil(parentBytes.length / 65536);
-        const currentPages = memory.buffer.byteLength / 65536;
-        if (pagesNeeded > currentPages) {
-          memory.grow(pagesNeeded - currentPages);
-        }
+    if (config.threadStart) {
+      const ts = config.threadStart;
+      memory = ts.sharedMemory;
+      threaded = true;
+      stateBase = ts.regBaseAddr;
+      regBaseGlobal = new WebAssembly.Global({ value: "i32", mutable: false }, ts.regBaseAddr);
+      new Uint8Array(memory.buffer).copyWithin(stateBase, ts.parentRegBase, ts.parentRegBase + STATE_SIZE);
+      cpu = new CpuState(memory, stateBase);
+      cpu.setReg(0, 0n);
+      cpu.setSP(BigInt(ts.childStack >>> 0));
+      new DataView(memory.buffer).setBigUint64(stateBase + 280, BigInt(ts.tls >>> 0), true);
+      if (ts.flags & 16777216 && ts.childTidPtr) {
+        new DataView(memory.buffer).setInt32(ts.childTidPtr + GUEST_MEM_BASE, ts.tid, true);
       }
-      new Uint8Array(memory.buffer).set(parentBytes);
-      cpu = new CpuState(memory);
+      if (ts.flags & 2097152 && ts.childTidPtr) clearChildTid = ts.childTidPtr;
+      syscalls = new SyscallHandler(0n, {
+        writeStdout: (d) => postWrite(1, d),
+        writeStderr: (d) => postWrite(2, d),
+        readStdin: (count) => readStdin(count),
+        stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
+        waitStdin: (timeoutMs) => waitStdin(timeoutMs)
+      }, vfs);
+      syscalls.bridgeAvailable = true;
+      syscalls.setThreadIds(ts.tid, ts.tgid);
+      syscalls.maxBytes = THREAD_REGS_BASE;
+      runToCompletion(BigInt(ts.startPC));
+      return;
+    }
+    let pc;
+    if (config.memSnapshot) {
+      applySparseSnapshot(memory, config.memSnapshot);
+      cpu = new CpuState(memory, stateBase);
       cpu.setReg(0, 0n);
       syscalls = new SyscallHandler(0n, {
         writeStdout: (d) => postWrite(1, d),
@@ -10391,13 +7650,18 @@
       syscalls.bridgeAvailable = true;
       if (config.syscallState) {
         syscalls.restoreState(config.syscallState);
+        syscalls.setIdentity(myPid, syscalls.currentPid);
+        syscalls.dupNativeFdsAfterFork((oldFd) => {
+          let result = -1;
+          handleBridgeCall("fs_dup", { fd: oldFd }, (resp) => {
+            result = resp.ret;
+          });
+          return result;
+        });
       }
       if (config.kernelPipesSnapshot) {
         for (const [fd, info] of config.kernelPipesSnapshot) {
           kernelPipes.set(fd, { ...info });
-          const ring = new PipeRing(kernelSAB, pipeRingOffset(info.pipeIndex), PIPE_RING_SIZE);
-          if (info.mode === "write") ring.addWriter();
-          else ring.addReader();
         }
         for (const fd of kernelPipes.keys()) {
           if (fd >= nextLocalFd) nextLocalFd = fd + 1;
@@ -10405,13 +7669,11 @@
       }
       pc = cpu.getPC() + 4n;
     } else {
-      cpu = new CpuState(memory);
-      const elfInfo = loadElf(elfBytes, memory);
-      const sp = setupStack(memory, elfInfo, config.argv, config.envp);
-      cpu.setSP(sp);
-      const view = new DataView(memory.buffer);
-      view.setBigUint64(280, BigInt(9437184), true);
-      syscalls = new SyscallHandler(elfInfo.brkStart, {
+      const prog = loadProgram(memory, elfBytes, config.argv, config.envp, readGuestFile);
+      cpu = new CpuState(memory, stateBase);
+      cpu.setSP(prog.sp);
+      new DataView(memory.buffer).setBigUint64(stateBase + 280, BigInt(9437184), true);
+      syscalls = new SyscallHandler(prog.brkStart, {
         writeStdout: (d) => postWrite(1, d),
         writeStderr: (d) => postWrite(2, d),
         readStdin: (count) => readStdin(count),
@@ -10419,7 +7681,7 @@
         waitStdin: (timeoutMs) => waitStdin(timeoutMs)
       }, vfs);
       syscalls.bridgeAvailable = true;
-      pc = elfInfo.entry;
+      pc = prog.entry;
     }
     const stdinRingIdx = Atomics.load(procTable, procSlotOffset(mySlot) / 4 + 7);
     if (stdinRingIdx >= 0) {
@@ -10428,6 +7690,10 @@
     if (config.termCols && config.termRows) {
       syscalls.setTermSize(config.termCols, config.termRows);
     }
+    syscalls.installSignalTrampoline(memory);
+    runToCompletion(pc);
+  }
+  function runToCompletion(pc) {
     try {
       runLoop(pc);
     } catch (e) {
@@ -10435,27 +7701,74 @@
         return;
       }
       console.error(`[worker ${myPid}] CRASH:`, e.message, e.stack);
+      try {
+        postWrite(2, new TextEncoder().encode(`\r
+[worker ${myPid}] crash: ${e.message} (last syscall nr=${lastSyscallNr})\r
+`));
+      } catch {
+      }
       postExit(139);
+    } finally {
+      if (!pendingClone) {
+        try {
+          syscalls.closeNativeFds((fd) => handleBridgeCall("fs_close", { fd }, () => {
+          }));
+        } catch {
+        }
+      }
     }
   }
   function getRegion(pc) {
-    let region = regionCache.get(pc);
-    if (region) return region;
-    const view = new DataView(memory.buffer);
-    const block = detectBlock(view, pc);
-    try {
-      region = translateBlock(block, memory);
-    } catch (e) {
-      console.error(`[worker ${myPid}] CRASH at pc=0x${pc.toString(16)}:`, e.message);
-      for (let i = 0; i < Math.min(block.count, 10); i++) {
-        const addr = Number(block.startPC) + i * 4;
-        const insn = view.getUint32(addr + 65536, true);
-        console.error(`  0x${addr.toString(16)}: 0x${insn.toString(16).padStart(8, "0")}`);
+    const region = regionCache.get(pc);
+    if (region) {
+      if (regionCache.size >= REGION_CACHE_CAP) {
+        regionCache.delete(pc);
+        regionCache.set(pc, region);
       }
-      throw e;
+      return region;
     }
-    regionCache.set(pc, region);
-    return region;
+    const view = new DataView(memory.buffer);
+    const shadowBase = threaded ? THREADED_SHADOW_BASE : ZIG_SHADOW_BASE;
+    const zigRegion = translateRegionZig(view, pc, memory, shadowBase, false, threaded, regBaseGlobal);
+    if (!zigRegion) {
+      const insn = view.getUint32(Number(pc) + 65536, true);
+      throw new Error(`[worker ${myPid}] translator failed at pc=0x${pc.toString(16)} (entry insn 0x${insn.toString(16).padStart(8, "0")})`);
+    }
+    if (regionCache.size >= REGION_CACHE_CAP) {
+      const oldest = regionCache.keys().next().value;
+      if (oldest !== void 0) regionCache.delete(oldest);
+    }
+    regionCache.set(pc, zigRegion);
+    return zigRegion;
+  }
+  function pollAndQueueSignals() {
+    syscalls.checkTimers();
+    const sigSlot = procSlotOffset(mySlot) / 4 + PROC_SIGNAL;
+    const bits2 = Atomics.load(procTable, sigSlot);
+    if (bits2) {
+      Atomics.and(procTable, sigSlot, ~bits2);
+      for (let signo = 1; signo < 32; signo++) if (bits2 & 1 << signo) syscalls.raiseSignal(signo);
+    }
+    return syscalls.pendingSignals.length > 0;
+  }
+  function interruptibleWaiter(i32, idx, expected) {
+    const rem = syscalls.timerRemainingMs();
+    Atomics.wait(i32, idx, expected, rem > 0 ? Math.min(1e3, rem) : 1e3);
+    return pollAndQueueSignals();
+  }
+  function deliverQueuedSignals(pc) {
+    if (!syscalls.pendingSignals.length) return pc;
+    cpu.setPC(pc);
+    while (syscalls.pendingSignals.length > 0) {
+      const sig = syscalls.pendingSignals.shift();
+      const r = syscalls.deliverSignal(cpu, memory, sig);
+      if (r.action === "exit") {
+        postExit(r.exitCode ?? 128 + sig);
+        return null;
+      }
+      if (r.delivered && r.action === "continue") return cpu.getPC();
+    }
+    return pc;
   }
   function runLoop(startPC) {
     let pc = startPC;
@@ -10468,25 +7781,104 @@
       const region = getRegion(pc);
       pc = region.run();
       view = new DataView(memory.buffer);
-      const insns = Number(view.getBigUint64(ITER_OFFSET, true));
+      const insns = Number(view.getBigUint64(stateBase + ITER_OFFSET, true));
       totalInsns += insns;
-      view.setBigUint64(ITER_OFFSET, 0n, true);
+      view.setBigUint64(stateBase + ITER_OFFSET, 0n, true);
       lastSignalCheck += insns;
       if (lastSignalCheck > 1e4) {
         lastSignalCheck = 0;
-        const sigPending = Atomics.load(procTable, procSlotOffset(mySlot) / 4 + 6);
-        if (sigPending & SIG_INT) {
-          Atomics.and(procTable, procSlotOffset(mySlot) / 4 + 6, ~SIG_INT);
-          postExit(130);
-          return;
+        if (pollAndQueueSignals()) {
+          const next = deliverQueuedSignals(pc);
+          if (next === null) return;
+          pc = next;
+          continue;
         }
       }
       if (pc === SVC_PC) {
-        const svcPC = view.getBigUint64(PC_OFFSET, true);
+        const svcPC = view.getBigUint64(stateBase + PC_OFFSET, true);
         const nr = Number(cpu.getReg(8));
+        lastSyscallNr = nr;
         if (nr === 260) {
           handleWait4(cpu, view);
+          const eintr = BigInt.asIntN(64, cpu.getReg(0)) === -4n;
+          const retPC = eintr && syscalls.pendingSignals.length > 0 && syscalls.anyPendingRestart() ? svcPC : svcPC + 4n;
+          if (syscalls.pendingSignals.length) {
+            const next = deliverQueuedSignals(retPC);
+            if (next === null) return;
+            pc = next;
+          } else {
+            pc = retPC;
+          }
+          continue;
+        }
+        if (nr === 139) {
+          pc = syscalls.handleSigreturn(cpu, memory);
+          continue;
+        }
+        if (nr === 129 || nr === 130 || nr === 131) {
+          handleKill(nr, cpu);
           pc = svcPC + 4n;
+          if (syscalls.pendingSignals.length) {
+            const next = deliverQueuedSignals(pc);
+            if (next === null) return;
+            pc = next;
+          }
+          continue;
+        }
+        if (nr === 154) {
+          handleSetpgid(cpu);
+          pc = svcPC + 4n;
+          continue;
+        }
+        if (nr === 155) {
+          handleGetpgid(cpu);
+          pc = svcPC + 4n;
+          continue;
+        }
+        if (nr === 220) {
+          const cloneFlags = Number(cpu.getReg(0));
+          const CLONE_THREAD = 65536;
+          if (cloneFlags & CLONE_THREAD) {
+            if (handleCloneThread(cpu, svcPC)) return;
+            pc = svcPC + 4n;
+            continue;
+          }
+        }
+        if (nr === 98 && threaded) {
+          const interrupted = handleFutex(cpu);
+          pc = svcPC + 4n;
+          if (interrupted && syscalls.pendingSignals.length) {
+            const next = deliverQueuedSignals(pc);
+            if (next === null) return;
+            pc = next;
+          }
+          continue;
+        }
+        if (nr === 157) {
+          Atomics.store(procTable, procSlotOffset(mySlot) / 4 + PROC_PGID, myPid);
+          cpu.setReg(0, BigInt(myPid));
+          pc = svcPC + 4n;
+          continue;
+        }
+        if (nr === 25) {
+          const lc = Number(cpu.getReg(1));
+          if (lc === 5 || lc === 6 || lc === 7 || lc === 12 || lc === 13 || lc === 14) {
+            handleFcntlLock(cpu, view, lc);
+            pc = svcPC + 4n;
+            continue;
+          }
+        }
+        if (nr === 101 || nr === 115) {
+          const abs = nr === 115 && (Number(cpu.getReg(1)) & 1) !== 0;
+          const reqAddr = Number(nr === 115 ? cpu.getReg(2) : cpu.getReg(0));
+          const remAddr = Number(nr === 115 ? cpu.getReg(3) : cpu.getReg(1));
+          handleNanosleep(cpu, view, reqAddr, remAddr, abs, nr === 115 ? Number(cpu.getReg(0)) : 1);
+          pc = svcPC + 4n;
+          if (syscalls.pendingSignals.length) {
+            const next = deliverQueuedSignals(pc);
+            if (next === null) return;
+            pc = next;
+          }
           continue;
         }
         if (nr === 59) {
@@ -10501,10 +7893,26 @@
         }
         if ((nr === 63 || nr === 64 || nr === 66 || nr === 57) && kernelPipes.has(Number(cpu.getReg(0)))) {
           handleKernelPipeIO(nr, cpu, view);
-          pc = svcPC + 4n;
+          const eintr = BigInt.asIntN(64, cpu.getReg(0)) === -4n;
+          const retPC = eintr && syscalls.pendingSignals.length > 0 && syscalls.anyPendingRestart() ? svcPC : svcPC + 4n;
+          if (syscalls.pendingSignals.length) {
+            const next = deliverQueuedSignals(retPC);
+            if (next === null) return;
+            pc = next;
+          } else {
+            pc = retPC;
+          }
           continue;
         }
-        const result = syscalls.handle(cpu, memory);
+        let result;
+        try {
+          result = syscalls.handle(cpu, memory);
+        } catch (e) {
+          if (e instanceof RangeError) {
+            cpu.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+            result = { status: "ok" };
+          } else throw e;
+        }
         view = new DataView(memory.buffer);
         switch (result.status) {
           case "ok":
@@ -10517,13 +7925,16 @@
             pc = handleFork(result.resumePC);
             break;
           case "execve":
-            pc = handleExec(result.argv, result.envp);
+            pc = handleExec(result.path, result.argv, result.envp);
             break;
           case "blocked_read":
             handleBlockedRead();
             pc = svcPC;
             break;
           case "bridge":
+            if (result.method.startsWith("fs_")) {
+              result.args.creds = syscalls.getCreds();
+            }
             handleBridgeCall(result.method, result.args, result.apply);
             pc = svcPC + 4n;
             break;
@@ -10531,45 +7942,262 @@
             pc = svcPC + 4n;
             break;
         }
+        if (syscalls.pendingSignals.length) {
+          const next = deliverQueuedSignals(pc);
+          if (next === null) return;
+          pc = next;
+        }
         continue;
       }
     }
     postExit(0);
+  }
+  function buildSparseSnapshot(buffer, totalLen) {
+    const pageCount = Math.ceil(totalLen / MEM_PAGE_SIZE);
+    const wordsPerPage = MEM_PAGE_SIZE >>> 2;
+    const u32 = new Uint32Array(buffer, 0, pageCount * MEM_PAGE_SIZE >>> 2);
+    const bytes = new Uint8Array(buffer);
+    const idx = [];
+    for (let p = 0; p < pageCount; p++) {
+      const wStart = p * wordsPerPage;
+      let nz = false;
+      for (let w = 0; w < wordsPerPage; w++) {
+        if (u32[wStart + w] !== 0) {
+          nz = true;
+          break;
+        }
+      }
+      if (nz) idx.push(p);
+    }
+    const data = new Uint8Array(idx.length * MEM_PAGE_SIZE);
+    for (let i = 0; i < idx.length; i++) {
+      const off = idx[i] * MEM_PAGE_SIZE;
+      data.set(bytes.subarray(off, off + MEM_PAGE_SIZE), i * MEM_PAGE_SIZE);
+    }
+    return { pages: Uint32Array.from(idx), data: data.buffer, totalLen: pageCount * MEM_PAGE_SIZE };
+  }
+  function applySparseSnapshot(mem, snap) {
+    if (snap.totalLen > mem.buffer.byteLength) {
+      const need = Math.ceil(snap.totalLen / MEM_PAGE_SIZE);
+      const cur = mem.buffer.byteLength / MEM_PAGE_SIZE;
+      if (need > cur) mem.grow(need - cur);
+    }
+    const dst = new Uint8Array(mem.buffer);
+    const data = new Uint8Array(snap.data);
+    for (let i = 0; i < snap.pages.length; i++) {
+      dst.set(data.subarray(i * MEM_PAGE_SIZE, (i + 1) * MEM_PAGE_SIZE), snap.pages[i] * MEM_PAGE_SIZE);
+    }
   }
   function handleFork(resumePC) {
     const snapSize = Math.min(
       Number(syscalls.getMmapBase()) + GUEST_MEM_BASE + 65536,
       memory.buffer.byteLength
     );
-    const memoryBuffer = memory.buffer.slice(0, snapSize);
+    const memSnapshot = buildSparseSnapshot(memory.buffer, snapSize);
     const syscallState = syscalls.getState();
     cpu.setPC(resumePC);
     const kernelPipesSnapshot = [...kernelPipes.entries()];
+    for (const [, info] of kernelPipesSnapshot) {
+      const ring = new PipeRing(kernelSAB, pipeRingOffset(info.pipeIndex), PIPE_RING_SIZE);
+      if (info.mode === "write") ring.addWriter();
+      else ring.addReader();
+    }
     self.postMessage({
       type: "fork",
-      memoryBuffer,
+      memSnapshot,
       syscallState,
       kernelPipesSnapshot,
       resumePC: resumePC.toString()
-    }, [memoryBuffer]);
+    }, [memSnapshot.data]);
     Atomics.store(myMailbox, MBOX_READY, 0);
     Atomics.wait(myMailbox, MBOX_READY, 0);
     const childPid = Atomics.load(myMailbox, MBOX_VALUE0);
+    if (childPid < 0) {
+      for (const [, info] of kernelPipesSnapshot) {
+        const ring = new PipeRing(kernelSAB, pipeRingOffset(info.pipeIndex), PIPE_RING_SIZE);
+        if (info.mode === "write") ring.closeWriter();
+        else ring.closeReader();
+      }
+      cpu.setReg(0, BigInt.asUintN(64, BigInt(childPid)));
+      return resumePC;
+    }
     cpu.setReg(0, BigInt(childPid));
     return resumePC;
   }
-  function handleExec(argv, envp) {
-    const memBytes = new Uint8Array(memory.buffer);
-    memBytes.fill(0, GUEST_MEM_BASE, GUEST_MEM_BASE + 67108864);
-    const elfInfo = loadElf(elfBytes, memory);
-    const sp = setupStack(memory, elfInfo, argv, envp);
-    cpu.reset();
-    cpu.setSP(sp);
-    const view = new DataView(memory.buffer);
-    view.setBigUint64(280, BigInt(9437184), true);
-    syscalls.resetForExec(elfInfo.brkStart);
+  var CLONE_PARENT_SETTID = 1048576;
+  var pendingClone = null;
+  function handleCloneThread(cpu2, svcPC) {
+    const flags = Number(cpu2.getReg(0));
+    const childStack = Number(cpu2.getReg(1));
+    const parentTidPtr = Number(cpu2.getReg(2));
+    const tls = Number(cpu2.getReg(3));
+    const childTidPtr = Number(cpu2.getReg(4));
+    if (!threaded) {
+      pendingClone = { svcPC, childStack, tls, parentTidPtr, childTidPtr, flags };
+      self.postMessage({ type: "clone_thread", curPages: memory.buffer.byteLength / MEM_PAGE_SIZE });
+      return true;
+    }
+    Atomics.store(myMailbox, MBOX_READY, 0);
+    self.postMessage({
+      type: "spawn_thread",
+      tgid: syscalls.tgid || myPid,
+      startPC: (svcPC + 4n).toString(),
+      childStack,
+      tls,
+      childTidPtr,
+      flags,
+      parentRegBase: stateBase
+    });
+    Atomics.wait(myMailbox, MBOX_READY, 0);
+    const tid = Atomics.load(myMailbox, MBOX_VALUE0);
+    if (tid < 0) {
+      cpu2.setReg(0, BigInt.asUintN(64, BigInt(-11)));
+      return false;
+    }
+    if (flags & CLONE_PARENT_SETTID && parentTidPtr) new DataView(memory.buffer).setInt32(parentTidPtr + GUEST_MEM_BASE, tid, true);
+    cpu2.setReg(0, BigInt(tid));
+    return false;
+  }
+  function completePromote(sharedMemory, tid, regBaseAddr, staleHigh) {
+    const pc = pendingClone;
+    const copyLen = memory.buffer.byteLength;
+    const shared = new Uint8Array(sharedMemory.buffer);
+    shared.set(new Uint8Array(memory.buffer));
+    if (staleHigh > copyLen) shared.fill(0, copyLen, staleHigh);
+    if (staleHigh > 0) shared.fill(0, THREADED_SHADOW_BASE, THREADED_SHADOW_BASE + (THREAD_REGS_BASE >> 9));
+    memory = sharedMemory;
+    threaded = true;
+    stateBase = 0;
+    regBaseGlobal = new WebAssembly.Global({ value: "i32", mutable: false }, 0);
+    cpu = new CpuState(memory, stateBase);
     regionCache.clear();
-    return elfInfo.entry;
+    syscalls.setThreadIds(myPid, myPid);
+    syscalls.maxBytes = THREAD_REGS_BASE;
+    new Uint8Array(memory.buffer).copyWithin(regBaseAddr, 0, STATE_SIZE);
+    cpu.setReg(0, BigInt(tid));
+    if (pc.flags & CLONE_PARENT_SETTID && pc.parentTidPtr) new DataView(memory.buffer).setInt32(pc.parentTidPtr + GUEST_MEM_BASE, tid, true);
+    self.postMessage({
+      type: "thread_go",
+      tid,
+      regBaseAddr,
+      startPC: (pc.svcPC + 4n).toString(),
+      childStack: pc.childStack,
+      tls: pc.tls,
+      childTidPtr: pc.childTidPtr,
+      flags: pc.flags,
+      parentRegBase: regBaseAddr
+      // block already holds the clone-time snapshot
+    });
+    const resume = pc.svcPC + 4n;
+    pendingClone = null;
+    runToCompletion(resume);
+  }
+  function completePromoteFail() {
+    const pc = pendingClone;
+    cpu.setReg(0, BigInt.asUintN(64, BigInt(-11)));
+    const resume = pc.svcPC + 4n;
+    pendingClone = null;
+    runToCompletion(resume);
+  }
+  function handleFutex(cpu2) {
+    const uaddr = Number(cpu2.getReg(0));
+    const op = Number(cpu2.getReg(1)) & 127;
+    const val = Number(cpu2.getReg(2)) | 0;
+    const i32 = new Int32Array(memory.buffer);
+    const idx = uaddr + GUEST_MEM_BASE >> 2;
+    if (op === 0) {
+      if (Atomics.load(i32, idx) !== val) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-11)));
+        return false;
+      }
+      const r = Atomics.wait(i32, idx, val, 1e3);
+      if (r === "not-equal") {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-11)));
+        return false;
+      }
+      if (pollAndQueueSignals()) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-4)));
+        return true;
+      }
+      cpu2.setReg(0, 0n);
+      return false;
+    }
+    if (op === 1) {
+      cpu2.setReg(0, BigInt(Atomics.notify(i32, idx, val < 0 ? Infinity : val)));
+      return false;
+    }
+    if (op === 3 || op === 4 || op === 5 || op === 10 || op === 11) {
+      cpu2.setReg(0, BigInt(Atomics.notify(i32, idx, val < 0 ? Infinity : val)));
+      return false;
+    }
+    cpu2.setReg(0, 0n);
+    return false;
+  }
+  function handleExec(path, argv, envp) {
+    let bytes = readGuestFile(path);
+    if (bytes.length >= 2 && bytes[0] === 35 && bytes[1] === 33) {
+      let end = 2;
+      while (end < bytes.length && end < 256 && bytes[end] !== 10) end++;
+      const m = new TextDecoder().decode(bytes.subarray(2, end)).trim().match(/^(\S+)(?:\s+(.*))?$/);
+      if (m) {
+        const interp = m[1];
+        const optArg = m[2]?.trim();
+        const newArgv = [interp];
+        if (optArg) newArgv.push(optArg);
+        newArgv.push(path, ...argv.slice(1));
+        path = interp;
+        argv = newArgv;
+        bytes = readGuestFile(interp);
+      }
+    }
+    elfBytes = bytes;
+    new Uint8Array(memory.buffer).fill(0, GUEST_MEM_BASE, GUEST_MEM_BASE + 67108864);
+    const prog = loadProgram(memory, elfBytes, argv, envp, readGuestFile);
+    cpu = new CpuState(memory, stateBase);
+    cpu.setSP(prog.sp);
+    new DataView(memory.buffer).setBigUint64(stateBase + 280, BigInt(9437184), true);
+    syscalls.resetForExec(prog.brkStart, (fd) => handleBridgeCall("fs_close", { fd }, () => {
+    }));
+    regionCache.clear();
+    syscalls.installSignalTrampoline(memory);
+    return prog.entry;
+  }
+  function handleNanosleep(cpu2, view, reqAddr, remAddr, absolute, clockId) {
+    const sec = Number(view.getBigUint64(reqAddr + GUEST_MEM_BASE, true));
+    const nsec = Number(view.getBigUint64(reqAddr + GUEST_MEM_BASE + 8, true));
+    const targetNs = sec * 1e9 + nsec;
+    const ms = absolute ? (targetNs - Number(syscalls.clockNs(clockId))) / 1e6 : targetNs / 1e6;
+    if (ms <= 0) {
+      cpu2.setReg(0, 0n);
+      return;
+    }
+    const slotBase = procSlotOffset(mySlot) / 4;
+    const deadline = performance.now() + ms;
+    let interrupted = false;
+    for (; ; ) {
+      const rem = deadline - performance.now();
+      if (rem <= 0) break;
+      Atomics.store(procTable, slotBase + PROC_WAIT_FUTEX, 0);
+      Atomics.wait(procTable, slotBase + PROC_WAIT_FUTEX, 0, Math.min(rem, 1e3));
+      if (pollAndQueueSignals()) {
+        interrupted = true;
+        break;
+      }
+    }
+    if (interrupted) {
+      if (remAddr && !absolute) {
+        const remMs = Math.max(0, deadline - performance.now());
+        view.setBigUint64(remAddr + GUEST_MEM_BASE, BigInt(Math.floor(remMs / 1e3)), true);
+        view.setBigUint64(remAddr + GUEST_MEM_BASE + 8, BigInt(Math.round(remMs % 1e3 * 1e6)), true);
+      }
+      cpu2.setReg(0, BigInt.asUintN(64, -4n));
+    } else {
+      if (remAddr && !absolute) {
+        view.setBigUint64(remAddr + GUEST_MEM_BASE, 0n, true);
+        view.setBigUint64(remAddr + GUEST_MEM_BASE + 8, 0n, true);
+      }
+      cpu2.setReg(0, 0n);
+    }
   }
   function handleWait4(cpu2, view) {
     const targetPid = Number(BigInt.asIntN(32, cpu2.getReg(0)));
@@ -10615,16 +8243,122 @@
         cpu2.setReg(0, 0n);
         return;
       }
+      const rem = syscalls.timerRemainingMs();
+      const waitMs = rem > 0 ? Math.min(1e3, rem) : 1e3;
       const mySlotBase = procSlotOffset(mySlot) / 4;
       Atomics.store(procTable, mySlotBase + PROC_WAIT_FUTEX, 0);
-      Atomics.wait(procTable, mySlotBase + PROC_WAIT_FUTEX, 0, 1e3);
-      const sigPending = Atomics.load(procTable, mySlotBase + PROC_SIGNAL);
-      if (sigPending & SIG_INT) {
-        Atomics.and(procTable, mySlotBase + PROC_SIGNAL, ~SIG_INT);
+      Atomics.wait(procTable, mySlotBase + PROC_WAIT_FUTEX, 0, waitMs);
+      if (pollAndQueueSignals()) {
         cpu2.setReg(0, BigInt.asUintN(64, BigInt(-4)));
         return;
       }
     }
+  }
+  function handleKill(nr, cpu2) {
+    const targetPid = Number(BigInt.asIntN(32, cpu2.getReg(0)));
+    const sig = nr === 131 ? Number(cpu2.getReg(2)) : Number(cpu2.getReg(1));
+    const myPgid = Atomics.load(procTable, procSlotOffset(mySlot) / 4 + PROC_PGID);
+    let delivered = false;
+    for (let slot = 0; slot < 64; slot++) {
+      const base = procSlotOffset(slot) / 4;
+      const pid = Atomics.load(procTable, base + PROC_PID);
+      if (pid === 0) continue;
+      const pgid = Atomics.load(procTable, base + PROC_PGID);
+      let match;
+      if (targetPid > 0) match = pid === targetPid;
+      else if (targetPid === 0) match = pgid === myPgid;
+      else if (targetPid === -1) match = pid !== 1 && pid !== myPid;
+      else match = pgid === -targetPid;
+      if (!match) continue;
+      delivered = true;
+      if (sig === 0) continue;
+      if (pid === myPid) {
+        syscalls.raiseSignal(sig);
+        continue;
+      }
+      if (sig === 9) {
+        self.postMessage({ type: "kill", pid, sig });
+        continue;
+      }
+      Atomics.or(procTable, base + PROC_SIGNAL, 1 << sig);
+      Atomics.store(procTable, base + PROC_WAIT_FUTEX, 1);
+      Atomics.notify(procTable, base + PROC_WAIT_FUTEX);
+    }
+    cpu2.setReg(0, delivered ? 0n : BigInt.asUintN(64, BigInt(-3)));
+  }
+  function handleSetpgid(cpu2) {
+    let pid = Number(BigInt.asIntN(32, cpu2.getReg(0)));
+    let pgid = Number(BigInt.asIntN(32, cpu2.getReg(1)));
+    if (pid === 0) pid = myPid;
+    if (pgid === 0) pgid = pid;
+    if (pgid < 0) {
+      cpu2.setReg(0, BigInt.asUintN(64, BigInt(-22)));
+      return;
+    }
+    for (let slot = 0; slot < 64; slot++) {
+      const base = procSlotOffset(slot) / 4;
+      if (Atomics.load(procTable, base + PROC_PID) !== pid) continue;
+      Atomics.store(procTable, base + PROC_PGID, pgid);
+      cpu2.setReg(0, 0n);
+      return;
+    }
+    cpu2.setReg(0, BigInt.asUintN(64, BigInt(-3)));
+  }
+  function handleGetpgid(cpu2) {
+    let pid = Number(BigInt.asIntN(32, cpu2.getReg(0)));
+    if (pid === 0) pid = myPid;
+    for (let slot = 0; slot < 64; slot++) {
+      const base = procSlotOffset(slot) / 4;
+      if (Atomics.load(procTable, base + PROC_PID) !== pid) continue;
+      cpu2.setReg(0, BigInt(Atomics.load(procTable, base + PROC_PGID)));
+      return;
+    }
+    cpu2.setReg(0, BigInt.asUintN(64, BigInt(-3)));
+  }
+  function handleFcntlLock(cpu2, view, cmd) {
+    const fd = Number(cpu2.getReg(0));
+    const flockAddr = Number(cpu2.getReg(2));
+    if (badGuestPtr(new Uint8Array(memory.buffer), flockAddr, 32)) {
+      cpu2.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+      return;
+    }
+    const flockPtr = flockAddr + GUEST_MEM_BASE;
+    const ltype = view.getInt16(flockPtr, true);
+    const whence = view.getInt16(flockPtr + 2, true);
+    const lstart = Number(view.getBigInt64(flockPtr + 8, true));
+    const len = Number(view.getBigInt64(flockPtr + 16, true));
+    const path = syscalls.fdPath(fd);
+    if (path === null) {
+      cpu2.setReg(0, 0n);
+      return;
+    }
+    let start = lstart;
+    if (whence === 1) start += syscalls.fdOffset(fd);
+    else if (whence === 2) start += syscalls.fdSize(fd);
+    if (start < 0) {
+      cpu2.setReg(0, BigInt.asUintN(64, BigInt(-22)));
+      return;
+    }
+    Atomics.store(myMailbox, MBOX_READY, 0);
+    self.postMessage({ type: "lock_req", path, cmd, ltype, start, len });
+    Atomics.wait(myMailbox, MBOX_READY, 0);
+    const r = Atomics.load(myMailbox, MBOX_VALUE0);
+    if (cmd === 5 || cmd === 12) {
+      const rtype = Atomics.load(myMailbox, MBOX_VALUE0 + 1);
+      view.setInt16(flockPtr, rtype, true);
+      if (rtype !== 2) {
+        const rpid = Atomics.load(myMailbox, MBOX_VALUE0 + 2);
+        const cstart = (Atomics.load(myMailbox, MBOX_VALUE0 + 3) >>> 0) + Atomics.load(myMailbox, MBOX_VALUE0 + 4) * 4294967296;
+        const clen = (Atomics.load(myMailbox, MBOX_VALUE0 + 5) >>> 0) + Atomics.load(myMailbox, MBOX_VALUE0 + 6) * 4294967296;
+        view.setInt16(flockPtr + 2, 0, true);
+        view.setBigInt64(flockPtr + 8, BigInt(cstart), true);
+        view.setBigInt64(flockPtr + 16, BigInt(clen), true);
+        view.setInt32(flockPtr + 24, rpid, true);
+      }
+      cpu2.setReg(0, 0n);
+      return;
+    }
+    cpu2.setReg(0, r < 0 ? BigInt.asUintN(64, BigInt(r)) : 0n);
   }
   function handleKernelPipeDup3(cpu2) {
     const oldFd = Number(cpu2.getReg(0));
@@ -10656,6 +8390,10 @@
   function handlePipe2(cpu2, view) {
     const pipefdAddr = Number(cpu2.getReg(0));
     const pipeIndex = allocPipeSlot();
+    if (pipeIndex < 0) {
+      cpu2.setReg(0, BigInt.asUintN(64, BigInt(-23)));
+      return;
+    }
     const ring = new PipeRing(kernelSAB, pipeRingOffset(pipeIndex), PIPE_RING_SIZE);
     ring.reset();
     const readFd = nextLocalFd++;
@@ -10685,8 +8423,16 @@
     if (nr === 63) {
       const buf = Number(cpu2.getReg(1));
       const count = Number(cpu2.getReg(2));
+      if (count > 0 && badGuestPtr(new Uint8Array(memory.buffer), buf, count)) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+        return;
+      }
       const dst = new Uint8Array(count);
-      const n = ring.read(dst);
+      const n = ring.read(dst, interruptibleWaiter);
+      if (n === -1) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-4)));
+        return;
+      }
       if (n > 0) {
         new Uint8Array(memory.buffer, buf + GUEST_MEM_BASE, n).set(dst.subarray(0, n));
       }
@@ -10696,10 +8442,31 @@
     if (nr === 64) {
       const buf = Number(cpu2.getReg(1));
       const count = Number(cpu2.getReg(2));
+      if (count > 0 && badGuestPtr(new Uint8Array(memory.buffer), buf, count)) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+        return;
+      }
       const src = new Uint8Array(memory.buffer, buf + GUEST_MEM_BASE, count);
-      const n = ring.write(src);
+      if (syscalls.isNonBlockingFd(fd)) {
+        const n2 = ring.write(src);
+        if (n2 === -1) {
+          cpu2.setReg(0, BigInt.asUintN(64, BigInt(-32)));
+          return;
+        }
+        if (n2 === 0 && count > 0) {
+          cpu2.setReg(0, BigInt.asUintN(64, BigInt(-11)));
+          return;
+        }
+        cpu2.setReg(0, BigInt(n2));
+        return;
+      }
+      const n = ring.writeAll(src, interruptibleWaiter);
       if (n === -1) {
         cpu2.setReg(0, BigInt.asUintN(64, BigInt(-32)));
+        return;
+      }
+      if (n === -2) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-4)));
         return;
       }
       cpu2.setReg(0, BigInt(n));
@@ -10710,10 +8477,21 @@
       const iovcnt = Number(cpu2.getReg(2));
       let totalWritten = 0;
       const bytes = new Uint8Array(memory.buffer);
+      if (iovcnt > 0 && badGuestPtr(bytes, iovAddr, iovcnt * 16)) {
+        cpu2.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+        return;
+      }
       for (let i = 0; i < iovcnt; i++) {
         const base = view.getBigUint64(iovAddr + i * 16 + GUEST_MEM_BASE, true);
         const len = view.getBigUint64(iovAddr + i * 16 + 8 + GUEST_MEM_BASE, true);
         if (len === 0n) continue;
+        if (badGuestPtr(bytes, Number(base), Number(len))) {
+          if (totalWritten === 0) {
+            cpu2.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+            return;
+          }
+          break;
+        }
         const src = bytes.subarray(Number(base) + GUEST_MEM_BASE, Number(base) + GUEST_MEM_BASE + Number(len));
         const n = ring.write(src);
         if (n === -1) {
@@ -10736,19 +8514,48 @@
       const ringI32 = new Int32Array(kernelSAB, stdinRingOffset(stdinRingIdx), 4);
       while (stdinRing.empty && !stdinRing.writerClosed) {
         const wp = Atomics.load(ringI32, 0);
-        Atomics.wait(ringI32, 0, wp);
-        const sigPending = Atomics.load(procTable, procSlotOffset(mySlot) / 4 + 6);
-        if (sigPending & SIG_INT) {
-          Atomics.and(procTable, procSlotOffset(mySlot) / 4 + 6, ~SIG_INT);
-          if (syscalls.hasSignalHandler(2)) {
-            syscalls.raiseSignal(2);
-            return;
-          }
-          postExit(130);
-          throw new Error("SIGINT");
-        }
+        const rem = syscalls.timerRemainingMs();
+        Atomics.wait(ringI32, 0, wp, rem > 0 ? Math.min(1e3, rem) : 1e3);
+        if (pollAndQueueSignals()) return;
       }
     }
+  }
+  function readGuestFile(path) {
+    const fdh = { fd: -1 };
+    handleBridgeCall("fs_open", { path, flags: 0, mode: 0 }, (r) => {
+      fdh.fd = r.ret ?? -1;
+    });
+    if (fdh.fd < 0) throw new Error(`readGuestFile: cannot open ${path} (ret ${fdh.fd})`);
+    const chunks = [];
+    let total = 0;
+    const CHUNK = 12288;
+    try {
+      for (; ; ) {
+        const h = { data: new Uint8Array(0) };
+        handleBridgeCall("fs_read", { fd: fdh.fd, count: CHUNK }, (r) => {
+          if (typeof r.data === "string" && r.data.length) {
+            const bin = atob(r.data);
+            const u = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+            h.data = u;
+          }
+        });
+        if (h.data.length === 0) break;
+        chunks.push(h.data);
+        total += h.data.length;
+        if (h.data.length < CHUNK) break;
+      }
+    } finally {
+      handleBridgeCall("fs_close", { fd: fdh.fd }, () => {
+      });
+    }
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      out.set(c, off);
+      off += c.length;
+    }
+    return out;
   }
   function handleBridgeCall(method, args, apply) {
     self.postMessage({ type: "bridge_call", id: 0, method, args });
@@ -10789,7 +8596,12 @@
       for (let i = 0; i < dataLen; i++) str += String.fromCharCode(dataBytes[i]);
       resp.data = btoa(str);
     }
-    apply(resp);
+    try {
+      apply(resp);
+    } catch (e) {
+      if (e instanceof RangeError) cpu.setReg(0, BigInt.asUintN(64, BigInt(-14)));
+      else throw e;
+    }
   }
   function readStdin(count) {
     if (!stdinRing) return null;
@@ -10816,12 +8628,23 @@
     self.postMessage({ type: "write", fd, data: data.slice() });
   }
   function postExit(code) {
+    if (threaded && clearChildTid) {
+      try {
+        const i32 = new Int32Array(memory.buffer);
+        const idx = clearChildTid + GUEST_MEM_BASE >> 2;
+        Atomics.store(i32, idx, 0);
+        Atomics.notify(i32, idx, Infinity);
+      } catch {
+      }
+      clearChildTid = 0;
+    }
     for (const [fd, info] of kernelPipes) {
       const ring = new PipeRing(kernelSAB, pipeRingOffset(info.pipeIndex), PIPE_RING_SIZE);
       if (info.mode === "write") ring.closeWriter();
       else ring.closeReader();
     }
     kernelPipes.clear();
-    self.postMessage({ type: "exit", pid: myPid, code });
+    const high = threaded ? Number(syscalls.getMmapBase()) + GUEST_MEM_BASE : 0;
+    self.postMessage({ type: "exit", pid: myPid, code, high });
   }
 })();

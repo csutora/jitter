@@ -14,6 +14,20 @@ ghostty/macos/GhosttyKit.xcframework/
 # Test artifacts
 tests/conformance/bin
 
+# Zig engine build cache + output (regenerable via `just build-engine`)
+engine/.zig-cache/
+engine/zig-out/
+engine/.claude/
+
+# Large external / regenerable assets (not source)
+Jitter/Jitter/Resources/ltp.tar
+tests/dynamic/alpine/
+tests/dynamic/rootfs/
+
+# editor / backup junk
+*.bak
+*.bak2
+
 # Node modules
 node_modules/
 

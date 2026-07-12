@@ -51,9 +51,18 @@ if (existsSync(busyboxPath)) {
   console.log('Note: assets/busybox-aarch64 not found — Boot Shell will not work');
 }
 
+// Copy zig translator.wasm if built — worker.js fetches it at startup
+const translatorPath = 'engine/zig-out/bin/translator.wasm';
+if (existsSync(translatorPath)) {
+  copyFileSync(translatorPath, 'dist/translator.wasm');
+  console.log('Copied translator.wasm to dist/');
+} else {
+  console.log('Note: engine/zig-out/bin/translator.wasm not found — zig translator disabled. run `just build-engine` first.');
+}
+
 const iosResources = 'Jitter/Jitter/Resources';
 if (existsSync(iosResources)) {
-  for (const f of ['index.html', 'worker.js', 'busybox-aarch64']) {
+  for (const f of ['index.html', 'worker.js', 'busybox-aarch64', 'translator.wasm']) {
     const src = `dist/${f}`;
     if (existsSync(src)) copyFileSync(src, `${iosResources}/${f}`);
   }

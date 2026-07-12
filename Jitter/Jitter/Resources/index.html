@@ -65,6 +65,8 @@ var PROC_TABLE_OFFSET = 0;
 var PROC_SLOT_SIZE = 64;
 var MAILBOX_OFFSET = 4096;
 var MAILBOX_SLOT_SIZE = 128;
+var PIPE_RING_OFFSET = 12288;
+var PIPE_RING_COUNT = 32;
 var PIPE_RING_SIZE = 16384;
 var STDIN_RING_OFFSET = 536576;
 var STDIN_RING_SIZE = 8192;
@@ -80,6 +82,8 @@ var PROC_EXIT_CODE = 4;
 var PROC_WAIT_FUTEX = 5;
 var PROC_SIGNAL = 6;
 var PROC_STDIN_RING = 7;
+var PROC_REPARENTED = 8;
+var PROC_TGID = 9;
 var SIG_INT = 1 << 2;
 var SIG_PIPE = 1 << 13;
 var SIG_CHLD = 1 << 17;
@@ -101,6 +105,9 @@ function procSlotOffset(slot) {
 }
 function mailboxSlotOffset(slot) {
   return MAILBOX_OFFSET + slot * MAILBOX_SLOT_SIZE;
+}
+function pipeRingOffset(pipeIndex) {
+  return PIPE_RING_OFFSET + pipeIndex * PIPE_RING_SIZE;
 }
 function stdinRingOffset(stdinIndex) {
   return STDIN_RING_OFFSET + stdinIndex * STDIN_RING_SIZE;
@@ -162,6 +169,29 @@ var PipeRing = class {
     Atomics.notify(this.i32, PIPE_WRITE_POS);
     return toWrite;
   }
+  /**
+   * Blocking write: keep writing `src` until it is fully in the ring, parking on reader progress
+   * (PIPE_READ_POS) whenever the ring is full. `waiter` is the interruptible park (same one the
+   * blocking read uses): it returns true if a signal interrupted the wait.
+   * Returns bytes written (== src.length on success); if nothing could be written it returns
+   * -1 (all readers closed -> EPIPE) or -2 (interrupted -> EINTR). A partial write that then hits
+   * reader-close/interrupt returns the partial count, per posix.
+   */
+  writeAll(src, waiter) {
+    let written = 0;
+    while (written < src.length) {
+      const n = this.write(src.subarray(written));
+      if (n === -1) return written > 0 ? written : -1;
+      written += n;
+      if (written >= src.length) break;
+      const rp = Atomics.load(this.i32, PIPE_READ_POS);
+      const wp = Atomics.load(this.i32, PIPE_WRITE_POS);
+      if (this.dataSize - 1 - (wp - rp) <= 0) {
+        if (waiter(this.i32, PIPE_READ_POS, rp)) return written > 0 ? written : -2;
+      }
+    }
+    return written;
+  }
   /** Decrement writer refcount. Last close triggers EOF for readers. */
   closeWriter() {
     const remaining = Atomics.sub(this.i32, PIPE_WRITER_CLOSED, 1) - 1;
@@ -178,11 +208,17 @@ var PipeRing = class {
   /**
    * Read data from the ring into dst. Returns the number of bytes read.
    * Returns 0 for EOF (writer closed and ring empty).
-   * Blocks via Atomics.wait() if the ring is empty and writer is still open.
+   * Returns -1 if `waiter` reported an interruption (EINTR — a pending signal).
+   * Blocks via Atomics.wait() (or `waiter`) if the ring is empty and writer is still open.
+   *
+   * `waiter`, when given, replaces the bare Atomics.wait: it parks on the passed futex and
+   * returns true if the wait should be abandoned because a signal is pending. this keeps the
+   * signal machinery in the Worker while letting the ring own the empty/EOF logic. without it
+   * the read blocks indefinitely, which is un-interruptible by anything but SIGKILL.
    *
    * IMPORTANT: Only call from a Worker thread (Atomics.wait blocks the thread).
    */
-  read(dst) {
+  read(dst, waiter) {
     while (true) {
       const wp = Atomics.load(this.i32, PIPE_WRITE_POS);
       const rp = Atomics.load(this.i32, PIPE_READ_POS);
@@ -202,7 +238,11 @@ var PipeRing = class {
       if (Atomics.load(this.i32, PIPE_WRITER_CLOSED) === 0) {
         return 0;
       }
-      Atomics.wait(this.i32, PIPE_WRITE_POS, wp);
+      if (waiter) {
+        if (waiter(this.i32, PIPE_WRITE_POS, wp)) return -1;
+      } else {
+        Atomics.wait(this.i32, PIPE_WRITE_POS, wp);
+      }
     }
   }
   /**
@@ -248,15 +288,44 @@ var PipeRing = class {
 };
 
 // src/kernel.ts
+var WORKER_CAP = 12;
+var POOL_MAX = 16;
+var POOL_IDLE_KEEP = 3;
+var IDLE_TRIM_MS = 3e3;
+var THREAD_REGS_BASE = 1610612736;
+var THREADED_MEM_PAGES = 24704;
 var Kernel = class {
   sab;
   procTable;
   globalState;
   workers = /* @__PURE__ */ new Map();
+  // threaded processes: the kernel (main thread) owns each thread-group's shared memory (only the main
+  // thread can allocate shared WebAssembly.Memory on WKWebView/JSC). keyed by tgid, freed when the
+  // group's last thread exits. `pendingPromotes` bridges the async first-thread handshake
+  // (clone_thread -> promote -> thread_go); `threadCounts` tracks live threads per group for cleanup.
+  sharedMems = /* @__PURE__ */ new Map();
+  threadCounts = /* @__PURE__ */ new Map();
+  threadedLeaders = /* @__PURE__ */ new Set();
+  // pids that own a thread-group's shared memory
+  // one parked shared memory kept for reuse by the next threaded process (avoids alloc/GC churn).
+  // `high` is the previous tenant's touched high-water, so the reuser only has to zero the stale span.
+  spareSharedMem = null;
+  pendingPromotes = /* @__PURE__ */ new Map();
   elfBytes;
   workerURL;
   onOutput;
   bridge;
+  zigTranslatorBytes;
+  zigTranslatorModule;
+  // idle Workers parked for reuse (see WORKER POOL). live Workers are in `this.workers`.
+  idleWorkers = [];
+  // POSIX advisory record locks (fcntl F_SETLK/F_GETLK/F_SETLKW). each process is its own Worker,
+  // so the lock authority must be central: this shared table is keyed by resolved file path. a
+  // range is [start, end); end === Infinity means "to EOF" (l_len 0). locks are owned by pid and
+  // released when the owner exits (handleExit) or explicitly unlocks.
+  recordLocks = /* @__PURE__ */ new Map();
+  // processes parked in F_SETLKW waiting for a conflicting lock to clear.
+  lockWaiters = [];
   // Stdin ring for the foreground process
   fgStdinRing = null;
   termCols = 80;
@@ -266,6 +335,14 @@ var Kernel = class {
     this.workerURL = config.workerURL;
     this.onOutput = config.onOutput;
     this.bridge = config.bridge;
+    this.zigTranslatorBytes = config.zigTranslatorBytes;
+    if (config.zigTranslatorBytes) {
+      try {
+        this.zigTranslatorModule = new WebAssembly.Module(new Uint8Array(config.zigTranslatorBytes));
+      } catch (e) {
+        console.error("[kernel] translator.wasm compile failed, falling back to per-worker bytes:", e);
+      }
+    }
     this.sab = new SharedArrayBuffer(KERNEL_SAB_SIZE);
     this.procTable = new Int32Array(this.sab);
     this.globalState = new Int32Array(this.sab, GLOBAL_STATE_OFFSET, 16);
@@ -273,6 +350,12 @@ var Kernel = class {
     Atomics.store(this.globalState, GLOBAL_NEXT_STDIN, 0);
     Atomics.store(this.globalState, GLOBAL_NEXT_PIPE, 0);
     Atomics.store(this.globalState, GLOBAL_FG_PGID, 1);
+    setInterval(() => this.trimIdle(), IDLE_TRIM_MS);
+  }
+  trimIdle() {
+    while (this.idleWorkers.length > POOL_IDLE_KEEP) {
+      this.idleWorkers.pop().terminate();
+    }
   }
   /** Boot the initial shell process (PID 1). */
   boot(argv = ["sh"], envp = ["HOME=/root", "TERM=xterm-256color", "PATH=/bin:/usr/bin", "PWD=/"]) {
@@ -338,7 +421,7 @@ var Kernel = class {
       const state = Atomics.load(this.procTable, procSlotOffset(slot) / 4 + PROC_STATE);
       if (state === PROC_EMPTY) return slot;
     }
-    throw new Error("Process table full (64 slots)");
+    return -1;
   }
   spawnProcess(opts) {
     const slot = opts.slot ?? this.findFreeSlot();
@@ -351,11 +434,24 @@ var Kernel = class {
     Atomics.store(this.procTable, slotBase + PROC_WAIT_FUTEX, 0);
     Atomics.store(this.procTable, slotBase + PROC_SIGNAL, 0);
     Atomics.store(this.procTable, slotBase + PROC_STDIN_RING, opts.stdinRing ?? -1);
-    const worker = new Worker(this.workerURL);
+    Atomics.store(this.procTable, slotBase + PROC_REPARENTED, 0);
+    Atomics.store(this.procTable, slotBase + PROC_TGID, opts.threadStart?.tgid ?? opts.pid);
+    const worker = this.idleWorkers.pop() ?? new Worker(this.workerURL);
     this.workers.set(opts.pid, worker);
     worker.onmessage = (e) => this.handleWorkerMessage(opts.pid, slot, e.data);
     worker.onerror = (e) => {
-      console.error(`[kernel] Worker ${opts.pid} error:`, e.message);
+      console.error(`[kernel] Worker ${opts.pid} error:`, e.message, e.filename, e.lineno);
+      const msg = `\r
+[kernel] worker ${opts.pid} crashed: ${e.message}\r
+`;
+      try {
+        this.onOutput(new TextEncoder().encode(msg));
+      } catch {
+      }
+      const base = procSlotOffset(slot) / 4;
+      if (Atomics.load(this.procTable, base + PROC_PID) === opts.pid && Atomics.load(this.procTable, base + PROC_STATE) === PROC_RUNNING) {
+        this.handleExit(opts.pid, slot, 134);
+      }
     };
     const config = {
       pid: opts.pid,
@@ -366,17 +462,142 @@ var Kernel = class {
       elfBytes: opts.elfBytes,
       argv: opts.argv,
       envp: opts.envp,
-      memoryBuffer: opts.memoryBuffer,
+      memSnapshot: opts.memSnapshot,
       syscallState: opts.syscallState,
       kernelPipesSnapshot: opts.kernelPipesSnapshot,
       termCols: this.termCols,
-      termRows: this.termRows
+      termRows: this.termRows,
+      // prefer the shared compiled module; only ship raw bytes if compilation failed above.
+      zigTranslatorModule: this.zigTranslatorModule,
+      zigTranslatorBytes: this.zigTranslatorModule ? void 0 : this.zigTranslatorBytes,
+      threadStart: opts.threadStart
     };
     const transferList = [];
-    if (config.memoryBuffer) {
-      transferList.push(config.memoryBuffer);
+    if (config.memSnapshot) {
+      transferList.push(config.memSnapshot.data);
     }
     worker.postMessage({ type: "init", config }, transferList);
+  }
+  // release a thread-group's shared memory. instead of dropping it (relying on GC, which lags under
+  // back-to-back threaded launches), park it as the single reusable spare so the next threaded process
+  // takes it over. if a spare is already parked (a second threaded group ran concurrently), drop this
+  // one for GC. `high` is the group's touched high-water so the reuser only zeros the stale span.
+  freeSharedMem(tgid, high = 0) {
+    const mem = this.sharedMems.get(tgid);
+    this.sharedMems.delete(tgid);
+    this.threadedLeaders.delete(tgid);
+    if (mem && !this.spareSharedMem) this.spareSharedMem = { mem, high };
+  }
+  // first pthread_create ('clone_thread'): create this process's shared memory (only the main thread
+  // can) and reserve the child's tid + reg-block slot, then hand the memory back to the caller via
+  // 'promote'. the caller copies its state into it and replies 'thread_go', at which point the memory
+  // holds the process state and we can safely spawn the thread-Worker (handleThreadGo).
+  handleCloneThreadPromote(parentPid, parentSlot) {
+    const worker = this.workers.get(parentPid);
+    if (!worker) return;
+    const slot = this.findFreeSlot();
+    if (slot < 0 || this.idleWorkers.length === 0 && this.workers.size >= POOL_MAX) {
+      worker.postMessage({ type: "clone_fail" });
+      return;
+    }
+    let memory;
+    let staleHigh = 0;
+    if (this.spareSharedMem) {
+      memory = this.spareSharedMem.mem;
+      staleHigh = this.spareSharedMem.high;
+      this.spareSharedMem = null;
+    } else {
+      try {
+        memory = new WebAssembly.Memory({ initial: THREADED_MEM_PAGES, maximum: THREADED_MEM_PAGES, shared: true });
+      } catch {
+        worker.postMessage({ type: "clone_fail" });
+        return;
+      }
+    }
+    const slotBase = procSlotOffset(slot) / 4;
+    Atomics.store(this.procTable, slotBase + PROC_STATE, PROC_RUNNING);
+    Atomics.store(this.procTable, slotBase + PROC_PID, -1);
+    const tid = this.allocPid();
+    const parentBase = procSlotOffset(parentSlot) / 4;
+    const pgid = Atomics.load(this.procTable, parentBase + PROC_PGID);
+    const tgid = Atomics.load(this.procTable, parentBase + PROC_PID);
+    const regBaseAddr = THREAD_REGS_BASE + slot * 1024;
+    this.sharedMems.set(tgid, memory);
+    this.threadCounts.set(tgid, 1);
+    this.threadedLeaders.add(tgid);
+    this.pendingPromotes.set(parentPid, { memory, tid, slot, regBaseAddr, tgid, pgid });
+    worker.postMessage({ type: "promote", sharedMemory: memory, tid, regBaseAddr, staleHigh });
+  }
+  // the promoted caller has copied its state into the shared memory and told us to go. spawn the
+  // thread-Worker on that memory at its reserved slot/reg-block.
+  handleThreadGo(parentPid, msg) {
+    const p = this.pendingPromotes.get(parentPid);
+    if (!p) return;
+    this.pendingPromotes.delete(parentPid);
+    this.threadCounts.set(p.tgid, (this.threadCounts.get(p.tgid) ?? 1) + 1);
+    this.spawnProcess({
+      pid: p.tid,
+      ppid: parentPid,
+      pgid: p.pgid,
+      slot: p.slot,
+      elfBytes: this.elfBytes,
+      argv: [],
+      envp: [],
+      threadStart: {
+        sharedMemory: p.memory,
+        startPC: msg.startPC,
+        childStack: msg.childStack,
+        tls: msg.tls,
+        tid: p.tid,
+        tgid: p.tgid,
+        regBaseAddr: p.regBaseAddr,
+        parentRegBase: msg.parentRegBase,
+        childTidPtr: msg.childTidPtr,
+        flags: msg.flags
+      }
+    });
+  }
+  // subsequent pthread_create ('spawn_thread'): the group's shared memory already exists (keyed by
+  // tgid), so reuse it. reply the tid (or -1 EAGAIN) to the caller via its mailbox.
+  handleSpawnThread(parentPid, parentSlot, msg) {
+    const mb = new Int32Array(this.sab, mailboxSlotOffset(parentSlot), MAILBOX_SLOT_SIZE / 4);
+    const memory = this.sharedMems.get(msg.tgid);
+    const slot = this.findFreeSlot();
+    if (!memory || slot < 0 || this.idleWorkers.length === 0 && this.workers.size >= POOL_MAX) {
+      Atomics.store(mb, MBOX_VALUE0, -1);
+      Atomics.store(mb, MBOX_READY, 1);
+      Atomics.notify(mb, MBOX_READY);
+      return;
+    }
+    const tid = this.allocPid();
+    const parentBase = procSlotOffset(parentSlot) / 4;
+    const pgid = Atomics.load(this.procTable, parentBase + PROC_PGID);
+    const regBaseAddr = THREAD_REGS_BASE + slot * 1024;
+    this.threadCounts.set(msg.tgid, (this.threadCounts.get(msg.tgid) ?? 1) + 1);
+    this.spawnProcess({
+      pid: tid,
+      ppid: parentPid,
+      pgid,
+      slot,
+      elfBytes: this.elfBytes,
+      argv: [],
+      envp: [],
+      threadStart: {
+        sharedMemory: memory,
+        startPC: msg.startPC,
+        childStack: msg.childStack,
+        tls: msg.tls,
+        tid,
+        tgid: msg.tgid,
+        regBaseAddr,
+        parentRegBase: msg.parentRegBase,
+        childTidPtr: msg.childTidPtr,
+        flags: msg.flags
+      }
+    });
+    Atomics.store(mb, MBOX_VALUE0, tid);
+    Atomics.store(mb, MBOX_READY, 1);
+    Atomics.notify(mb, MBOX_READY);
   }
   // ── Worker message handling ───────────────────────────────────────────────
   handleWorkerMessage(pid, slot, msg) {
@@ -385,13 +606,31 @@ var Kernel = class {
         this.handleFork(pid, slot, msg);
         break;
       case "exit":
-        this.handleExit(pid, slot, msg.code);
+        this.handleExit(pid, slot, msg.code, true, msg.high ?? 0);
+        break;
+      case "kill":
+        this.handleKillSignal(msg.pid, msg.sig);
         break;
       case "write":
         this.onOutput(msg.data);
         break;
       case "pipe_alloc":
         this.handlePipeAlloc(pid, slot);
+        break;
+      case "clone_thread":
+        this.handleCloneThreadPromote(pid, slot);
+        break;
+      case "thread_go":
+        this.handleThreadGo(pid, msg);
+        break;
+      case "spawn_thread":
+        this.handleSpawnThread(pid, slot, msg);
+        break;
+      case "lock_req":
+        this.handleLockReq(pid, slot, msg);
+        break;
+      case "lock_cancel":
+        this.cancelLockWaiter(pid);
         break;
       case "bridge_call":
         this.handleBridgeCall(pid, slot, msg);
@@ -402,9 +641,19 @@ var Kernel = class {
         console.warn(`[kernel] Unknown message from Worker ${pid}:`, msg);
     }
   }
+  replyForkEagain(parentSlot) {
+    const mb = new Int32Array(this.sab, mailboxSlotOffset(parentSlot), MAILBOX_SLOT_SIZE / 4);
+    Atomics.store(mb, MBOX_VALUE0, -11);
+    Atomics.store(mb, MBOX_READY, 1);
+    Atomics.notify(mb, MBOX_READY);
+  }
   handleFork(parentPid, parentSlot, msg) {
-    const childPid = this.allocPid();
     const childSlot = this.findFreeSlot();
+    if (childSlot < 0 || parentPid !== 1 && this.workers.size >= WORKER_CAP || this.idleWorkers.length === 0 && this.workers.size >= POOL_MAX) {
+      this.replyForkEagain(parentSlot);
+      return;
+    }
+    const childPid = this.allocPid();
     const parentBase = procSlotOffset(parentSlot) / 4;
     const parentStdin = Atomics.load(this.procTable, parentBase + PROC_STDIN_RING);
     this.spawnProcess({
@@ -416,7 +665,7 @@ var Kernel = class {
       elfBytes: this.elfBytes,
       argv: [],
       envp: [],
-      memoryBuffer: msg.memoryBuffer,
+      memSnapshot: msg.memSnapshot,
       syscallState: msg.syscallState,
       kernelPipesSnapshot: msg.kernelPipesSnapshot
     });
@@ -425,8 +674,61 @@ var Kernel = class {
     Atomics.store(mailbox, MBOX_READY, 1);
     Atomics.notify(mailbox, MBOX_READY);
   }
-  handleExit(pid, slot, code) {
+  // SIGKILL enforcement. a worker blocked in Atomics.wait (pipe read, bridge mailbox, ...)
+  // cannot observe a signal bit and self-terminate, so the kernel force-terminates it here.
+  // reuse the normal exit teardown (zombie + reap-wake) with a signalled exit status; the
+  // RUNNING guard makes a racing self-exit idempotent.
+  handleKillSignal(pid, sig) {
+    for (let s = 0; s < 64; s++) {
+      const base = procSlotOffset(s) / 4;
+      if (Atomics.load(this.procTable, base + PROC_PID) !== pid) continue;
+      if (Atomics.load(this.procTable, base + PROC_STATE) !== PROC_RUNNING) return;
+      this.handleExit(pid, s, 128 + sig);
+      return;
+    }
+  }
+  // `poolable` is true only for a clean self-exit (the worker posted 'exit' and its runLoop
+  // returned — it is now idle and reusable). a kill or crash leaves the Worker dead/mid-execution,
+  // so those pass false and the Worker is destroyed instead of pooled.
+  handleExit(pid, slot, code, poolable = false, threadedHigh = 0) {
     const slotBase = procSlotOffset(slot) / 4;
+    this.releaseLocksForPid(pid);
+    const tgid = Atomics.load(this.procTable, slotBase + PROC_TGID) || pid;
+    if (tgid !== pid) {
+      if (this.threadCounts.has(tgid)) {
+        const n = (this.threadCounts.get(tgid) ?? 1) - 1;
+        if (n <= 0) {
+          this.threadCounts.delete(tgid);
+          this.freeSharedMem(tgid, threadedHigh);
+        } else this.threadCounts.set(tgid, n);
+      }
+      const w = this.workers.get(pid);
+      if (w) {
+        this.workers.delete(pid);
+        w.terminate();
+      }
+      Atomics.store(this.procTable, slotBase + PROC_PID, 0);
+      Atomics.store(this.procTable, slotBase + PROC_STATE, PROC_EMPTY);
+      return;
+    }
+    if (this.sharedMems.has(pid)) {
+      for (let s = 0; s < 64; s++) {
+        const b = procSlotOffset(s) / 4;
+        const tp = Atomics.load(this.procTable, b + PROC_PID);
+        if (tp === pid || tp === 0) continue;
+        if (Atomics.load(this.procTable, b + PROC_TGID) !== pid) continue;
+        const tw = this.workers.get(tp);
+        if (tw) {
+          this.workers.delete(tp);
+          tw.terminate();
+        }
+        Atomics.store(this.procTable, b + PROC_PID, 0);
+        Atomics.store(this.procTable, b + PROC_STATE, PROC_EMPTY);
+      }
+      this.threadCounts.delete(pid);
+      this.freeSharedMem(pid, threadedHigh);
+      poolable = false;
+    }
     Atomics.store(this.procTable, slotBase + PROC_STATE, PROC_ZOMBIE);
     Atomics.store(this.procTable, slotBase + PROC_EXIT_CODE, code);
     Atomics.store(this.procTable, slotBase + PROC_WAIT_FUTEX, 1);
@@ -440,24 +742,193 @@ var Kernel = class {
         break;
       }
     }
+    for (let s = 0; s < 64; s++) {
+      const b = procSlotOffset(s) / 4;
+      if (Atomics.load(this.procTable, b + PROC_PID) === 0) continue;
+      if (Atomics.load(this.procTable, b + PROC_PPID) !== pid) continue;
+      Atomics.store(this.procTable, b + PROC_PPID, 1);
+      Atomics.store(this.procTable, b + PROC_REPARENTED, 1);
+      if (Atomics.load(this.procTable, b + PROC_STATE) === PROC_ZOMBIE) this.reapSlot(s);
+    }
     const worker = this.workers.get(pid);
     if (worker) {
-      worker.terminate();
       this.workers.delete(pid);
+      if (poolable) this.idleWorkers.push(worker);
+      else worker.terminate();
     }
     if (pid === 1) {
-      for (const [p, w] of this.workers) {
-        w.terminate();
-      }
+      for (const [p, w] of this.workers) w.terminate();
       this.workers.clear();
+      for (const w of this.idleWorkers) w.terminate();
+      this.idleWorkers.length = 0;
+      return;
     }
+    if (Atomics.load(this.procTable, slotBase + PROC_REPARENTED) === 1) this.reapSlot(slot);
+  }
+  // Free a proc-table slot outright (kernel-side reap of an orphan zombie). terminates any
+  // lingering worker for that pid, then clears the slot so fork() can reuse it.
+  reapSlot(slot) {
+    const base = procSlotOffset(slot) / 4;
+    const pid = Atomics.load(this.procTable, base + PROC_PID);
+    const w = this.workers.get(pid);
+    if (w) {
+      w.terminate();
+      this.workers.delete(pid);
+    }
+    Atomics.store(this.procTable, base + PROC_STATE, PROC_EMPTY);
+    Atomics.store(this.procTable, base + PROC_PID, 0);
+    Atomics.store(this.procTable, base + PROC_PPID, 0);
+    Atomics.store(this.procTable, base + PROC_REPARENTED, 0);
   }
   handlePipeAlloc(pid, slot) {
-    const pipeSlot = Atomics.add(this.globalState, GLOBAL_NEXT_PIPE, 1);
+    let pipeSlot = -1;
+    for (let i = 0; i < PIPE_RING_COUNT; i++) {
+      const ring = new PipeRing(this.sab, pipeRingOffset(i), PIPE_RING_SIZE);
+      if (ring.readerClosed && ring.writerClosed) {
+        ring.reset(1, 1);
+        pipeSlot = i;
+        break;
+      }
+    }
     const mailbox = new Int32Array(this.sab, mailboxSlotOffset(slot), MAILBOX_SLOT_SIZE / 4);
     Atomics.store(mailbox, MBOX_VALUE0, pipeSlot);
     Atomics.store(mailbox, MBOX_READY, 1);
     Atomics.notify(mailbox, MBOX_READY);
+  }
+  // ── fcntl advisory record locking ─────────────────────────────────────────
+  // reply words land in the mailbox starting at MBOX_VALUE0. for F_GETLK a conflict is reported
+  // as [0, type, pid, start_lo, start_hi, len_lo, len_hi]; for set/unlock it is [0] or [-errno].
+  lockReply(slot, words) {
+    const mb = new Int32Array(this.sab, mailboxSlotOffset(slot), MAILBOX_SLOT_SIZE / 4);
+    for (let i = 0; i < words.length; i++) Atomics.store(mb, MBOX_VALUE0 + i, words[i] | 0);
+    Atomics.store(mb, MBOX_READY, 1);
+    Atomics.notify(mb, MBOX_READY);
+  }
+  lockConflict(list, pid, wantWrite, start, end) {
+    return list.find((l) => l.pid !== pid && l.start < end && start < l.end && (wantWrite || l.write));
+  }
+  applyUnlock(path, pid, start, end) {
+    const list = this.recordLocks.get(path);
+    if (!list) return;
+    const out = [];
+    for (const l of list) {
+      if (l.pid !== pid || l.end <= start || end <= l.start) {
+        out.push(l);
+        continue;
+      }
+      if (l.start < start) out.push({ pid, write: l.write, start: l.start, end: start });
+      if (end < l.end) out.push({ pid, write: l.write, start: end, end: l.end });
+    }
+    if (out.length) this.recordLocks.set(path, out);
+    else this.recordLocks.delete(path);
+  }
+  applyLock(path, pid, write, start, end) {
+    this.applyUnlock(path, pid, start, end);
+    const list = this.recordLocks.get(path) ?? [];
+    list.push({ pid, write, start, end });
+    const mine = list.filter((l) => l.pid === pid && l.write === write).sort((a, b) => a.start - b.start);
+    const rest = list.filter((l) => !(l.pid === pid && l.write === write));
+    const merged = [];
+    for (const l of mine) {
+      const last = merged[merged.length - 1];
+      if (last && l.start <= last.end) last.end = Math.max(last.end, l.end);
+      else merged.push({ ...l });
+    }
+    this.recordLocks.set(path, [...rest, ...merged]);
+  }
+  handleLockReq(pid, slot, msg) {
+    const { path, cmd, ltype, start, len } = msg;
+    const end = len <= 0 ? Infinity : start + len;
+    const list = this.recordLocks.get(path) ?? [];
+    if (cmd === 5 || cmd === 12) {
+      const conflicts = list.filter((l) => l.pid !== pid && l.start < end && start < l.end && (ltype === 1 || l.write));
+      const c2 = conflicts.length ? conflicts.reduce((a, b) => b.start < a.start ? b : a) : void 0;
+      if (!c2) {
+        this.lockReply(slot, [0, 2]);
+        return;
+      }
+      const clen = c2.end === Infinity ? 0 : c2.end - c2.start;
+      this.lockReply(slot, [
+        0,
+        c2.write ? 1 : 0,
+        c2.pid,
+        c2.start >>> 0,
+        Math.floor(c2.start / 4294967296),
+        clen >>> 0,
+        Math.floor(clen / 4294967296)
+      ]);
+      return;
+    }
+    if (ltype === 2) {
+      this.applyUnlock(path, pid, start, end);
+      this.lockReply(slot, [0]);
+      this.retryLockWaiters(path);
+      return;
+    }
+    const c = this.lockConflict(list, pid, ltype === 1, start, end);
+    if (c) {
+      if (cmd === 7 || cmd === 14) {
+        if (this.wouldDeadlock(pid, path, ltype === 1, start, end)) {
+          this.lockReply(slot, [-35]);
+          return;
+        }
+        this.lockWaiters.push({ pid, slot, path, write: ltype === 1, start, end });
+        return;
+      }
+      this.lockReply(slot, [-11]);
+      return;
+    }
+    this.applyLock(path, pid, ltype === 1, start, end);
+    this.lockReply(slot, [0]);
+  }
+  // pids currently holding a lock that conflicts with the given request (its wait-for edges).
+  conflictingOwners(path, pid, write, start, end) {
+    const list = this.recordLocks.get(path) ?? [];
+    const owners = /* @__PURE__ */ new Set();
+    for (const l of list) if (l.pid !== pid && l.start < end && start < l.end && (write || l.write)) owners.add(l.pid);
+    return [...owners];
+  }
+  // would parking pid on this request close a cycle? walk the wait-for graph (pid waits for the
+  // lock owners, each blocked owner waits for its own conflict owners) and look for a path back.
+  wouldDeadlock(pid, path, write, start, end) {
+    const seen = /* @__PURE__ */ new Set();
+    const stack = this.conflictingOwners(path, pid, write, start, end);
+    while (stack.length) {
+      const o = stack.pop();
+      if (o === pid) return true;
+      if (seen.has(o)) continue;
+      seen.add(o);
+      const w = this.lockWaiters.find((x) => x.pid === o);
+      if (w) stack.push(...this.conflictingOwners(w.path, w.pid, w.write, w.start, w.end));
+    }
+    return false;
+  }
+  retryLockWaiters(path) {
+    for (let i = 0; i < this.lockWaiters.length; ) {
+      const w = this.lockWaiters[i];
+      if (w.path !== path) {
+        i++;
+        continue;
+      }
+      const list = this.recordLocks.get(w.path) ?? [];
+      if (!this.lockConflict(list, w.pid, w.write, w.start, w.end)) {
+        this.applyLock(w.path, w.pid, w.write, w.start, w.end);
+        this.lockReply(w.slot, [0]);
+        this.lockWaiters.splice(i, 1);
+      } else i++;
+    }
+  }
+  releaseLocksForPid(pid) {
+    for (const [path, list] of this.recordLocks) {
+      const kept = list.filter((l) => l.pid !== pid);
+      if (kept.length) this.recordLocks.set(path, kept);
+      else this.recordLocks.delete(path);
+    }
+    this.lockWaiters = this.lockWaiters.filter((w) => w.pid !== pid);
+    for (const p of /* @__PURE__ */ new Set([...this.recordLocks.keys()])) this.retryLockWaiters(p);
+  }
+  cancelLockWaiter(pid) {
+    this.lockWaiters = this.lockWaiters.filter((w) => w.pid !== pid);
   }
   handleBridgeCall(pid, slot, msg) {
     if (!this.bridge) {
@@ -467,13 +938,15 @@ var Kernel = class {
     const method = msg.method;
     this.bridge.call(method, msg.args).then((resp) => {
       const ret = resp.ret ?? 0;
-      const meta = [0, 0, 0, 0];
+      const meta = [0, 0, 0, 0, 0, 0];
       let rawData = null;
       if (method === "fs_stat" || method === "fs_fstat") {
         meta[0] = resp.mode ?? 0;
         meta[1] = resp.size ?? 0;
         meta[2] = resp.nlink ?? 0;
         meta[3] = resp.mtime ?? 0;
+        meta[4] = resp.uid ?? 0;
+        meta[5] = resp.gid ?? 0;
       } else if (method === "fs_readlink") {
         if (resp.target) {
           rawData = new TextEncoder().encode(resp.target);
@@ -486,6 +959,9 @@ var Kernel = class {
         rawData = Uint8Array.from(atob(resp.data), (c) => c.charCodeAt(0));
       }
       this.writeBridgeResponse(slot, ret, meta, rawData);
+    }).catch((err) => {
+      console.error(`[kernel] bridge call '${method}' failed:`, err);
+      this.writeBridgeResponse(slot, -5, [0, 0, 0, 0], null);
     });
   }
   writeBridgeResponse(slot, ret, meta, data) {
@@ -625,17 +1101,34 @@ function translateNewlines(data) {
   }
   return out;
 }
+var bootStarted = false;
 window.bootShell = async () => {
+  if (bootStarted) return;
+  bootStarted = true;
   const btn = document.getElementById("btn-shell");
-  btn.disabled = true;
-  btn.textContent = "Loading...";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Loading...";
+  }
+  let writeOutput = null;
+  const term = (s) => writeOutput?.(new TextEncoder().encode(s));
   try {
     const bridge = new NativeBridge();
     if (bridge.isNative) {
       console.log("[jitter] Native bridge detected \u2014 filesystem calls will route to Swift");
     }
+    writeOutput = bridge.isNative ? (data) => {
+      bridge.call("term_data", { data: uint8ToBase64(data) }).catch(() => {
+      });
+    } : makeBrowserSink();
+    term("[jitter] boot: output path up\r\n");
+    const statusBar = document.getElementById("status-bar");
+    statusBar.classList.add("active");
+    if (btn) btn.style.display = "none";
+    statusBar.textContent = "Booting...";
     let elfBytes;
     if (bridge.isNative) {
+      term("[jitter] boot: loading busybox...\r\n");
       const resp = await bridge.call("load_bundle_file", { name: "busybox-aarch64" });
       if (resp.error) throw new Error(`Failed to load busybox via bridge: ${resp.error}`);
       const binary = atob(resp.data);
@@ -646,32 +1139,35 @@ window.bootShell = async () => {
       if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
       elfBytes = new Uint8Array(await resp.arrayBuffer());
     }
-    const statusBar = document.getElementById("status-bar");
-    statusBar.classList.add("active");
-    btn.style.display = "none";
-    statusBar.textContent = "Booting...";
-    const writeOutput = bridge.isNative ? (data) => {
-      bridge.call("term_data", { data: uint8ToBase64(data) }).catch(() => {
-      });
-    } : makeBrowserSink();
+    term(`[jitter] boot: busybox loaded (${elfBytes.length} bytes)\r
+`);
     if (!self.crossOriginIsolated) {
       throw new Error(
         "crossOriginIsolated is false. Serve with COOP=same-origin and COEP=require-corp headers."
       );
     }
     statusBar.textContent = "Booting...";
+    term("[jitter] boot: fetching translator.wasm...\r\n");
+    let zigTranslatorBytes;
+    const tresp = await fetch("translator.wasm");
+    if (!tresp.ok) throw new Error(`translator.wasm fetch failed: HTTP ${tresp.status}`);
+    zigTranslatorBytes = await tresp.arrayBuffer();
+    term(`[jitter] boot: translator ready (${zigTranslatorBytes.byteLength} bytes)\r
+`);
+    const out = writeOutput;
     const kernel = new Kernel({
       elfBytes,
       workerURL: "worker.js",
       onOutput: (data) => {
-        writeOutput(appendScrollbackWipeAfterClear(translateNewlines(data)));
+        out(appendScrollbackWipeAfterClear(translateNewlines(data)));
       },
-      bridge: bridge.isNative ? bridge : void 0
+      bridge: bridge.isNative ? bridge : void 0,
+      zigTranslatorBytes
     });
     const feedStdin = (bytes) => {
       if (bytes.length === 1 && bytes[0] === 3) {
         kernel.sendInterrupt();
-        writeOutput(new Uint8Array([94, 67, 13, 10]));
+        out(new Uint8Array([94, 67, 13, 10]));
         return;
       }
       kernel.pushStdin(bytes);
@@ -688,6 +1184,7 @@ window.bootShell = async () => {
         kernel.setTermSize(cols, rows);
       }
     }
+    term("[jitter] boot: starting sh (if no prompt follows, the emulator/worker stalled)\r\n");
     kernel.boot(
       ["sh"],
       ["HOME=/root", "TERM=xterm-256color", "PATH=/bin", "PWD=/"]
@@ -695,10 +1192,16 @@ window.bootShell = async () => {
     statusBar.textContent = "Running";
   } catch (err) {
     console.error("Boot failed:", err);
+    term(`\r
+[jitter] boot failed: ${err?.message ?? err}\r
+${err?.stack ?? ""}\r
+`);
     const sb = document.getElementById("status-bar");
     if (sb) sb.textContent = `Boot failed: ${err.message}`;
-    btn.disabled = false;
-    btn.textContent = "Boot Shell";
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Boot Shell";
+    }
   }
 };
 if (window.webkit?.messageHandlers?.jitter) {
@@ -709,10 +1212,11 @@ if (window.webkit?.messageHandlers?.jitter) {
     if (el) el.style.display = "none";
   };
   for (const id of ["controls", "status-bar"]) hide(id);
-  window.addEventListener("DOMContentLoaded", () => {
+  if (document.readyState === "loading") {
+    window.addEventListener("DOMContentLoaded", () => window.bootShell?.(), { once: true });
+  } else {
     window.bootShell?.();
-  });
-  if (document.readyState !== "loading") window.bootShell?.();
+  }
 }
 </script>
 </body>

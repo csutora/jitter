@@ -33,19 +33,21 @@ final class TerminalUIView: UIView, UIKeyInput {
             return (head, anchor)
         }
 
+        // anchor/head columns are cell BOUNDARIES (0...cols), boundary b being the left edge of
+        // cell b. a cell is inside the selection when it sits between the two boundaries, so the
+        // end boundary is exclusive at the cell level.
         func contains(col: Int, row: Int) -> Bool {
             let (s, e) = normalized
             if row < s.row || row > e.row { return false }
-            if s.row == e.row { return col >= s.col && col <= e.col }
+            if s.row == e.row { return col >= s.col && col < e.col }
             if row == s.row { return col >= s.col }
-            if row == e.row { return col <= e.col }
+            if row == e.row { return col < e.col }
             return true
         }
     }
 
     private var selection: Selection?
     private let selectionBg = CellRGB(r: 60, g: 110, b: 200)
-    private var lastTouchDownPoint: CGPoint?
 
     var contentInsets: UIEdgeInsets = UIEdgeInsets(top: 8, left: 18, bottom: 8, right: 18) {
         didSet { setNeedsLayout(); setNeedsDisplay() }
@@ -88,22 +90,106 @@ final class TerminalUIView: UIView, UIKeyInput {
             self.renderState = rs
         }
 
+        // scroll is driven by a real UIScrollView layered over the terminal. it natively handles
+        // finger drag, trackpad / mouse-wheel / continuity-cursor scroll, and momentum — the exact
+        // "feels like any other view" behaviour that a custom pan gesture never reliably got for
+        // indirect (trackpad) input here. the content is empty and oversized; we never move it, we
+        // just translate the scroll offset's deltas into line-locked viewport scrolls.
+        scrollProxy.showsVerticalScrollIndicator = false
+        scrollProxy.showsHorizontalScrollIndicator = false
+        scrollProxy.backgroundColor = .clear
+        scrollProxy.isOpaque = false
+        scrollProxy.contentInsetAdjustmentBehavior = .never
+        scrollProxy.delaysContentTouches = false
+        scrollProxy.delegate = self
+        // the proxy's pan drives scrolling for FINGER drags only (plus indirect trackpad/wheel
+        // scroll events, which aren't touches and so aren't gated here). a pointer click-drag
+        // (.indirectPointer) is left for the selection gesture below, matching the platform
+        // convention: finger drags scroll, a cursor click-drag selects.
+        scrollProxy.panGestureRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        addSubview(scrollProxy)
+
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
         tap.cancelsTouchesInView = false
-        addGestureRecognizer(tap)
+        scrollProxy.addGestureRecognizer(tap)
 
-        let scroll = UIPanGestureRecognizer(target: self, action: #selector(handleScroll(_:)))
-        scroll.allowedScrollTypesMask = .all
-        scroll.maximumNumberOfTouches = 0
-        addGestureRecognizer(scroll)
+        // FINGER selection: press-and-hold then drag (disables scrolling while active so the drag
+        // extends the selection; a quick finger drag just scrolls).
+        let select = UILongPressGestureRecognizer(target: self, action: #selector(handleSelect(_:)))
+        select.minimumPressDuration = 0.35
+        select.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        scrollProxy.addGestureRecognizer(select)
 
-        let select = UIPanGestureRecognizer(target: self, action: #selector(handleSelect(_:)))
-        select.minimumNumberOfTouches = 1
-        select.maximumNumberOfTouches = 1
-        addGestureRecognizer(select)
+        // POINTER selection: a trackpad/mouse click-drag selects immediately (no hold needed). it
+        // only sees .indirectPointer touches, which the scroll pan ignores, so the two never fight.
+        let pointerSelect = DownLocationPan(target: self, action: #selector(handlePointerSelect(_:)))
+        pointerSelect.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        scrollProxy.addGestureRecognizer(pointerSelect)
     }
 
+    // map a point to the nearest cell BOUNDARY column (round, not truncate) so a cell is grabbed
+    // once the cursor passes its midpoint — no need to click pixel-perfectly at a cell's edge. the
+    // column ranges 0...cols (cols = right edge of the last cell); the row is the containing cell.
+    private func selBoundary(point p: CGPoint) -> (col: Int, row: Int) {
+        let inner = bounds.inset(by: effectiveInsets())
+        let col = max(0, min(lastReportedCols, Int(((p.x - inner.minX) / cellSize.width).rounded())))
+        let row = max(0, min(lastReportedRows - 1, Int((p.y - inner.minY) / cellSize.height)))
+        return (col, viewportTop + row) // absolute row (survives scroll/output)
+    }
+
+    // capture the absolute viewport top at the start of a selection so its coordinates are absolute
+    // from the first point (draw() only refreshes viewportTop once a selection exists).
+    private func beginSelectionCoords() { viewportTop = terminal?.scrollbar()?.offset ?? 0 }
+
+    @objc private func handlePointerSelect(_ g: DownLocationPan) {
+        let p = g.location(in: self)
+        switch g.state {
+        case .began:
+            beginSelectionCoords()
+            // anchor at the true click point (captured at touch-down), not wherever the pointer had
+            // already drifted to by the time the pan began.
+            let start = g.downLocation ?? p
+            selection = Selection(anchor: selBoundary(point: start), head: selBoundary(point: p))
+            setNeedsDisplay()
+        case .changed:
+            selection?.head = selBoundary(point: p)
+            setNeedsDisplay()
+        default:
+            break
+        }
+    }
+
+    // ── scrolling (UIScrollView-driven, line-locked) ─────────────────────────
+    private let scrollProxy = UIScrollView()
+    private let scrollCenter: CGFloat = 100_000_000 // oversized so the offset never reaches an edge
+    private var lastScrollY: CGFloat = 0
     private var scrollAccum: CGFloat = 0
+    private var isSelecting = false
+    private var suppressScrollMap = false
+    // the absolute row index of the top visible row within the full scrollback (ghostty's scrollbar
+    // offset), refreshed every draw. the selection is stored in these ABSOLUTE coordinates, so it
+    // stays pinned to its content as the viewport scrolls or new output arrives — no delta tracking
+    // to drift. converted back to a screen row (absolute - viewportTop) at render/copy time.
+    private var viewportTop = 0
+
+    private func layoutScrollProxy() {
+        scrollProxy.frame = bounds
+        let h = bounds.height + 2 * scrollCenter
+        if scrollProxy.contentSize.height != h {
+            scrollProxy.contentSize = CGSize(width: bounds.width, height: h)
+            recenterScroll()
+        }
+    }
+
+    // park the offset in the middle of the huge content so it can be dragged either way ~forever;
+    // we only ever read deltas, never the absolute position.
+    private func recenterScroll() {
+        suppressScrollMap = true
+        scrollProxy.contentOffset = CGPoint(x: 0, y: scrollCenter)
+        lastScrollY = scrollCenter
+        scrollAccum = 0
+        suppressScrollMap = false
+    }
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
 
@@ -120,59 +206,35 @@ final class TerminalUIView: UIView, UIKeyInput {
         if !isFirstResponder { becomeFirstResponder() }
     }
 
-    @objc private func handleScroll(_ g: UIPanGestureRecognizer) {
-        switch g.state {
-        case .began:
-            scrollAccum = 0
-            if selection != nil { selection = nil }
-        case .changed:
-            let t = g.translation(in: self)
-            g.setTranslation(.zero, in: self)
-            scrollAccum += t.y
-            let lines = Int((scrollAccum / cellSize.height).rounded(.towardZero))
-            if lines != 0 {
-                scrollAccum -= CGFloat(lines) * cellSize.height
-                terminal?.scrollViewport(delta: -lines)
-                setNeedsDisplay()
-            }
-        default:
-            break
-        }
-    }
 
-    private func cellAt(point p: CGPoint) -> (col: Int, row: Int) {
-        let inner = bounds.inset(by: effectiveInsets())
-        let col = max(0, min(lastReportedCols - 1, Int((p.x - inner.minX) / cellSize.width)))
-        let row = max(0, min(lastReportedRows - 1, Int((p.y - inner.minY) / cellSize.height)))
-        return (col, row)
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        super.touchesBegan(touches, with: event)
-        if let t = touches.first {
-            lastTouchDownPoint = t.location(in: self)
-        }
-    }
-
-    @objc private func handleSelect(_ g: UIPanGestureRecognizer) {
+    @objc private func handleSelect(_ g: UILongPressGestureRecognizer) {
         let p = g.location(in: self)
         switch g.state {
         case .began:
-            let start = lastTouchDownPoint ?? p
-            selection = Selection(anchor: cellAt(point: start), head: cellAt(point: p))
+            isSelecting = true
+            scrollProxy.isScrollEnabled = false // don't scroll while extending a selection
+            beginSelectionCoords()
+            selection = Selection(anchor: selBoundary(point: p), head: selBoundary(point: p))
+            setNeedsDisplay()
         case .changed:
-            selection?.head = cellAt(point: p)
+            selection?.head = selBoundary(point: p)
+            setNeedsDisplay()
+        case .ended, .cancelled, .failed:
+            isSelecting = false
+            scrollProxy.isScrollEnabled = true
+            recenterScroll()
         default:
             break
         }
-        setNeedsDisplay()
     }
 
     override var canBecomeFirstResponder: Bool { true }
 
     private func snapViewportToBottom() {
+        // the selection is stored in absolute scrollback coordinates, so it stays pinned to its
+        // content across the jump — nothing to adjust here.
         terminal?.scrollViewportToBottom()
-        scrollAccum = 0
+        recenterScroll()
     }
 
     // MARK: UIKeyInput
@@ -218,19 +280,26 @@ final class TerminalUIView: UIView, UIKeyInput {
         guard let sel = selection, let renderState, let terminal else { return }
         guard renderState.update(from: terminal) else { return }
         let (start, end) = sel.normalized
+        // selection rows are absolute; map each visible row to its absolute index via the viewport
+        // top. (only copies the on-screen portion of a selection — a scrollback-spanning copy is a
+        // separate feature.)
+        let top = terminal.scrollbar()?.offset ?? viewportTop
         var lines: [String] = []
-        var rowIdx = 0
         renderState.forEachRow { y, row in
-            defer { rowIdx += 1 }
-            if y < start.row || y > end.row { return }
-            let startCol = (y == start.row) ? start.col : 0
-            let endColInclusive = (y == end.row) ? end.col : row.count - 1
+            let absY = top + y
+            if absY < start.row || absY > end.row { return }
+            let startCol = (absY == start.row) ? start.col : 0
+            // end column is a boundary (exclusive at the cell level); a non-end row runs to the
+            // line end.
+            let endColExcl = (absY == end.row) ? end.col : row.count
             var line = ""
-            for x in startCol...min(endColInclusive, row.count - 1) {
+            var x = startCol
+            while x < min(endColExcl, row.count) {
                 for cp in row[x].codepoints {
                     if let s = Unicode.Scalar(cp) { line.append(Character(s)) }
                 }
                 if row[x].codepoints.isEmpty { line.append(" ") }
+                x += 1
             }
             while line.hasSuffix(" ") { line.removeLast() }
             lines.append(line)
@@ -288,6 +357,7 @@ final class TerminalUIView: UIView, UIKeyInput {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        layoutScrollProxy()
         guard let terminal else { return }
         let inner = bounds.inset(by: effectiveInsets())
         let cols = max(1, Int(inner.width / cellSize.width))
@@ -332,6 +402,9 @@ final class TerminalUIView: UIView, UIKeyInput {
               let terminal,
               let renderState else { return }
         guard renderState.update(from: terminal) else { return }
+        // absolute row of the top visible line; the selection is stored in absolute coords and this
+        // maps them to screen rows. only queried when there's a live selection (it can be costly).
+        viewportTop = (selection != nil ? terminal.scrollbar()?.offset : 0) ?? 0
 
         let cellW = cellSize.width
         let cellH = cellSize.height
@@ -419,7 +492,7 @@ final class TerminalUIView: UIView, UIKeyInput {
     }
 
     private func effectiveBg(_ cell: Cell, x: Int, y: Int, cur: CursorInfo?, blockCursorActive: Bool, cursorColor: CellRGB, defaultBg: CellRGB) -> CellRGB {
-        if let sel = selection, sel.contains(col: x, row: y) { return selectionBg }
+        if let sel = selection, sel.contains(col: x, row: viewportTop + y) { return selectionBg }
         if blockCursorActive, let cur, cur.x == x, cur.y == y { return cursorColor }
         return cell.style.inverse ? cell.fg : cell.bg
     }
@@ -458,5 +531,49 @@ final class TerminalUIView: UIView, UIKeyInput {
         let line = CTLineCreateWithAttributedString(attributed)
         ctx.textPosition = origin
         CTLineDraw(line, ctx)
+    }
+}
+
+// a pan that remembers where the touch actually went down. UIPanGestureRecognizer only begins
+// after some movement, and its translation at .began can be ~0, so `location - translation` does
+// NOT reliably recover the click point — the selection anchor would land wherever the pointer had
+// already drifted to. capturing the down location in touchesBegan fixes the selection start.
+final class DownLocationPan: UIPanGestureRecognizer {
+    var downLocation: CGPoint?
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        // capture in the proxy's SUPERVIEW (the terminal), not the proxy itself: the proxy is a
+        // UIScrollView whose bounds origin is its (huge, recentered) contentOffset, so a location
+        // in its own space is offset by ~100M points. the handler reads location(in: terminal),
+        // so match that space here.
+        if downLocation == nil, let t = touches.first {
+            downLocation = t.location(in: view?.superview)
+        }
+        super.touchesBegan(touches, with: event)
+    }
+    override func reset() {
+        super.reset()
+        downLocation = nil
+    }
+}
+
+extension TerminalUIView: UIScrollViewDelegate {
+    // translate the scroll proxy's offset deltas into line-locked viewport scrolls. offset
+    // increasing (dragging toward the bottom of content) reveals newer output -> positive delta;
+    // decreasing reveals older -> negative. we never move the (empty) content, only read deltas.
+    // the selection is pinned to absolute scrollback coords, so it needs no adjustment here — the
+    // renderer maps it to screen rows each frame via the viewport offset.
+    func scrollViewDidScroll(_ sv: UIScrollView) {
+        if suppressScrollMap || isSelecting { return }
+        let delta = sv.contentOffset.y - lastScrollY
+        lastScrollY = sv.contentOffset.y
+        scrollAccum += delta
+        let lines = Int((scrollAccum / cellSize.height).rounded(.towardZero))
+        if lines != 0 {
+            scrollAccum -= CGFloat(lines) * cellSize.height
+            terminal?.scrollViewport(delta: lines)
+            setNeedsDisplay()
+        }
+        // never let the offset drift near the oversized content's edge over a very long session.
+        if abs(sv.contentOffset.y - scrollCenter) > scrollCenter * 0.9 { recenterScroll() }
     }
 }

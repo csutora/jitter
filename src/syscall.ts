@@ -12,6 +12,17 @@ export type SyscallResult =
   | { status: 'execve'; path: string; argv: string[]; envp: string[] }
   | { status: 'bridge'; method: string; args: Record<string, any>; apply: (resp: any) => void };
 
+// base64-encode bytes for the bridge. must chunk: btoa(String.fromCharCode(...data))
+// spreads the whole buffer as call args and blows the stack on large writes (tar extract).
+function bytesToBase64(data: Uint8Array): string {
+  const chunk = 0x8000;
+  let s = '';
+  for (let i = 0; i < data.length; i += chunk) {
+    s += String.fromCharCode.apply(null, data.subarray(i, i + chunk) as unknown as number[]);
+  }
+  return btoa(s);
+}
+
 // ── Error constants ─────────────────────────────────────────────────────────
 
 const ENOSYS = 38;
@@ -19,11 +30,22 @@ const EBADF  = 9;
 const EINVAL = 22;
 const ENOENT = 2;
 const EPERM  = 1;
+const EMFILE = 24;
 const ENOTDIR = 20;
 const ECHILD = 10;
 const ESPIPE = 29;
 const EAGAIN = 11;
+const EFAULT = 14;
+const EACCES = 13;
+const ENOMEM = 12;
 const MAX_FDS = 1024;
+
+// per-process address-space ceiling (RLIMIT_AS-ish). a mmap/brk growth past this returns ENOMEM
+// to the guest (malloc -> NULL) instead of growing the wasm memory toward the device jetsam limit
+// and taking the whole WKWebView content process down. one process can't alone blow the budget;
+// it fails gracefully like real linux under a cgroup/ulimit. (the global cross-process budget is
+// enforced separately in the kernel.) generous enough that real programs never see it.
+const MAX_PROCESS_BYTES = 1610612736; // 1.5 GiB
 
 const O_NONBLOCK = 0o4000;
 
@@ -73,6 +95,7 @@ export interface VFS {
   open(path: string, flags: number, mode: number): number;
   close(fd: number): number;
   dup(fd: number): number;
+  dupTo(oldFd: number, newFd: number): number;
   hasFd(fd: number): boolean;
   read(fd: number, buf: number, count: number, memory: DataView): number;
   write(fd: number, buf: number, count: number, memory: DataView): number;
@@ -82,6 +105,8 @@ export interface VFS {
   faccessat(dirfd: number, path: string, mode: number, flags: number): number;
   fchmod(fd: number, mode: number): number;
   fchown(fd: number, uid: number, gid: number): number;
+  chmodPath(path: string, mode: number): number;
+  chownPath(path: string, uid: number, gid: number): number;
   ftruncate(fd: number, length: number): number;
   getcwd(): string;
   setCwd(path: string): void;
@@ -97,6 +122,8 @@ export interface VFS {
   restoreFds(snap: Map<number, any>): void;
   closeAllExcept(...keep: number[]): void;
   loadBinary(data: Uint8Array): void;
+  fdAllocator: (() => number) | null;
+  credsProvider: (() => { ruid: number; euid: number; rgid: number; egid: number }) | null;
 }
 
 // ── I/O interface for terminal ──────────────────────────────────────────────
@@ -136,12 +163,76 @@ type FdEntry =
 
 export class SyscallHandler {
   private brk: bigint;
-  private mmapBase = 0x2000000n; // mmap region starts at 32MB
+  // the exclusive-monitor shadow lives at ZIG_SHADOW_BASE (32MB) and is tiny
+  // (1 byte per 512 guest bytes, so <=256KB for a 128MB guest). reserve [32MB,33MB)
+  // for it and start the mmap arena above, so mmap'd shared libraries (ld.so mmaps
+  // libc.so.6) don't collide with the shadow. mmap grows up toward the shadow_base
+  // ceiling of the top-of-memory shadow... here shadow is low, so cap mmap well above.
+  private mmapBase = 0x2100000n; // 33MB — just above the 1MB shadow reservation
+  // brk/mmap ceiling. a threaded process uses a lower ceiling (its shared memory places the per-thread
+  // register blocks + atomics shadow just above this, and the shared reservation is bounded so several
+  // threaded processes can coexist). single-threaded processes keep the full 1.5 GiB.
+  maxBytes = MAX_PROCESS_BYTES;
+  // MAP_SHARED regions (guest offsets). shared across fork: a child's writes to these
+  // must survive the parent-memory restore in the serialized fork model.
+  private sharedRegions: Array<{ addr: number; len: number }> = [];
+  // guest ranges mapped PROT_NONE (inaccessible). a user pointer landing here faults with
+  // EFAULT, which is how LTP's tst_get_bad_addr() probes are built.
+  private protNone: Array<{ start: number; end: number }> = [];
   private cwd = '/';
   private tpidr = 0n;
   private umask = 0o022;
   private fdCloexec = new Set<number>();
   private fdSig = new Map<number, number>();
+  // nanosecond clock. Date.now() is millisecond-resolution; performance.now() gives sub-ms
+  // where the host allows it (browsers/WKWebView clamp it to ~1ms for spectre mitigation,
+  // which is fine). posix only requires CLOCK_MONOTONIC to be non-decreasing, not strictly
+  // increasing, so we allow equal consecutive reads and clamp only to defend against the
+  // clock actually running backwards (performance.now() shouldn't, but Date.now() can under
+  // ntp/settimeofday). no artificial per-read increment: that would distort measured
+  // elapsed time under tight loops, which is the one thing a clock must get right.
+  private clkHasPerf = typeof performance !== 'undefined';
+  private clkPerfBase = this.clkHasPerf ? performance.now() : Date.now();
+  private clkRealBaseNs = BigInt(Date.now()) * 1_000_000n;
+  private clkLastMonoNs = 0n;
+  private monoNs(): bigint {
+    const elapsedMs = (this.clkHasPerf ? performance.now() : Date.now()) - this.clkPerfBase;
+    let ns = BigInt(Math.round(elapsedMs * 1_000_000));
+    if (ns < this.clkLastMonoNs) ns = this.clkLastMonoNs; // never go backwards
+    else this.clkLastMonoNs = ns;
+    return ns;
+  }
+  clockNs(clkId: number): bigint {
+    // CLOCK_MONOTONIC(1)/RAW(4)/BOOTTIME(7) + cputime clocks -> since construction;
+    // CLOCK_REALTIME(0) and everything else -> wall clock
+    const mono = this.monoNs();
+    if (clkId === 1 || clkId === 4 || clkId === 7 || clkId === 2 || clkId === 3) return mono;
+    return this.clkRealBaseNs + mono;
+  }
+  // ITIMER_REAL: monotonic ms deadline at which SIGALRM fires, 0 = disarmed. interval is
+  // the auto-rearm period (0 = one-shot). used by alarm()/setitimer() and by busybox
+  // timeout, which is how the ltp driver bounds each test. checked by the exec loops via
+  // checkTimers() so it fires even in a syscall-less spin.
+  private itimerRealDeadlineMs = 0;
+  private itimerRealIntervalMs = 0;
+  // RLIMIT_NOFILE soft limit: the highest fd number a process may allocate. set via
+  // prlimit64/setrlimit; enforced at fd-allocating syscalls (open/dup/...) -> EMFILE.
+  private nofileLimit = 1024;
+  private nowMs(): bigint { return this.monoNs() / 1_000_000n; }
+  /** raise SIGALRM if the real interval timer has expired; rearm or disarm. returns true if it fired. */
+  checkTimers(): boolean {
+    if (this.itimerRealDeadlineMs === 0) return false;
+    if (Number(this.nowMs()) < this.itimerRealDeadlineMs) return false;
+    this.raiseSignal(SIGALRM);
+    if (this.itimerRealIntervalMs > 0) this.itimerRealDeadlineMs += this.itimerRealIntervalMs;
+    else this.itimerRealDeadlineMs = 0;
+    return true;
+  }
+  /** ms until the real timer fires, or 0 if disarmed (for getitimer / wait timeouts). */
+  timerRemainingMs(): number {
+    if (this.itimerRealDeadlineMs === 0) return 0;
+    return Math.max(0, this.itimerRealDeadlineMs - Number(this.nowMs()));
+  }
   pendingSignals: number[] = [];  // queue of signals to deliver
   private epollSets?: Map<number, Map<number, { events: number; data: bigint }>>;
   private signalHandlers?: Map<number, { handler: bigint; flags: bigint; restorer: bigint; mask: bigint }>;
@@ -150,6 +241,18 @@ export class SyscallHandler {
   bridgeAvailable = false;
   currentPid = 1;
   currentPpid = 0;
+  /** thread-group id: 0 for a normal process (getpid == currentPid); for a thread it's the
+   * process pid so getpid()==tgid while gettid()==currentPid(==tid). */
+  tgid = 0;
+
+  /** mark this handler as belonging to a thread: gettid returns `tid`, getpid returns `tgid`. */
+  setThreadIds(tid: number, tgid: number): void {
+    this.currentPid = tid;
+    this.tgid = tgid;
+  }
+  // process credentials. real/effective/saved uid+gid. start as root (0).
+  private ruid = 0; private euid = 0; private suid = 0;
+  private rgid = 0; private egid = 0; private sgid = 0;
   private termCols = 80;
   private termRows = 24;
   private vfs?: VFS;
@@ -158,10 +261,9 @@ export class SyscallHandler {
   private fdFlags = new Map<number, number>(); // fd -> flags
   private fdTable = new Map<number, FdEntry>(); // unified fd table
   private nativeRefs = new Map<number, number>(); // nativeFd -> refcount
-  private nextFd = 3; // next available fd (0-2 are stdio)
   // Stat cache: populated from getdents, consumed by fs_stat. Avoids N+1 bridge calls for ls -l.
   // Path → {mode, size, nlink, mtime, expiresAt (ms since epoch)}
-  private statCache = new Map<string, { mode: number; size: number; nlink: number; mtime: number; expiresAt: number }>();
+  private statCache = new Map<string, { mode: number; size: number; nlink: number; mtime: number; uid: number; gid: number; expiresAt: number }>();
   private readonly STAT_CACHE_TTL_MS = 1000;
   lastWaitStatus?: number;  // exit code from last child (set by dispatch loop)
   lastWaitPid?: number;     // PID of last exited child
@@ -179,6 +281,10 @@ export class SyscallHandler {
     this.fdTable.set(0, { type: 'stdio', fd: 0 });
     this.fdTable.set(1, { type: 'stdio', fd: 1 });
     this.fdTable.set(2, { type: 'stdio', fd: 2 });
+    if (this.vfs) {
+      this.vfs.fdAllocator = () => this.allocFd();
+      this.vfs.credsProvider = () => ({ ruid: this.ruid, euid: this.euid, rgid: this.rgid, egid: this.egid });
+    }
   }
 
   /**
@@ -211,6 +317,24 @@ export class SyscallHandler {
     }
     // Everything else → Swift NativeFS
     return resolved;
+  }
+
+  // resolve a (possibly relative) path to a normalized absolute path against the current cwd.
+  // used for execve so the worker reads the binary from the right place (a bare "./prog" must
+  // become "/cwd/prog"), matching how the kernel resolves the exec pathname.
+  private absolutizePath(path: string): string {
+    let resolved = path;
+    if (!path.startsWith('/')) {
+      const cwd = this.vfs?.getcwd() ?? this.cwd;
+      resolved = cwd === '/' ? '/' + path : cwd + '/' + path;
+    }
+    const parts: string[] = [];
+    for (const p of resolved.split('/')) {
+      if (p === '' || p === '.') continue;
+      if (p === '..') { parts.pop(); continue; }
+      parts.push(p);
+    }
+    return '/' + parts.join('/');
   }
 
   setTermSize(cols: number, rows: number): void {
@@ -274,6 +398,16 @@ export class SyscallHandler {
     view.setBigUint64(frameBase + 256, cpu.getPC(), true);     // saved PC (return address)
     view.setBigUint64(frameBase + 264, cpu.getNZCV(), true);   // saved NZCV
     view.setUint32(frameBase + 272, signum, true);              // signal number
+    view.setBigUint64(frameBase + 280, this.signalMask ?? 0n, true); // saved signal mask
+
+    // block this signal (plus the handler's sa_mask) for the duration of the handler unless
+    // SA_NODEFER — this is what stops a repeated signal (e.g. tst_test's SIGUSR1 heartbeat) from
+    // re-entering its own handler and never returning to the interrupted syscall. restored by
+    // rt_sigreturn.
+    const flags = handler?.flags ?? 0n;
+    let newMask = (this.signalMask ?? 0n) | (handler?.mask ?? 0n);
+    if ((flags & 0x40000000n) === 0n) newMask |= (1n << BigInt(signum - 1)); // SA_NODEFER
+    this.signalMask = newMask;
 
     // Set up for signal handler execution
     cpu.setSP(frameSP);
@@ -297,6 +431,7 @@ export class SyscallHandler {
     const savedSP = view.getBigUint64(frameBase + 248, true);
     const savedPC = view.getBigUint64(frameBase + 256, true);
     const savedNZCV = view.getBigUint64(frameBase + 264, true);
+    this.signalMask = view.getBigUint64(frameBase + 280, true); // restore pre-handler mask
 
     cpu.setSP(savedSP);
     cpu.setNZCV(savedNZCV);
@@ -307,6 +442,17 @@ export class SyscallHandler {
   /** Queue a signal for delivery. */
   raiseSignal(signum: number): void {
     this.pendingSignals.push(signum);
+  }
+
+  /** True if any queued signal has an SA_RESTART handler — the interrupted restartable syscall
+   *  (wait4, blocking read) should then be re-executed instead of returning EINTR. */
+  anyPendingRestart(): boolean {
+    if (!this.signalHandlers) return false;
+    for (const sig of this.pendingSignals) {
+      const h = this.signalHandlers.get(sig);
+      if (h && h.handler !== SIG_DFL && h.handler !== SIG_IGN && (h.flags & 0x10000000n) !== 0n) return true; // SA_RESTART
+    }
+    return false;
   }
 
   /** Check if a custom signal handler is installed (not SIG_DFL or SIG_IGN). */
@@ -375,7 +521,32 @@ export class SyscallHandler {
   /** Register an fd entry directly (used by Worker for kernel pipe fds). */
   registerFd(fd: number, entry: FdEntry): void {
     this.fdTable.set(fd, entry);
-    if (fd >= this.nextFd) this.nextFd = fd + 1;
+  }
+
+  // the resolved path backing a native fd, used as the key for cross-process record locks. a
+  // non-native fd (pipe, vfs) returns null: those have no on-disk identity to lock against.
+  fdPath(fd: number): string | null {
+    const e = this.fdTable.get(fd);
+    return e && e.type === 'native' ? e.path : null;
+  }
+
+  // fd offset / file size for resolving SEEK_CUR / SEEK_END lock ranges. native fds keep their
+  // offset and size on the Swift side, so these are best-effort (0) until a bridge query is added;
+  // SEEK_SET locks (the common case) are unaffected.
+  fdOffset(_fd: number): number { return 0; }
+  fdSize(_fd: number): number { return 0; }
+
+  /** Set process identity (used when a fork continues as the child). */
+  setIdentity(pid: number, ppid: number): void {
+    this.currentPid = pid;
+    this.currentPpid = ppid;
+  }
+
+  // the current process credentials, threaded into NativeFS path-op bridge calls so the native
+  // side can enforce emulated POSIX ownership/permissions against this process's identity.
+  // (supplementary groups aren't tracked yet — setgroups is a no-op — so groups is empty for now.)
+  getCreds(): { ruid: number; euid: number; rgid: number; egid: number; umask: number; groups: number[] } {
+    return { ruid: this.ruid, euid: this.euid, rgid: this.rgid, egid: this.egid, umask: this.umask, groups: [] };
   }
 
   /** Get state for process snapshot */
@@ -387,46 +558,101 @@ export class SyscallHandler {
       fdFlags: new Map(this.fdFlags),
       fdTable: new Map(this.fdTable),
       nativeRefs: new Map(this.nativeRefs),
-      nextFd: this.nextFd,
+      currentPid: this.currentPid,
+      currentPpid: this.currentPpid,
+      creds: { ruid: this.ruid, euid: this.euid, suid: this.suid, rgid: this.rgid, egid: this.egid, sgid: this.sgid },
+      sharedRegions: this.sharedRegions.map((r) => ({ ...r })),
+      protNone: this.protNone.map((r) => ({ ...r })),
+      nofileLimit: this.nofileLimit,
       vfsFdSnapshot: this.vfs ? this.vfs.snapshotFds() : undefined,
     };
   }
 
   /** Restore state from process snapshot */
-  restoreState(state: { brk: bigint; mmapBase: bigint; cwd: string; fdFlags: Map<number, number>; fdTable?: Map<number, FdEntry>; nativeRefs?: Map<number, number>; nextFd?: number; vfsFdSnapshot?: any }): void {
+  restoreState(state: { brk: bigint; mmapBase: bigint; cwd: string; fdFlags: Map<number, number>; fdTable?: Map<number, FdEntry>; nativeRefs?: Map<number, number>; currentPid?: number; currentPpid?: number; creds?: { ruid: number; euid: number; suid: number; rgid: number; egid: number; sgid: number }; sharedRegions?: Array<{ addr: number; len: number }>; protNone?: Array<{ start: number; end: number }>; nofileLimit?: number; vfsFdSnapshot?: any }): void {
     this.brk = state.brk;
     this.mmapBase = state.mmapBase;
+    this.cwd = state.cwd;
     if (this.vfs) {
-      this.vfs.chdir(state.cwd);
+      // set the cwd directly (it was already validated when first entered); vfs.chdir would
+      // re-resolve against the in-memory /proc+/dev tree and reject real NativeFS paths.
+      this.vfs.setCwd(state.cwd);
       if (state.vfsFdSnapshot) this.vfs.restoreFds(state.vfsFdSnapshot);
-    } else {
-      this.cwd = state.cwd;
     }
     this.fdFlags = new Map(state.fdFlags);
     if (state.fdTable) this.fdTable = new Map(state.fdTable);
     if (state.nativeRefs) this.nativeRefs = new Map(state.nativeRefs);
-    if (state.nextFd !== undefined) this.nextFd = state.nextFd;
+    if (state.currentPid !== undefined) this.currentPid = state.currentPid;
+    if (state.currentPpid !== undefined) this.currentPpid = state.currentPpid;
+    if (state.creds) {
+      this.ruid = state.creds.ruid; this.euid = state.creds.euid; this.suid = state.creds.suid;
+      this.rgid = state.creds.rgid; this.egid = state.creds.egid; this.sgid = state.creds.sgid;
+    }
+    if (state.sharedRegions !== undefined) this.sharedRegions = state.sharedRegions.map((r) => ({ ...r }));
+    if (state.protNone !== undefined) this.protNone = state.protNone.map((r) => ({ ...r }));
+    if (state.nofileLimit !== undefined) this.nofileLimit = state.nofileLimit;
   }
 
-  /** Reset state for execve (new process image) */
-  resetForExec(brkStart: bigint): void {
+  /**
+   * After fork, native fds in the inherited fdTable still reference the parent's
+   * swift filehandles. dup each one so the child owns independent fds — otherwise
+   * parent close() kills the child's view of the file.
+   */
+  dupNativeFdsAfterFork(dupFn: (oldNativeFd: number) => number): void {
+    for (const [guestFd, entry] of this.fdTable) {
+      if (entry.type !== 'native') continue;
+      const newFd = dupFn(entry.nativeFd);
+      if (newFd < 0) continue;
+      this.fdTable.set(guestFd, { type: 'native', nativeFd: newFd, path: entry.path });
+    }
+  }
+
+  /**
+   * Close every native (Swift-backed) fd this process still holds. real kernels close a
+   * process's fds when it exits; jitter never did, so a Worker that runs many pooled tenants
+   * leaks Swift file handles until the device fd budget is exhausted and NativeFS starts failing
+   * opens. call this on process exit / before pool reuse. stdio and non-native fds are ignored.
+   */
+  closeNativeFds(closeFn: (nativeFd: number) => void): void {
+    for (const [, entry] of this.fdTable) {
+      if (entry.type === 'native') closeFn(entry.nativeFd);
+    }
+  }
+
+  resetForExec(brkStart: bigint, closeFn?: (nativeFd: number) => void): void {
     this.brk = brkStart;
-    this.mmapBase = 0x2000000n;
+    this.mmapBase = 0x2100000n;
     // Preserve stdio redirections (fds 0, 1, 2) — real Linux closes CLOEXEC fds,
-    // we close all fds >= 3 (pipe ends the child set up before exec)
+    // we close all fds >= 3 (pipe ends the child set up before exec). native fds we drop must be
+    // fs_close'd too, or exec leaks the Swift file handle behind them.
     const preserved = new Map<number, FdEntry>();
     for (const [fd, entry] of this.fdTable) {
       if (fd <= 2) preserved.set(fd, entry);
+      else if (entry.type === 'native' && closeFn) closeFn(entry.nativeFd);
     }
     this.fdTable = preserved;
-    this.nextFd = 3;
     // Also close VFS fds >= 3 (child shouldn't inherit parent's open files after exec)
     if (this.vfs) this.vfs.closeAllExcept(0, 1, 2);
   }
 
   /** Allocate next available fd */
+  // lowest-numbered unused guest fd >= min, per posix. the guest fd namespace is
+  // shared: pipe/native/socket/tty fds live in fdTable, vfs-backed fds live in the
+  // vfs (where the guest fd is also the vfs internal fd). scan both so the two
+  // allocators never hand out the same number.
+  private lowestFreeFd(min: number): number {
+    let fd = min;
+    while (this.fdTable.has(fd) || (this.vfs?.hasFd(fd) ?? false)) fd++;
+    return fd;
+  }
+
   private allocFd(): number {
-    return this.nextFd++;
+    return this.lowestFreeFd(3);
+  }
+
+  /** true if a new fd (>= min) can be allocated within RLIMIT_NOFILE. */
+  private fdAvailable(min = 3): boolean {
+    return this.lowestFreeFd(min) < this.nofileLimit;
   }
 
   /** Resolve fd: check fdTable for overrides (dup2'd pipes, etc.), else fall through to default */
@@ -436,6 +662,19 @@ export class SyscallHandler {
 
   private isNonBlocking(fd: number): boolean {
     return ((this.fdFlags.get(fd) ?? 0) & O_NONBLOCK) !== 0;
+  }
+
+  /** public view of a fd's O_NONBLOCK flag (the worker needs it for kernel-pipe write blocking). */
+  isNonBlockingFd(fd: number): boolean { return this.isNonBlocking(fd); }
+
+  // a user pointer faults if it is out of the guest-addressable region (badGuestPtr) or lands
+  // in a range that was mapped PROT_NONE.
+  private ptrFaults(bytes: Uint8Array, addr: number, len = 1): boolean {
+    if (badGuestPtr(bytes, addr, len)) return true;
+    for (const r of this.protNone) {
+      if (addr < r.end && addr + len > r.start) return true;
+    }
+    return false;
   }
 
   /** Whether the fd has data available for read without blocking. */
@@ -559,7 +798,7 @@ export class SyscallHandler {
           envpAddr += 8;
         }
 
-        return { status: 'execve', path: pathname, argv: argvPtrs, envp: envpPtrs };
+        return { status: 'execve', path: this.absolutizePath(pathname), argv: argvPtrs, envp: envpPtrs };
       }
 
       case 95: { // waitid(idtype, id, infop, options)
@@ -779,7 +1018,7 @@ export class SyscallHandler {
           }
           if (writeEntry.type === 'native') {
             const writeData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-            const b64 = btoa(String.fromCharCode(...writeData));
+            const b64 = bytesToBase64(writeData);
             this.statCache.delete(writeEntry.path); // invalidate stat cache for this file
             return {
               status: 'bridge', method: 'fs_write',
@@ -795,7 +1034,7 @@ export class SyscallHandler {
           }
           if (writeEntry.type === 'socket') {
             const sockWriteData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
-            const sockB64 = btoa(String.fromCharCode(...sockWriteData));
+            const sockB64 = bytesToBase64(sockWriteData);
             return {
               status: 'bridge', method: 'net_write',
               args: { socketId: writeEntry.socketId, data: sockB64 },
@@ -855,7 +1094,7 @@ export class SyscallHandler {
             combined.set(bytes.slice(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
             off += len;
           }
-          const b64 = btoa(String.fromCharCode(...combined));
+          const b64 = bytesToBase64(combined);
           return {
             status: 'bridge', method: 'net_write',
             args: { socketId: writevEntry.socketId, data: b64 },
@@ -878,7 +1117,7 @@ export class SyscallHandler {
             combined.set(bytes.slice(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
             off += len;
           }
-          const b64 = btoa(String.fromCharCode(...combined));
+          const b64 = bytesToBase64(combined);
           return {
             status: 'bridge', method: 'fs_write',
             args: { fd: writevEntry.nativeFd, data: b64 },
@@ -989,9 +1228,11 @@ export class SyscallHandler {
       case 59: { // pipe2(pipefd, flags)
         const pipefdAddr = Number(a0);
         const pipe: PipeBuffer = { data: [], writeClosed: false, readClosed: false };
+        // register the read end before allocating the write end, otherwise lowest-free
+        // allocation hands out the same number twice (readFd isn't in the table yet)
         const readFd = this.allocFd();
-        const writeFd = this.allocFd();
         this.fdTable.set(readFd, { type: 'pipe_read', pipe });
+        const writeFd = this.allocFd();
         this.fdTable.set(writeFd, { type: 'pipe_write', pipe });
         // Write [readFd, writeFd] to guest memory
         view.setInt32(pipefdAddr + GUEST_MEM_BASE, readFd, true);
@@ -1003,13 +1244,13 @@ export class SyscallHandler {
       case 23: { // dup(oldfd)
         const oldfd = Number(a0);
         const oldEntry = this.fdTable.get(oldfd);
+        if (!oldEntry && !(this.vfs && this.vfs.hasFd(oldfd))) { ret = -BigInt(EBADF); break; }
+        if (!this.fdAvailable()) { ret = -BigInt(EMFILE); break; } // RLIMIT_NOFILE
         if (oldEntry) {
           const newfd = this.allocFd();
           if (oldEntry.type === 'vfs' && this.vfs) {
-            // Duplicate the underlying VFS fd so it has its own lifetime
-            const vfsFd = this.vfs.dup(oldEntry.fd);
-            if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
-            this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+            // share the vfs open file description at the new guest fd
+            if (this.vfs.dupTo(oldEntry.fd, newfd) < 0) { ret = -BigInt(EBADF); break; }
           } else if (oldEntry.type === 'native') {
             this.fdTable.set(newfd, { ...oldEntry });
             this.nativeRefs.set(oldEntry.nativeFd, (this.nativeRefs.get(oldEntry.nativeFd) ?? 1) + 1);
@@ -1018,11 +1259,8 @@ export class SyscallHandler {
           }
           ret = BigInt(newfd);
         } else if (this.vfs && this.vfs.hasFd(oldfd)) {
-          // oldfd is a VFS fd not in our table — dup it in VFS
-          const vfsFd = this.vfs.dup(oldfd);
-          if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
           const newfd = this.allocFd();
-          this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+          if (this.vfs.dupTo(oldfd, newfd) < 0) { ret = -BigInt(EBADF); break; }
           ret = BigInt(newfd);
         } else {
           ret = -BigInt(EBADF);
@@ -1041,7 +1279,7 @@ export class SyscallHandler {
         // Validate oldfd exists
         const oldfdValid = oldfd >= 0 && (this.fdTable.has(oldfd) || (this.vfs?.hasFd(oldfd) ?? false));
         if (!oldfdValid) { ret = -BigInt(EBADF); break; }
-        // Close newfd if it's open
+        // Close newfd if it's open (in the fd table or as a plain vfs fd)
         const existingEntry = this.fdTable.get(newfd);
         if (existingEntry) {
           if (existingEntry.type === 'pipe_write') existingEntry.pipe.writeClosed = true;
@@ -1054,14 +1292,14 @@ export class SyscallHandler {
             // Note: we skip bridge close here for simplicity — the fd will be reused
           }
           this.fdTable.delete(newfd);
+        } else if (this.vfs && this.vfs.hasFd(newfd)) {
+          this.vfs.close(newfd);
         }
         // Duplicate oldfd to newfd
         const srcEntry = this.fdTable.get(oldfd);
         if (srcEntry) {
           if (srcEntry.type === 'vfs' && this.vfs) {
-            const vfsFd = this.vfs.dup(srcEntry.fd);
-            if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
-            this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+            if (this.vfs.dupTo(srcEntry.fd, newfd) < 0) { ret = -BigInt(EBADF); break; }
           } else if (srcEntry.type === 'native') {
             this.fdTable.set(newfd, { ...srcEntry });
             this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
@@ -1070,9 +1308,7 @@ export class SyscallHandler {
           }
           ret = BigInt(newfd);
         } else if (this.vfs && this.vfs.hasFd(oldfd)) {
-          const vfsFd = this.vfs.dup(oldfd);
-          if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
-          this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+          if (this.vfs.dupTo(oldfd, newfd) < 0) { ret = -BigInt(EBADF); break; }
           ret = BigInt(newfd);
         } else {
           ret = -BigInt(EBADF);
@@ -1104,7 +1340,7 @@ export class SyscallHandler {
             apply: (resp: any) => {
               if (resp.ret < 0) {
                 cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-                this.nextFd--; // reclaim
+                // no fd was committed to the table, so the number is still free
               } else {
                 this.fdTable.set(guestFd, { type: 'native', nativeFd: resp.ret, path: bp56 });
                 this.nativeRefs.set(resp.ret, 1);
@@ -1133,6 +1369,10 @@ export class SyscallHandler {
       case 57: { // close(fd)
         const fd = Number(a0);
         const closeEntry = this.fdTable.get(fd);
+        // per-fd metadata never outlives the fd; clearing here keeps a later reuse
+        // of the same number (lowest-free allocation) from inheriting stale state
+        this.fdFlags.delete(fd);
+        this.fdCloexec.delete(fd);
         if (closeEntry) {
           if (closeEntry.type === 'pipe_write') closeEntry.pipe.writeClosed = true;
           if (closeEntry.type === 'pipe_read') closeEntry.pipe.readClosed = true;
@@ -1163,8 +1403,6 @@ export class SyscallHandler {
           }
           if (closeEntry.type === 'epoll') this.epollSets?.delete(fd);
           this.fdTable.delete(fd);
-          this.fdFlags.delete(fd);
-          this.fdCloexec.delete(fd);
           ret = 0n;
         } else if (this.vfs && this.vfs.hasFd(fd)) {
           ret = BigInt(this.vfs.close(fd));
@@ -1230,6 +1468,7 @@ export class SyscallHandler {
       case 80: { // fstat(fd, statbuf)
         const fd = Number(a0);
         const statBuf = Number(a1);
+        if (this.ptrFaults(bytes, statBuf, 128)) { ret = -BigInt(EFAULT); break; }
 
         // Check fd table first
         const fstatEntry = this.getFdEntry(fd);
@@ -1269,12 +1508,13 @@ export class SyscallHandler {
       case 79: { // fstatat(dirfd, path, statbuf, flags)
         const path = readGuestString(bytes, Number(a1));
         const statBuf79 = Number(a2);
+        if (this.ptrFaults(bytes, statBuf79, 128)) { ret = -BigInt(EFAULT); break; }
         const bp79 = this.bridgePath(path);
         if (bp79 !== null) {
           // Check stat cache (populated by recent getdents) — avoids bridge round-trip
           const cached = this.statCache.get(bp79);
           if (cached && cached.expiresAt > Date.now()) {
-            writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime] });
+            writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime, cached.uid, cached.gid] });
             ret = 0n;
             break;
           }
@@ -1293,6 +1533,8 @@ export class SyscallHandler {
                     size: resp._meta[1],
                     nlink: resp._meta[2],
                     mtime: resp._meta[3],
+                    uid: resp._meta[4] ?? 0,
+                    gid: resp._meta[5] ?? 0,
                     expiresAt: Date.now() + this.STAT_CACHE_TTL_MS,
                   });
                 }
@@ -1345,6 +1587,8 @@ export class SyscallHandler {
                     size: entry.size ?? 0,
                     nlink: entry.type === 4 ? 2 : 1, // DT_DIR=4
                     mtime: entry.mtime ?? 0,
+                    uid: entry.uid ?? 0,
+                    gid: entry.gid ?? 0,
                     expiresAt: cacheExpiry,
                   });
                 }
@@ -1396,7 +1640,9 @@ export class SyscallHandler {
       }
 
       case 35: { // unlinkat(dirfd, path, flags)
+        if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
         const path = readGuestString(bytes, Number(a1));
+        if (path === '') { ret = -BigInt(ENOENT); break; } // empty path (no AT_EMPTY_PATH for unlink)
         const bp35 = this.bridgePath(path);
         if (bp35 !== null) {
           this.statCache.delete(bp35);
@@ -1425,12 +1671,8 @@ export class SyscallHandler {
           // S_IFCHR = 0o020000 — character device (needs root, skip for now)
           const fmt = mode & 0o170000;
           if (fmt === 0o010000) {
-            // mkfifo — create as a regular empty file (we don't support real FIFOs yet)
-            ret = BigInt(this.vfs.open(path, 0o100 | 0o1000, mode & 0o7777)); // O_CREAT | O_TRUNC
-            if (ret >= 0n) {
-              this.vfs.close(Number(ret));
-              ret = 0n;
-            }
+            // mkfifo — create a named-pipe (S_IFIFO) inode
+            ret = BigInt(this.vfs.mkfifo(path, mode & 0o7777));
           } else if (fmt === 0o100000 || fmt === 0) {
             // Regular file
             ret = BigInt(this.vfs.open(path, 0o100, mode & 0o7777)); // O_CREAT
@@ -1448,6 +1690,7 @@ export class SyscallHandler {
       }
 
       case 38: { // renameat(olddirfd, oldpath, newdirfd, newpath)
+        if (this.ptrFaults(bytes, Number(a1)) || this.ptrFaults(bytes, Number(a3))) { ret = -BigInt(EFAULT); break; }
         const oldpath = readGuestString(bytes, Number(a1));
         const newpath = readGuestString(bytes, Number(a3));
         const bOld = this.bridgePath(oldpath);
@@ -1470,6 +1713,7 @@ export class SyscallHandler {
       }
 
       case 36: { // symlinkat(target, newdirfd, linkpath)
+        if (this.ptrFaults(bytes, Number(a0)) || this.ptrFaults(bytes, Number(a2))) { ret = -BigInt(EFAULT); break; }
         const target = readGuestString(bytes, Number(a0));
         const linkpath = readGuestString(bytes, Number(a2));
         const bLink = this.bridgePath(linkpath);
@@ -1489,6 +1733,7 @@ export class SyscallHandler {
       }
 
       case 37: { // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+        if (this.ptrFaults(bytes, Number(a1)) || this.ptrFaults(bytes, Number(a3))) { ret = -BigInt(EFAULT); break; }
         const oldpath = readGuestString(bytes, Number(a1));
         const newpath = readGuestString(bytes, Number(a3));
         if (this.vfs) {
@@ -1521,6 +1766,7 @@ export class SyscallHandler {
                 // Data is the symlink target, base64-encoded
                 const decoded = Uint8Array.from(atob(resp.data), c => c.charCodeAt(0));
                 const len = Math.min(decoded.length, bufsiz);
+                if (badGuestPtr(bytes, buf, len)) { cpu.setReg(0, BigInt.asUintN(64, BigInt(-14))); return; } // EFAULT
                 bytes.set(decoded.subarray(0, len), buf + GUEST_MEM_BASE);
                 cpu.setReg(0, BigInt(len));
               } else {
@@ -1536,6 +1782,7 @@ export class SyscallHandler {
           } else {
             const encoded = new TextEncoder().encode(target);
             const len = Math.min(encoded.length, bufsiz);
+            if (badGuestPtr(bytes, buf, len)) { ret = -BigInt(14); break; } // EFAULT
             bytes.set(encoded.subarray(0, len), buf + GUEST_MEM_BASE);
             ret = BigInt(len);
           }
@@ -1546,15 +1793,15 @@ export class SyscallHandler {
       }
 
       case 48: { // faccessat(dirfd, path, mode, flags)
+        if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
         const path = readGuestString(bytes, Number(a1));
         const bp48 = this.bridgePath(path);
         if (bp48 !== null) {
-          // Use stat to check existence/access on the native side
           return {
-            status: 'bridge', method: 'fs_stat',
-            args: { path: bp48 },
+            status: 'bridge', method: 'fs_faccessat',
+            args: { path: bp48, mode: Number(a2) },
             apply: (resp: any) => {
-              cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret < 0 ? resp.ret : 0)));
+              cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
             },
           };
         }
@@ -1566,33 +1813,78 @@ export class SyscallHandler {
         break;
       }
 
-      // ── chmod/chown (stubs — we run as root, permissions are a no-op) ──
-      case 52: { // fchmod(fd, mode) — actually track mode changes
+      case 52: { // fchmod(fd, mode)
         const fchmodFd = Number(a0);
         const fchmodMode = Number(a1);
-        // Update mode in VFS if it's a VFS file
-        if (this.vfs && this.vfs.hasFd(fchmodFd)) {
-          this.vfs.fchmod(fchmodFd, fchmodMode);
+        const fchmodEntry = this.getFdEntry(fchmodFd);
+        if (fchmodEntry?.type === 'native') {
+          this.statCache.delete(fchmodEntry.path);
+          return {
+            status: 'bridge', method: 'fs_chmod',
+            args: { path: fchmodEntry.path, mode: fchmodMode },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+          };
         }
-        ret = 0n;
+        if (this.vfs && this.vfs.hasFd(fchmodFd)) ret = BigInt(this.vfs.fchmod(fchmodFd, fchmodMode));
+        else if (this.fdTable.has(fchmodFd)) ret = 0n; // native/stdio fd: best-effort no-op
+        else ret = -BigInt(EBADF);
         break;
       }
-      case 53:   // (unused on aarch64, but keep for safety)
-      case 54: { // fchmodat(dirfd, path, mode, flags)
-        ret = 0n;
+      case 53: { // fchmodat(dirfd, path, mode)
+        const fchmodatPath = readGuestString(bytes, Number(a1));
+        const fchmodatMode = Number(a2);
+        const bpChmod = this.bridgePath(fchmodatPath);
+        if (bpChmod !== null) {
+          this.statCache.delete(bpChmod);
+          return {
+            status: 'bridge', method: 'fs_chmod',
+            args: { path: bpChmod, mode: fchmodatMode },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+          };
+        }
+        ret = this.vfs ? BigInt(this.vfs.chmodPath(fchmodatPath, fchmodatMode)) : -BigInt(ENOENT);
         break;
       }
-      case 55: { // fchownat(dirfd, path, owner, group, flags)
-        // If AT_EMPTY_PATH (0x1000) is set, operate on dirfd directly (like fchown)
+      case 54: { // fchownat(dirfd, path, owner, group, flags)
         const fchownFlags = Number(a4);
+        const cOwner = Number(BigInt.asIntN(32, a2));
+        const cGroup = Number(BigInt.asIntN(32, a3));
         if (fchownFlags & 0x1000) {
+          // AT_EMPTY_PATH: operate on dirfd directly (like fchown)
           const fchownFd = Number(a0);
-          if (this.vfs && this.vfs.hasFd(fchownFd)) {
-            this.vfs.fchown(fchownFd, Number(BigInt.asIntN(32, a2)), Number(BigInt.asIntN(32, a3)));
-          }
+          if (this.vfs && this.vfs.hasFd(fchownFd)) ret = BigInt(this.vfs.fchown(fchownFd, cOwner, cGroup));
+          else if (this.fdTable.has(fchownFd)) ret = 0n; // native/stdio fd: best-effort no-op
+          else ret = -BigInt(EBADF);
+          break;
         }
-        // Otherwise it's path-based — we accept but don't track path-based ownership changes yet
-        ret = 0n;
+        const fchownatPath = readGuestString(bytes, Number(a1));
+        const bpChown = this.bridgePath(fchownatPath);
+        if (bpChown !== null) {
+          return {
+            status: 'bridge', method: 'fs_chown',
+            args: { path: bpChown, uid: cOwner, gid: cGroup },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret ?? 0))); },
+          };
+        }
+        ret = this.vfs ? BigInt(this.vfs.chownPath(fchownatPath, cOwner, cGroup)) : -BigInt(ENOENT);
+        break;
+      }
+      case 55: { // fchown(fd, owner, group)
+        const fchownFd = Number(a0);
+        const owner = Number(BigInt.asIntN(32, a1));
+        const group = Number(BigInt.asIntN(32, a2));
+        const ent = this.getFdEntry(fchownFd);
+        if (ent?.type === 'native') {
+          this.statCache.delete(ent.path);
+          return {
+            status: 'bridge', method: 'fs_chown',
+            args: { path: ent.path, uid: owner, gid: group },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret ?? 0))); },
+          };
+        }
+        if (this.vfs && this.vfs.hasFd(fchownFd)) ret = BigInt(this.vfs.fchown(fchownFd, owner, group));
+        else if (this.fdTable.has(fchownFd)) ret = 0n;
+        else ret = -BigInt(EBADF);
         break;
       }
 
@@ -1678,6 +1970,9 @@ export class SyscallHandler {
         } else if (addr >= this.brk) {
           // Ensure memory is large enough
           const needed = Number(addr) + GUEST_MEM_BASE;
+          // budget: refuse to grow past the per-process ceiling. brk failure returns the
+          // unchanged break, which glibc's wrapper reads as ENOMEM (malloc -> NULL).
+          if (needed > this.maxBytes) { ret = this.brk; break; }
           if (needed > memory.buffer.byteLength) {
             const pagesNeeded = Math.ceil(needed / 65536);
             const currentPages = memory.buffer.byteLength / 65536;
@@ -1703,6 +1998,27 @@ export class SyscallHandler {
         const MAP_FIXED = 0x10;
         const MAP_SHARED = 0x01;
 
+        // zero length is invalid; exactly one map type (MAP_SHARED/MAP_PRIVATE, or the
+        // MAP_SHARED_VALIDATE superset) must be requested.
+        const mapType = flags & 0xf;
+        if (length === 0 || (mapType !== 0x01 && mapType !== 0x02 && mapType !== 0x03)) {
+          ret = -BigInt(EINVAL);
+          break;
+        }
+
+        // File-backed mmap always reads pages from the file, so the descriptor must be
+        // readable (O_WRONLY faults with EACCES); a shared writable mapping additionally
+        // requires the file to be open for writing.
+        if (mmapFd >= 0 && !(flags & MAP_ANONYMOUS) && this.vfs && this.vfs.hasFd(mmapFd)) {
+          const am = this.vfs.fdAccessMode(mmapFd);
+          const PROT_WRITE = 0x2;
+          if (am === 1 /* O_WRONLY */ ||
+              ((flags & MAP_SHARED) && (prot & PROT_WRITE) && am === 0 /* O_RDONLY */)) {
+            ret = -BigInt(EACCES);
+            break;
+          }
+        }
+
         // Honor requested address if nonzero (MAP_FIXED or hint)
         let addr: bigint;
         if (a0 !== 0n) {
@@ -1716,6 +2032,9 @@ export class SyscallHandler {
 
         // Ensure WASM memory is large enough
         const needed = Number(addr) + aligned + GUEST_MEM_BASE;
+        // budget: refuse mappings past the per-process ceiling -> ENOMEM (mmap returns MAP_FAILED),
+        // rather than growing toward the jetsam limit and crashing the whole content process.
+        if (needed > this.maxBytes) { ret = -BigInt(ENOMEM); break; }
         if (needed > memory.buffer.byteLength) {
           const pagesNeeded = Math.ceil(needed / 65536);
           const currentPages = memory.buffer.byteLength / 65536;
@@ -1737,17 +2056,39 @@ export class SyscallHandler {
           }
         }
 
+        if (flags & MAP_SHARED) this.sharedRegions.push({ addr: Number(addr), len: aligned });
+
+        // track PROT_NONE mappings so pointers into them fault; clear any stale overlap first.
+        const mmStart = Number(addr), mmEnd = mmStart + aligned;
+        this.protNone = this.protNone.filter((r) => r.end <= mmStart || r.start >= mmEnd);
+        if ((prot & 0x7) === 0) this.protNone.push({ start: mmStart, end: mmEnd });
+
         ret = addr;
         break;
       }
 
-      case 226: // mprotect
+      case 226: { // mprotect(addr, len, prot)
+        const mpStart = Number(a0), mpEnd = mpStart + ((Number(a1) + 0xFFF) & ~0xFFF);
+        this.protNone = this.protNone.filter((r) => r.end <= mpStart || r.start >= mpEnd);
+        if ((Number(a2) & 0x7) === 0) this.protNone.push({ start: mpStart, end: mpEnd });
         ret = 0n;
         break;
+      }
 
-      case 215: // munmap
+      case 215: { // munmap(addr, length)
+        // addr must be page-aligned and length non-zero; the range must lie within the
+        // guest address space. otherwise EINVAL, matching the kernel.
+        const unmapLen = Number(a1);
+        const guestMax = BigInt(memory.buffer.byteLength - GUEST_MEM_BASE);
+        if (unmapLen === 0 || (a0 & 0xFFFn) !== 0n || a0 >= guestMax || a0 + BigInt(unmapLen) > guestMax) {
+          ret = -BigInt(EINVAL);
+          break;
+        }
+        const umStart = Number(a0), umEnd = umStart + ((unmapLen + 0xFFF) & ~0xFFF);
+        this.protNone = this.protNone.filter((r) => r.end <= umStart || r.start >= umEnd);
         ret = 0n;
         break;
+      }
 
       // ── Thread/process ──
       case 96: { // set_tid_address(tidptr)
@@ -1761,8 +2102,8 @@ export class SyscallHandler {
 
       // gettid handled with getpid above
 
-      case 172: // getpid
-        ret = BigInt(this.currentPid);
+      case 172: // getpid — the thread-group id (== pid) for a thread; own pid otherwise
+        ret = BigInt(this.tgid || this.currentPid);
         break;
 
       case 173: // getppid
@@ -1774,10 +2115,16 @@ export class SyscallHandler {
         break;
 
       case 174: // getuid
+        ret = BigInt(this.ruid);
+        break;
       case 175: // geteuid
+        ret = BigInt(this.euid);
+        break;
       case 176: // getgid
+        ret = BigInt(this.rgid);
+        break;
       case 177: // getegid
-        ret = 0n; // root
+        ret = BigInt(this.egid);
         break;
 
       // ── Signals ──
@@ -1927,6 +2274,10 @@ export class SyscallHandler {
 
       // ── uname ──
       case 160: { // uname(buf)
+        if (badGuestPtr(new Uint8Array(memory.buffer), Number(a0), 6 * 65)) {
+          ret = -BigInt(14); // EFAULT
+          break;
+        }
         const buf = Number(a0) + GUEST_MEM_BASE;
         const fields = ['Linux', 'jitter', '6.1.0', '#1', 'aarch64', '(none)'];
         for (let i = 0; i < fields.length; i++) {
@@ -1940,22 +2291,19 @@ export class SyscallHandler {
       // ── Time ──
       case 113: { // clock_gettime(clk_id, tp)
         const tp = Number(a1) + GUEST_MEM_BASE;
-        const now = Date.now();
-        const sec = BigInt(Math.floor(now / 1000));
-        const nsec = BigInt((now % 1000) * 1000000);
-        view.setBigUint64(tp, sec, true);
-        view.setBigUint64(tp + 8, nsec, true);
+        const ns = this.clockNs(Number(a0));
+        view.setBigUint64(tp, ns / 1_000_000_000n, true);
+        view.setBigUint64(tp + 8, ns % 1_000_000_000n, true);
         ret = 0n;
         break;
       }
 
       case 169: { // gettimeofday(tv, tz)
+        if (badGuestPtr(new Uint8Array(memory.buffer), Number(a0), 16)) { ret = -BigInt(14); break; } // EFAULT
         const tv = Number(a0) + GUEST_MEM_BASE;
-        const now = Date.now();
-        const sec = BigInt(Math.floor(now / 1000));
-        const usec = BigInt((now % 1000) * 1000);
-        view.setBigUint64(tv, sec, true);
-        view.setBigUint64(tv + 8, usec, true);
+        const ns = this.clockNs(0); // wall clock
+        view.setBigUint64(tv, ns / 1_000_000_000n, true);
+        view.setBigUint64(tv + 8, (ns % 1_000_000_000n) / 1000n, true); // usec
         ret = 0n;
         break;
       }
@@ -1968,16 +2316,14 @@ export class SyscallHandler {
           case F_DUPFD:
           case F_DUPFD_CLOEXEC: {
             const minfd = Number(a2);
-            // Find lowest available fd >= minfd
-            let newfd = minfd;
-            while (this.fdTable.has(newfd)) newfd++;
+            if (!this.fdAvailable(minfd)) { ret = -BigInt(EMFILE); break; } // RLIMIT_NOFILE
+            // lowest available fd >= minfd across the shared guest fd namespace
+            const newfd = this.lowestFreeFd(minfd);
             // Duplicate the source fd entry
             const srcEntry = this.fdTable.get(fd);
             if (srcEntry) {
               if (srcEntry.type === 'vfs' && this.vfs) {
-                const vfsFd = this.vfs.dup(srcEntry.fd);
-                if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
-                this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+                if (this.vfs.dupTo(srcEntry.fd, newfd) < 0) { ret = -BigInt(EBADF); break; }
               } else if (srcEntry.type === 'native') {
                 this.fdTable.set(newfd, { ...srcEntry });
                 this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
@@ -1985,15 +2331,14 @@ export class SyscallHandler {
                 this.fdTable.set(newfd, { ...srcEntry });
               }
             } else if (this.vfs && this.vfs.hasFd(fd)) {
-              const vfsFd = this.vfs.dup(fd);
-              if (vfsFd < 0) { ret = BigInt(vfsFd); break; }
-              this.fdTable.set(newfd, { type: 'vfs', fd: vfsFd });
+              if (this.vfs.dupTo(fd, newfd) < 0) { ret = -BigInt(EBADF); break; }
             } else {
               ret = -BigInt(EBADF);
               break;
             }
-            // Keep nextFd above any manually allocated fd
-            if (newfd >= this.nextFd) this.nextFd = newfd + 1;
+            // F_DUPFD_CLOEXEC sets close-on-exec on the new fd; plain F_DUPFD clears it
+            if (cmd === F_DUPFD_CLOEXEC) this.fdCloexec.add(newfd);
+            else this.fdCloexec.delete(newfd);
             ret = BigInt(newfd);
             break;
           }
@@ -2152,16 +2497,73 @@ export class SyscallHandler {
         ret = 0n;
         break;
 
-      case 143: // setregid
-      case 144: // setgid
-      case 145: // setreuid
-      case 146: // setuid
-      case 147: // setresuid
-      case 149: // setresgid
-      case 151: // setfsuid
+      case 146: { // setuid(uid)
+        const uid = Number(BigInt.asIntN(32, a0));
+        if (this.euid === 0) { this.ruid = this.euid = this.suid = uid; ret = 0n; }
+        else if (uid === this.ruid || uid === this.suid) { this.euid = uid; ret = 0n; }
+        else ret = -BigInt(EPERM);
+        break;
+      }
+      case 144: { // setgid(gid)
+        const gid = Number(BigInt.asIntN(32, a0));
+        if (this.euid === 0) { this.rgid = this.egid = this.sgid = gid; ret = 0n; }
+        else if (gid === this.rgid || gid === this.sgid) { this.egid = gid; ret = 0n; }
+        else ret = -BigInt(EPERM);
+        break;
+      }
+      case 145: { // setreuid(ruid, euid)
+        const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1));
+        const unchanged = 0xffffffff;
+        if (this.euid !== 0) {
+          if ((r !== -1 && r >>> 0 !== unchanged && r !== this.ruid && r !== this.euid) ||
+              (e !== -1 && e >>> 0 !== unchanged && e !== this.ruid && e !== this.euid && e !== this.suid)) {
+            ret = -BigInt(EPERM); break;
+          }
+        }
+        if (r !== -1 && r >>> 0 !== unchanged) this.ruid = r;
+        if (e !== -1 && e >>> 0 !== unchanged) this.euid = e;
+        if (r !== -1 && r >>> 0 !== unchanged) this.suid = this.euid;
+        ret = 0n;
+        break;
+      }
+      case 147: { // setresuid(ruid, euid, suid)
+        const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1)), s = Number(BigInt.asIntN(32, a2));
+        const set = (v: number) => v !== -1 && (v >>> 0) !== 0xffffffff;
+        if (this.euid !== 0) {
+          const allowed = (v: number) => v === this.ruid || v === this.euid || v === this.suid;
+          if ((set(r) && !allowed(r)) || (set(e) && !allowed(e)) || (set(s) && !allowed(s))) {
+            ret = -BigInt(EPERM); break;
+          }
+        }
+        if (set(r)) this.ruid = r;
+        if (set(e)) this.euid = e;
+        if (set(s)) this.suid = s;
+        ret = 0n;
+        break;
+      }
+      case 143: { // setregid(rgid, egid)
+        const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1));
+        if (r !== -1 && (r >>> 0) !== 0xffffffff) this.rgid = r;
+        if (e !== -1 && (e >>> 0) !== 0xffffffff) this.egid = e;
+        ret = 0n;
+        break;
+      }
+      case 149: { // setresgid(rgid, egid, sgid)
+        const set = (v: number) => v !== -1 && (v >>> 0) !== 0xffffffff;
+        const r = Number(BigInt.asIntN(32, a0)), e = Number(BigInt.asIntN(32, a1)), s = Number(BigInt.asIntN(32, a2));
+        if (set(r)) this.rgid = r;
+        if (set(e)) this.egid = e;
+        if (set(s)) this.sgid = s;
+        ret = 0n;
+        break;
+      }
+      case 151: // setfsuid — returns previous fsuid; we alias fsuid to euid
+        ret = BigInt(this.euid);
+        break;
       case 152: // setfsgid
+        ret = BigInt(this.egid);
+        break;
       case 159: // setgroups
-        // We're always root — accept any uid/gid change
         ret = 0n;
         break;
       // ── Networking (via Swift bridge) ──
@@ -2187,7 +2589,6 @@ export class SyscallHandler {
           apply: (resp: any) => {
             if (resp.ret < 0) {
               cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-              this.nextFd--; // reclaim
             } else {
               this.fdTable.set(socketFd, { type: 'socket', socketId: resp.ret, domain, sockType });
               if (Number(a1) & 0o2000000) this.fdCloexec.add(socketFd); // SOCK_CLOEXEC
@@ -2228,7 +2629,6 @@ export class SyscallHandler {
           apply: (resp: any) => {
             if (resp.ret < 0) {
               cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
-              this.nextFd--;
             } else {
               this.fdTable.set(newFd, { type: 'socket', socketId: resp.ret, domain: acceptEntry.domain, sockType: acceptEntry.sockType });
               cpu.setReg(0, BigInt(newFd));
@@ -2281,7 +2681,7 @@ export class SyscallHandler {
         const sendBuf = Number(a1);
         const sendLen = Number(a2);
         const sendData = bytes.slice(sendBuf + GUEST_MEM_BASE, sendBuf + GUEST_MEM_BASE + sendLen);
-        const b64 = btoa(String.fromCharCode(...sendData));
+        const b64 = bytesToBase64(sendData);
         // If dest_addr is provided (connectionless sendto), use net_sendto
         const destAddrPtr = Number(a4);
         const destAddrLen = Number(a5);
@@ -2395,18 +2795,18 @@ export class SyscallHandler {
       }
 
       case 261: { // prlimit64(pid, resource, new_limit, old_limit)
-        // Per spec: get/set resource limits
         // struct rlimit64: { rlim_cur (8 bytes), rlim_max (8 bytes) }
+        const resource = Number(a1);
+        const rlNewPtr = Number(a2);
         const rlOldPtr = Number(a3);
         const RLIM_INFINITY = 0xFFFFFFFFFFFFFFFFn;
+        // report the current limit into old_limit BEFORE applying the new one
         if (rlOldPtr !== 0) {
           const base = rlOldPtr + GUEST_MEM_BASE;
-          const resource = Number(a1);
-          // Return reasonable defaults for common resources
           switch (resource) {
             case 7:  // RLIMIT_NOFILE
-              view.setBigUint64(base, 1024n, true);     // cur
-              view.setBigUint64(base + 8, 1024n, true); // max
+              view.setBigUint64(base, BigInt(this.nofileLimit), true);
+              view.setBigUint64(base + 8, 1048576n, true); // hard max
               break;
             case 3:  // RLIMIT_STACK
               view.setBigUint64(base, 8388608n, true);  // 8MB
@@ -2416,6 +2816,12 @@ export class SyscallHandler {
               view.setBigUint64(base, RLIM_INFINITY, true);
               view.setBigUint64(base + 8, RLIM_INFINITY, true);
           }
+        }
+        // apply the new limit for the resources we enforce
+        if (rlNewPtr !== 0 && resource === 7) {
+          const cur = view.getBigUint64(rlNewPtr + GUEST_MEM_BASE, true);
+          // clamp to a sane cap; RLIM_INFINITY -> effectively unlimited
+          this.nofileLimit = cur >= 1048576n ? 1048576 : Number(cur);
         }
         ret = 0n;
         break;
@@ -2468,7 +2874,10 @@ export class SyscallHandler {
             ret = 0n;
             break;
           case 16: // PR_GET_NAME — get thread name
-            // Write "jitter\0" to the buffer
+            if (badGuestPtr(new Uint8Array(memory.buffer), Number(a1), 16)) {
+              ret = -BigInt(14); // EFAULT
+              break;
+            }
             const nameBuf = Number(a1) + GUEST_MEM_BASE;
             const name = new TextEncoder().encode('jitter\0');
             new Uint8Array(memory.buffer).set(name, nameBuf);
@@ -2539,20 +2948,42 @@ export class SyscallHandler {
       // ── Timer syscalls ──
 
       case 102: { // getitimer(which, curr_value)
-        // Zero out the itimerval struct (16 bytes: 2x timeval of 8+8)
+        // itimerval = { it_interval: timeval, it_value: timeval }, timeval = { sec, usec }
         const itvPtr = Number(a1) + GUEST_MEM_BASE;
-        for (let i = 0; i < 32; i += 8) view.setBigUint64(itvPtr + i, 0n, true);
+        const which = Number(a0);
+        const remMs = which === 0 ? this.timerRemainingMs() : 0;
+        const intMs = which === 0 ? this.itimerRealIntervalMs : 0;
+        view.setBigUint64(itvPtr, BigInt(Math.floor(intMs / 1000)), true);
+        view.setBigUint64(itvPtr + 8, BigInt((intMs % 1000) * 1000), true);
+        view.setBigUint64(itvPtr + 16, BigInt(Math.floor(remMs / 1000)), true);
+        view.setBigUint64(itvPtr + 24, BigInt((remMs % 1000) * 1000), true);
         ret = 0n;
         break;
       }
 
       case 103: { // setitimer(which, new_value, old_value)
-        // Per spec: set interval timer (ITIMER_REAL sends SIGALRM)
-        // Accept but don't actually deliver signals
+        const which = Number(a0);
+        // report the previous timer into old_value before overwriting
         const oldPtr = Number(a2);
         if (oldPtr !== 0) {
           const base = oldPtr + GUEST_MEM_BASE;
-          for (let i = 0; i < 32; i += 8) view.setBigUint64(base + i, 0n, true);
+          const remMs = which === 0 ? this.timerRemainingMs() : 0;
+          const intMs = which === 0 ? this.itimerRealIntervalMs : 0;
+          view.setBigUint64(base, BigInt(Math.floor(intMs / 1000)), true);
+          view.setBigUint64(base + 8, BigInt((intMs % 1000) * 1000), true);
+          view.setBigUint64(base + 16, BigInt(Math.floor(remMs / 1000)), true);
+          view.setBigUint64(base + 24, BigInt((remMs % 1000) * 1000), true);
+        }
+        // only ITIMER_REAL (0) is backed by wall time -> SIGALRM. VIRTUAL/PROF measure cpu
+        // time we don't track; accept them but arm nothing (musl/ltp use REAL for timeouts).
+        if (which === 0) {
+          const newPtr = Number(a1);
+          if (newPtr === 0) { this.itimerRealDeadlineMs = 0; this.itimerRealIntervalMs = 0; ret = 0n; break; }
+          const nb = newPtr + GUEST_MEM_BASE;
+          const intMs = Number(view.getBigUint64(nb, true)) * 1000 + Math.floor(Number(view.getBigUint64(nb + 8, true)) / 1000);
+          const valMs = Number(view.getBigUint64(nb + 16, true)) * 1000 + Math.floor(Number(view.getBigUint64(nb + 24, true)) / 1000);
+          this.itimerRealIntervalMs = intMs;
+          this.itimerRealDeadlineMs = valMs > 0 ? Number(this.nowMs()) + valMs : 0;
         }
         ret = 0n;
         break;
@@ -2775,7 +3206,7 @@ export class SyscallHandler {
           envpPtrs281.push(readGuestString(bytes, ptr));
           envpAddr281 += 8;
         }
-        return { status: 'execve', path: pathname281, argv: argvPtrs281, envp: envpPtrs281 };
+        return { status: 'execve', path: this.absolutizePath(pathname281), argv: argvPtrs281, envp: envpPtrs281 };
       }
 
       case 47: { // fallocate(fd, mode, offset, len) — preallocate space
@@ -3226,7 +3657,7 @@ export class SyscallHandler {
           combined.set(bytes.subarray(base + GUEST_MEM_BASE, base + GUEST_MEM_BASE + len), off);
           off += len;
         }
-        const smB64 = btoa(String.fromCharCode(...combined));
+        const smB64 = bytesToBase64(combined);
         // Check for destination address (msg_name) for connectionless sendmsg
         const namePtr = Number(view.getBigUint64(mhdr, true));
         const nameLen = view.getUint32(mhdr + 8, true);
@@ -3780,6 +4211,7 @@ export class SyscallHandler {
         break;
       case 439: { // faccessat2(dirfd, pathname, mode, flags)
         // Per spec: like faccessat but with flags (AT_SYMLINK_NOFOLLOW, AT_EACCESS)
+        if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
         const fa2Path = readGuestString(bytes, Number(a1));
         if (this.vfs) {
           ret = BigInt(this.vfs.faccessat(Number(BigInt.asIntN(32, a0)), fa2Path, Number(a2), Number(a3)));
@@ -3894,6 +4326,15 @@ export class SyscallHandler {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+// a guest pointer faults (EFAULT) if it lands in the never-mapped low page or falls outside
+// the guest-addressable region. this catches the classic LTP bad-address probes ((void*)-1 and
+// NULL) without needing full per-page vma tracking, which our flat guest memory does not model.
+export function badGuestPtr(memory: Uint8Array, guestAddr: number, len = 1): boolean {
+  if (!Number.isFinite(guestAddr) || guestAddr < 0x1000) return true;
+  const max = memory.length - GUEST_MEM_BASE;
+  return guestAddr >= max || guestAddr + len > max;
+}
+
 export function readGuestString(memory: Uint8Array, guestAddr: number): string {
   const base = guestAddr + GUEST_MEM_BASE;
   let end = base;
@@ -3925,14 +4366,18 @@ function writeBridgeStat(view: DataView, guestAddr: number, resp: any): void {
   // struct stat (aarch64 Linux):
   // 0: st_dev (8), 8: st_ino (8), 16: st_mode (4), 20: st_nlink (4)
   // 48: st_size (8), 88: st_mtime (8)
-  // Meta layout for fs_stat: _meta[0]=mode, _meta[1]=size, _meta[2]=nlink, _meta[3]=mtime
+  // Meta layout for fs_stat: _meta = [mode, size, nlink, mtime, uid, gid]
   const meta = resp._meta;
   const mode = meta ? meta[0] : (resp.mode ?? 0o100644);
   const size = meta ? meta[1] : (resp.size ?? 0);
   const nlink = meta ? meta[2] : (resp.nlink ?? 1);
   const mtime = meta ? meta[3] : (resp.mtime ?? 0);
+  const uid = meta ? (meta[4] ?? 0) : (resp.uid ?? 0);
+  const gid = meta ? (meta[5] ?? 0) : (resp.gid ?? 0);
   view.setUint32(base + 16, mode, true);
   view.setUint32(base + 20, nlink, true);
+  view.setUint32(base + 24, uid, true);   // st_uid
+  view.setUint32(base + 28, gid, true);   // st_gid
   view.setBigUint64(base + 48, BigInt(size), true);
   view.setBigUint64(base + 88, BigInt(mtime), true);
 }

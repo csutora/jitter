@@ -8,6 +8,11 @@ final class LocalServer {
     private let rootDir: URL
     private let port: UInt16
 
+    /// Debug control channel: (method, path, body) -> (contentType, responseBody).
+    /// Set by ContentView to bridge /ctl/* requests to the terminal (inject stdin,
+    /// read output, reset the guest). nil = disabled (serves static files only).
+    var controlHandler: ((_ method: String, _ path: String, _ body: Data) -> (String, Data))?
+
     /// The URL to load in WKWebView once the server is running.
     var baseURL: URL { URL(string: "http://localhost:\(port)")! }
 
@@ -42,22 +47,49 @@ final class LocalServer {
 
     private func handleConnection(_ conn: NWConnection) {
         conn.start(queue: .global(qos: .userInitiated))
-        // Read the HTTP request (up to 8KB is plenty for GET requests)
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, error in
-            guard let self = self, let data = data, error == nil else {
-                conn.cancel()
+        readRequest(conn, accumulated: Data())
+    }
+
+    // accumulate bytes until we have the full headers + body (per Content-Length), then route.
+    private func readRequest(_ conn: NWConnection, accumulated: Data) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self, error == nil else { conn.cancel(); return }
+            var buf = accumulated
+            if let data = data { buf.append(data) }
+            // find header terminator
+            guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else {
+                if isComplete { conn.cancel() } else { self.readRequest(conn, accumulated: buf) }
                 return
             }
-            let request = String(data: data, encoding: .utf8) ?? ""
-            self.respond(to: request, on: conn)
+            let header = String(data: buf.subdata(in: buf.startIndex..<headerEnd.lowerBound), encoding: .utf8) ?? ""
+            let contentLength = header.split(separator: "\r\n")
+                .first(where: { $0.lowercased().hasPrefix("content-length:") })
+                .flatMap { Int($0.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) } ?? 0
+            let bodyStart = headerEnd.upperBound
+            let have = buf.distance(from: bodyStart, to: buf.endIndex)
+            if have < contentLength && !isComplete {
+                self.readRequest(conn, accumulated: buf)
+                return
+            }
+            let body = buf.subdata(in: bodyStart..<buf.endIndex)
+            self.respond(header: header, body: body, on: conn)
         }
     }
 
-    private func respond(to request: String, on conn: NWConnection) {
-        // Parse GET path from first line: "GET /path HTTP/1.1"
+    private func respond(header request: String, body: Data, on conn: NWConnection) {
+        // Parse "METHOD /path HTTP/1.1"
         let firstLine = request.split(separator: "\r\n").first ?? ""
         let parts = firstLine.split(separator: " ")
+        let method = parts.count >= 1 ? String(parts[0]) : "GET"
         let rawPath = parts.count >= 2 ? String(parts[1]) : "/"
+
+        // debug control channel: /ctl/* routes to the injected handler
+        if rawPath.hasPrefix("/ctl/"), let handler = controlHandler {
+            let (contentType, respBody) = handler(method, rawPath, body)
+            send(httpResponse(status: "200 OK", contentType: contentType, body: respBody), on: conn)
+            return
+        }
+
         let path = rawPath == "/" ? "/index.html" : rawPath
 
         // Decode percent-encoding and resolve to filesystem

@@ -2,11 +2,15 @@ import { regOffset, SP_OFFSET, PC_OFFSET, NZCV_OFFSET, V_OFFSET } from './types.
 
 export class CpuState {
   readonly memory: WebAssembly.Memory;
+  /** per-thread register-block base in linear memory. 0 for the main thread / single-threaded;
+   * a thread-worker's block sits at its reg_base so threads sharing one memory keep private regs. */
+  readonly base: number;
   private _view: DataView;
   private _buffer: ArrayBuffer;
 
-  constructor(memory: WebAssembly.Memory) {
+  constructor(memory: WebAssembly.Memory, base = 0) {
     this.memory = memory;
+    this.base = base;
     this._buffer = memory.buffer;
     this._view = new DataView(this._buffer);
   }
@@ -22,36 +26,36 @@ export class CpuState {
 
   getReg(r: number): bigint {
     if (r === 31) return 0n; // XZR reads as zero
-    return this.view.getBigUint64(regOffset(r), true);
+    return this.view.getBigUint64(this.base + regOffset(r), true);
   }
 
   setReg(r: number, value: bigint): void {
     if (r === 31) return; // XZR writes are discarded
-    this.view.setBigUint64(regOffset(r), value, true);
+    this.view.setBigUint64(this.base + regOffset(r), value, true);
   }
 
   getSP(): bigint {
-    return this.view.getBigUint64(SP_OFFSET, true);
+    return this.view.getBigUint64(this.base + SP_OFFSET, true);
   }
 
   setSP(value: bigint): void {
-    this.view.setBigUint64(SP_OFFSET, value, true);
+    this.view.setBigUint64(this.base + SP_OFFSET, value, true);
   }
 
   getPC(): bigint {
-    return this.view.getBigUint64(PC_OFFSET, true);
+    return this.view.getBigUint64(this.base + PC_OFFSET, true);
   }
 
   setPC(value: bigint): void {
-    this.view.setBigUint64(PC_OFFSET, value, true);
+    this.view.setBigUint64(this.base + PC_OFFSET, value, true);
   }
 
   getNZCV(): bigint {
-    return this.view.getBigUint64(NZCV_OFFSET, true);
+    return this.view.getBigUint64(this.base + NZCV_OFFSET, true);
   }
 
   setNZCV(value: bigint): void {
-    this.view.setBigUint64(NZCV_OFFSET, value, true);
+    this.view.setBigUint64(this.base + NZCV_OFFSET, value, true);
   }
 
   reset(): void {
@@ -62,7 +66,7 @@ export class CpuState {
     this.setNZCV(0n);
     // Zero SIMD registers V0-V31 (32 × 16 bytes = 512 bytes)
     for (let i = 0; i < 32 * 16; i += 8) {
-      this.view.setBigUint64(V_OFFSET + i, 0n, true);
+      this.view.setBigUint64(this.base + V_OFFSET + i, 0n, true);
     }
   }
 }

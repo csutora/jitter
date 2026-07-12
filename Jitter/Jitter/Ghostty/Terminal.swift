@@ -63,5 +63,15 @@ final class Terminal {
         ghostty_terminal_scroll_viewport(handle, behavior)
     }
 
+    /// Absolute viewport position within the full scrollback. `offset` is the row index of the
+    /// top visible row measured from the very top of the scrollable area (stable content anchor);
+    /// `total` is the scrollable height in rows, `len` the visible rows. nil if unavailable.
+    func scrollbar() -> (total: Int, offset: Int, len: Int)? {
+        guard let handle else { return nil }
+        var sb = GhosttyTerminalScrollbar(total: 0, offset: 0, len: 0)
+        guard ghostty_terminal_get(handle, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &sb) == GHOSTTY_SUCCESS else { return nil }
+        return (Int(sb.total), Int(sb.offset), Int(sb.len))
+    }
+
     var rawHandle: OpaquePointer? { handle }
 }

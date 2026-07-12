@@ -30,7 +30,7 @@ export interface SyscallState {
   cwd: string;
   fdFlags: Map<number, number>;
   fdTable?: Map<number, any>;  // FdEntry map — pipe/dup redirections
-  nextFd?: number;
+  sharedRegions?: Array<{ addr: number; len: number }>; // MAP_SHARED ranges preserved across fork
 }
 
 interface ProcessState {
@@ -151,10 +151,24 @@ export class ProcessManager {
     const parent = this.processStack.pop()!;
     parent.childExitCode = code;
 
+    // MAP_SHARED regions are shared across the fork: the child's writes must survive
+    // the parent-memory restore. capture the child's bytes for each shared region now,
+    // then re-apply after restoring the parent snapshot.
+    const shared = parent.syscallState.sharedRegions ?? [];
+    const savedShared = shared.map((r) => {
+      const start = r.addr + GUEST_MEM_BASE;
+      return new Uint8Array(memory.buffer.slice(start, start + r.len));
+    });
+
     // Restore memory
     const snapBytes = new Uint8Array(parent.memorySnapshot);
     const memBytes = new Uint8Array(memory.buffer);
     memBytes.set(snapBytes, 0);
+
+    // Re-apply the child's writes to shared regions
+    for (let i = 0; i < shared.length; i++) {
+      memBytes.set(savedShared[i], shared[i].addr + GUEST_MEM_BASE);
+    }
 
     // Restore CPU state (first STATE_SIZE bytes, which includes registers)
     const cpuBytes = new Uint8Array(parent.cpuState);

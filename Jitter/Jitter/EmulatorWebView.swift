@@ -29,6 +29,14 @@ struct EmulatorWebView: UIViewRepresentable {
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
 
+        // The webview is purely the compute+bridge engine and renders nothing the user touches
+        // (the terminal is layered on top and owns all input, delivered programmatically via the
+        // bridge). turn OFF its user interaction entirely — otherwise WKWebView keeps live scroll
+        // gesture recognizers that swallow trackpad / mouse-wheel / continuity-cursor scroll events
+        // before the terminal's pan gesture can see them (isScrollEnabled=false is not enough).
+        webView.isUserInteractionEnabled = false
+        webView.scrollView.isUserInteractionEnabled = false
+
         // Load from local HTTP server (not file:// — we need COOP/COEP headers for SharedArrayBuffer)
         let indexURL = baseURL.appendingPathComponent("index.html")
         webView.load(URLRequest(url: indexURL))

@@ -21,6 +21,18 @@ build:
 serve: build
     nix-shell --run "npx -y serve dist"
 
+# Build zig engine (translator.wasm)
+build-engine:
+    cd engine && nix-shell -p zig_0_15 --run "zig build --release=fast"
+
+# Run engine native tests
+test-engine:
+    cd engine && nix-shell -p zig_0_15 --run "zig build test --summary all"
+
+# Run all engine wasm tests through JSC
+test-engine-jsc: build-engine
+    engine/test/all.sh
+
 # Build ghostty-vt.xcframework into Jitter/Frameworks
 build-ghostty:
     cd ghostty && nix develop --command zig build \

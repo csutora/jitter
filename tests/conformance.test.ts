@@ -34,7 +34,7 @@ function runElf(elfPath: string, argv: string[], stdinText = ''): ElfResult | nu
   }
 
   const emu = new Emulator(1024);
-  emu.singleBlockMode = true;
+  // zig translator is the only path now
   emu.elfBytes = elfBytes;
 
   // Minimal VFS — constructor already populates /etc/passwd, /dev/*, /tmp, /proc/self/exe
@@ -61,6 +61,11 @@ function runElf(elfPath: string, argv: string[], stdinText = ''): ElfResult | nu
     writeStderr: (data: Uint8Array) => { stderr += new TextDecoder().decode(data); },
     readStdin: (count: number) => io.readStdin(count),
   }, vfs);
+
+  // an ltp test binary is a normal userspace process, not container init. give it a
+  // realistic non-1 pid: many tests assert pid > 1, and the ltp framework treats a
+  // forked child's getppid()==1 as "the main test process died" (reparented to init).
+  syscalls.setIdentity(100, 1);
 
   emu.syscallHandler = (cpu, memory) => syscalls.handle(cpu, memory);
   emu.syscallHandlerInstance = syscalls;
@@ -110,11 +115,14 @@ function runElf(elfPath: string, argv: string[], stdinText = ''): ElfResult | nu
       }
       if (result.status === 'blocked_read') break;
       if (result.status === 'fork') {
-        emu.processManager.fork(
+        const parentPid = syscalls.currentPid;
+        const childPid = emu.processManager.fork(
           emu.memory, emu.cpu,
           syscalls.getState(),
           result.resumePC,
         );
+        // the emulator continues as the child, so adopt the child identity
+        syscalls.setIdentity(childPid, parentPid);
         pc = result.resumePC;
         continue;
       }
@@ -131,7 +139,9 @@ function runElf(elfPath: string, argv: string[], stdinText = ''): ElfResult | nu
       continue;
     }
 
-    if (totalInsns >= 10_000_000 || blockCount >= 1_000_000) {
+    // note: 10M was calibrated when self-loop blocks reported iterations rather
+    // than executed insns; counts are accurate now so the budget reflects real work
+    if (totalInsns >= 500_000_000 || blockCount >= 1_000_000) {
       console.warn(`Limit reached: ${totalInsns} insns, ${blockCount} blocks`);
       break;
     }
@@ -248,9 +258,18 @@ describe('ltp', () => {
         console.error(result.haltInfo);
       }
 
-      // LTP test passes if exit code is 0 (pass) or 4 (warn) and no TFAIL lines
-      expect([0, 4], `${bin} exited with code ${result.exitCode}`).toContain(result.exitCode);
+      // the engine must not have halted on an undecoded/faulting instruction
+      expect(result.haltInfo, `${bin} halted the engine`).toBeUndefined();
+
+      // LTP exit codes are a bitmask: TPASS=0, TFAIL=1, TBROK=2, TWARN=4, TINFO=16,
+      // TCONF=32. bits 0 and 1 (TFAIL/TBROK) are real failures; everything else is a
+      // clean result. a TCONF-only exit (32) means the test isn't applicable to this
+      // configuration (e.g. the 16-bit-uid syscalls that don't exist on the aarch64
+      // asm-generic ABI) and is a legitimate skip, not a failure.
+      const failBits = result.exitCode & 3;
+      expect(failBits, `${bin} exited with code ${result.exitCode}`).toBe(0);
       expect(failed, `${bin} had ${failed} TFAIL results`).toBe(0);
+      expect(broken, `${bin} had ${broken} TBROK results`).toBe(0);
     });
   }
 });

@@ -25,7 +25,7 @@ function runBusybox(argv: string[], stdinText = '') {
   if (!elfBytes) return null;
 
   const emu = new Emulator(1024);
-  emu.singleBlockMode = true;
+  // zig translator is the only path now
   emu.elfBytes = elfBytes;
 
   const vfs = new InMemoryVFS();
@@ -269,7 +269,7 @@ describe('busybox boot', () => {
     if (!elfBytes) { console.log('busybox not found, skipping'); return; }
 
     const emu = new Emulator(1024);
-    emu.singleBlockMode = true;
+    // zig translator is the only path now
     const vfs = new InMemoryVFS();
     vfs.loadBinary(elfBytes);
     const elfInfo = loadElf(elfBytes, emu.memory);

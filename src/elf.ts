@@ -8,6 +8,7 @@ const ELFDATA2LSB = 1;       // Little-endian
 const EM_AARCH64 = 0xB7;
 const PT_LOAD = 1;
 const PT_DYNAMIC = 2;
+const PT_INTERP = 3;
 const PT_PHDR = 6;
 
 // Dynamic section tags
@@ -31,7 +32,14 @@ export interface ElfInfo {
   phnum: number;        // number of program headers
   brkStart: bigint;     // end of last PT_LOAD segment (heap starts here)
   loadBase: bigint;     // base address for PIE, 0 for non-PIE
+  interpPath?: string;  // PT_INTERP path (dynamic executables); undefined if static
+  interpBase?: bigint;  // load base of the interpreter, once loaded (for AT_BASE)
+  interpEntry?: bigint; // interpreter entry point — execution starts here when dynamic
 }
+
+// base address for the dynamic linker (ld.so). sits above the program (0x400000) and
+// stack (0x800000) but below the shadow reservation at 32MB.
+const INTERP_LOAD_BASE = 0x1000000n; // 16MB
 
 // ── Load an ELF64 binary into WASM linear memory ───────────────────────────
 
@@ -83,6 +91,7 @@ export function loadElf(
   let phdrAddr = 0n;
   let dynOffset = 0;
   let dynSize = 0;
+  let interpPath: string | undefined;
 
   // Process program headers — load segments
   for (let i = 0; i < phnum; i++) {
@@ -100,6 +109,12 @@ export function loadElf(
     if (pType === PT_DYNAMIC) {
       dynOffset = pOffset;
       dynSize = pFilesz;
+    }
+
+    if (pType === PT_INTERP) {
+      let end = pOffset;
+      while (end < pOffset + pFilesz && elfBytes[end] !== 0) end++;
+      interpPath = new TextDecoder().decode(elfBytes.subarray(pOffset, end));
     }
 
     if (pType !== PT_LOAD) continue;
@@ -156,7 +171,57 @@ export function loadElf(
     phnum,
     brkStart,
     loadBase,
+    interpPath,
   };
+}
+
+// ── Load the dynamic linker (ld.so) alongside a dynamic executable ──────────
+// ld.so is itself an ET_DYN; load its PT_LOAD segments at `base` and return its
+// entry point. execution for a dynamic program starts here, not at the program entry.
+export function loadInterp(
+  interpBytes: Uint8Array,
+  memory: WebAssembly.Memory,
+  base: bigint = INTERP_LOAD_BASE,
+): { entry: bigint; base: bigint } {
+  const dv = new DataView(interpBytes.buffer, interpBytes.byteOffset, interpBytes.byteLength);
+  for (let i = 0; i < 4; i++) if (interpBytes[i] !== ELF_MAGIC[i]) throw new Error('interp not an ELF');
+
+  const rawEntry = dv.getBigUint64(24, true);
+  const phoff = Number(dv.getBigUint64(32, true));
+  const phentSize = dv.getUint16(54, true);
+  const phnum = dv.getUint16(56, true);
+
+  let lowestVaddr = 0xFFFFFFFFFFFFFFFFn;
+  for (let i = 0; i < phnum; i++) {
+    const phBase = phoff + i * phentSize;
+    if (dv.getUint32(phBase, true) === PT_LOAD) {
+      const v = dv.getBigUint64(phBase + 16, true);
+      if (v < lowestVaddr) lowestVaddr = v;
+    }
+  }
+  const loadBase = base - lowestVaddr;
+
+  for (let i = 0; i < phnum; i++) {
+    const phBase = phoff + i * phentSize;
+    if (dv.getUint32(phBase, true) !== PT_LOAD) continue;
+    const pOffset = Number(dv.getBigUint64(phBase + 8, true));
+    const pVaddr = dv.getBigUint64(phBase + 16, true) + loadBase;
+    const pFilesz = Number(dv.getBigUint64(phBase + 32, true));
+    const pMemsz = Number(dv.getBigUint64(phBase + 40, true));
+    const wasmAddr = Number(pVaddr) + GUEST_MEM_BASE;
+
+    const needed = wasmAddr + pMemsz;
+    if (needed > memory.buffer.byteLength) {
+      const pagesNeeded = Math.ceil(needed / 65536);
+      const currentPages = memory.buffer.byteLength / 65536;
+      if (pagesNeeded > currentPages) memory.grow(pagesNeeded - currentPages);
+    }
+    const freshBytes = new Uint8Array(memory.buffer);
+    if (pFilesz > 0) freshBytes.set(interpBytes.subarray(pOffset, pOffset + pFilesz), wasmAddr);
+    if (pMemsz > pFilesz) freshBytes.fill(0, wasmAddr + pFilesz, wasmAddr + pMemsz);
+  }
+
+  return { entry: rawEntry + loadBase, base: loadBase };
 }
 
 // ── Apply RELR relocations ─────────────────────────────────────────────────
@@ -249,6 +314,31 @@ function applyRelocations(
   }
 }
 
+// ── High-level program loader (main ELF + optional dynamic interpreter) ──────
+// loads the main ELF, and if it's dynamic (has PT_INTERP), loads the interpreter
+// (ld.so) via the `readInterp` callback and arranges for execution to start at the
+// interpreter's entry with a full auxv. `readInterp(path)` returns the interpreter's
+// bytes (or throws). returns the entry PC to jump to and the initial SP.
+export function loadProgram(
+  memory: WebAssembly.Memory,
+  elfBytes: Uint8Array,
+  argv: string[],
+  envp: string[],
+  readInterp: (path: string) => Uint8Array,
+): { entry: bigint; sp: bigint; brkStart: bigint; interp: boolean } {
+  const elfInfo = loadElf(elfBytes, memory);
+  let startPC = elfInfo.entry;
+  if (elfInfo.interpPath) {
+    const interpBytes = readInterp(elfInfo.interpPath);
+    const { entry: iEntry, base: iBase } = loadInterp(interpBytes, memory);
+    elfInfo.interpBase = iBase;
+    elfInfo.interpEntry = iEntry;
+    startPC = iEntry;
+  }
+  const sp = setupStack(memory, elfInfo, argv, envp);
+  return { entry: startPC, sp, brkStart: elfInfo.brkStart, interp: !!elfInfo.interpPath };
+}
+
 // ── Stack setup (Linux ABI) ─────────────────────────────────────────────────
 
 const STACK_TOP = 0x800000; // 8MB
@@ -259,12 +349,25 @@ const AT_PHDR = 3;
 const AT_PHENT = 4;
 const AT_PHNUM = 5;
 const AT_PAGESZ = 6;
+const AT_BASE = 7;       // interpreter (ld.so) load base
+const AT_FLAGS = 8;
 const AT_ENTRY = 9;
 const AT_UID = 11;
 const AT_EUID = 12;
 const AT_GID = 13;
 const AT_EGID = 14;
+const AT_PLATFORM = 15;
+const AT_HWCAP = 16;
+const AT_CLKTCK = 17;
+const AT_SECURE = 23;
 const AT_RANDOM = 25;
+const AT_EXECFN = 31;
+
+// hwcap bits we can honestly back: FP + AdvSIMD (both fully translated). deliberately
+// NOT advertising SVE/SME/etc that we can't run, so glibc ifunc resolvers stay on code
+// paths we support.
+const HWCAP_FP = 1 << 0;
+const HWCAP_ASIMD = 1 << 1;
 
 export function setupStack(
   memory: WebAssembly.Memory,
@@ -302,6 +405,15 @@ export function setupStack(
     bytes[sp + GUEST_MEM_BASE + i] = (Math.random() * 256) | 0;
   }
 
+  // AT_PLATFORM string
+  const platform = new TextEncoder().encode('aarch64\0');
+  sp -= platform.length;
+  const platformAddr = sp;
+  bytes.set(platform, sp + GUEST_MEM_BASE);
+
+  // AT_EXECFN points at the program path (argv[0])
+  const execfnAddr = stringAddrs.length > 0 ? stringAddrs[0] : 0;
+
   // ── Align SP to 16 bytes ──
   sp = sp & ~0xF;
 
@@ -312,13 +424,21 @@ export function setupStack(
     [AT_PHNUM, BigInt(elfInfo.phnum)],
     [AT_PAGESZ, 4096n],
     [AT_ENTRY, elfInfo.entry],
+    [AT_FLAGS, 0n],
+    [AT_HWCAP, BigInt(HWCAP_FP | HWCAP_ASIMD)],
+    [AT_CLKTCK, 100n],
+    [AT_SECURE, 0n],
     [AT_UID, 0n],
     [AT_EUID, 0n],
     [AT_GID, 0n],
     [AT_EGID, 0n],
+    [AT_PLATFORM, BigInt(platformAddr)],
+    [AT_EXECFN, BigInt(execfnAddr)],
     [AT_RANDOM, BigInt(randomAddr)],
-    [AT_NULL, 0n],
   ];
+  // AT_BASE only for dynamic executables (interpreter present)
+  if (elfInfo.interpBase !== undefined) auxv.push([AT_BASE, elfInfo.interpBase]);
+  auxv.push([AT_NULL, 0n]);
 
   const stackEntries =
     8 + // argc

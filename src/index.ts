@@ -114,10 +114,22 @@ function translateNewlines(data: Uint8Array): Uint8Array {
 
 // ── Shell boot ──────────────────────────────────────────────────────────────
 
+let bootStarted = false;
 (window as any).bootShell = async () => {
+  // idempotent: the native auto-boot can fire from both the DOMContentLoaded listener
+  // and the readyState check, and a double boot spins up two competing kernels/shells
+  // that deadlock each other (no prompt).
+  if (bootStarted) return;
+  bootStarted = true;
+
   const btn = document.getElementById('btn-shell') as HTMLButtonElement;
-  btn.disabled = true;
-  btn.textContent = 'Loading...';
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
+
+  // hoisted so the catch handler can surface errors on the terminal itself.
+  // in the native app the status bar is hidden behind the terminal, so a thrown
+  // boot error would otherwise be completely invisible.
+  let writeOutput: ((data: Uint8Array) => void) | null = null;
+  const term = (s: string) => writeOutput?.(new TextEncoder().encode(s));
 
   try {
     // Setup native bridge (active only in WKWebView)
@@ -126,9 +138,25 @@ function translateNewlines(data: Uint8Array): Uint8Array {
       console.log('[jitter] Native bridge detected — filesystem calls will route to Swift');
     }
 
+    // bring the output path up FIRST, so every later step (busybox load, translator
+    // fetch, kernel boot) can report failures onto the visible terminal. if this
+    // banner never appears, the terminal rendering path itself is broken.
+    writeOutput = bridge.isNative
+      ? (data: Uint8Array) => {
+          bridge.call('term_data', { data: uint8ToBase64(data) }).catch(() => {});
+        }
+      : makeBrowserSink();
+    term('[jitter] boot: output path up\r\n');
+
+    const statusBar = document.getElementById('status-bar')!;
+    statusBar.classList.add('active');
+    if (btn) btn.style.display = 'none';
+    statusBar.textContent = 'Booting...';
+
     // Load busybox binary — via bridge in native app, via fetch in browser
     let elfBytes: Uint8Array;
     if (bridge.isNative) {
+      term('[jitter] boot: loading busybox...\r\n');
       const resp = await bridge.call('load_bundle_file', { name: 'busybox-aarch64' });
       if (resp.error) throw new Error(`Failed to load busybox via bridge: ${resp.error}`);
       const binary = atob(resp.data as string);
@@ -139,17 +167,7 @@ function translateNewlines(data: Uint8Array): Uint8Array {
       if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
       elfBytes = new Uint8Array(await resp.arrayBuffer());
     }
-
-    const statusBar = document.getElementById('status-bar')!;
-    statusBar.classList.add('active');
-    btn.style.display = 'none';
-    statusBar.textContent = 'Booting...';
-
-    const writeOutput = bridge.isNative
-      ? (data: Uint8Array) => {
-          bridge.call('term_data', { data: uint8ToBase64(data) }).catch(() => {});
-        }
-      : makeBrowserSink();
+    term(`[jitter] boot: busybox loaded (${elfBytes.length} bytes)\r\n`);
 
     // ── Multicore path: use Kernel + Web Workers when cross-origin isolated ──
     if (!self.crossOriginIsolated) {
@@ -160,19 +178,30 @@ function translateNewlines(data: Uint8Array): Uint8Array {
 
     statusBar.textContent = 'Booting...';
 
+    // the zig translator is mandatory now (the ts translator was removed). a failed
+    // fetch here means every worker will throw on init, so make it loud, not silent.
+    term('[jitter] boot: fetching translator.wasm...\r\n');
+    let zigTranslatorBytes: ArrayBuffer;
+    const tresp = await fetch('translator.wasm');
+    if (!tresp.ok) throw new Error(`translator.wasm fetch failed: HTTP ${tresp.status}`);
+    zigTranslatorBytes = await tresp.arrayBuffer();
+    term(`[jitter] boot: translator ready (${zigTranslatorBytes.byteLength} bytes)\r\n`);
+
+    const out = writeOutput!;
     const kernel = new Kernel({
       elfBytes,
       workerURL: 'worker.js',
       onOutput: (data: Uint8Array) => {
-        writeOutput(appendScrollbackWipeAfterClear(translateNewlines(data)));
+        out(appendScrollbackWipeAfterClear(translateNewlines(data)));
       },
       bridge: bridge.isNative ? bridge : undefined,
+      zigTranslatorBytes,
     });
 
     const feedStdin = (bytes: Uint8Array) => {
       if (bytes.length === 1 && bytes[0] === 0x03) {
         kernel.sendInterrupt();
-        writeOutput(new Uint8Array([0x5E, 0x43, 0x0D, 0x0A]));
+        out(new Uint8Array([0x5E, 0x43, 0x0D, 0x0A]));
         return;
       }
       kernel.pushStdin(bytes);
@@ -193,6 +222,7 @@ function translateNewlines(data: Uint8Array): Uint8Array {
       }
     }
 
+    term('[jitter] boot: starting sh (if no prompt follows, the emulator/worker stalled)\r\n');
     kernel.boot(
       ['sh'],
       ['HOME=/root', 'TERM=xterm-256color', 'PATH=/bin', 'PWD=/'],
@@ -201,10 +231,11 @@ function translateNewlines(data: Uint8Array): Uint8Array {
     statusBar.textContent = 'Running';
   } catch (err: any) {
     console.error('Boot failed:', err);
+    // surface the failure on the terminal (visible) and the status bar (browser)
+    term(`\r\n[jitter] boot failed: ${err?.message ?? err}\r\n${err?.stack ?? ''}\r\n`);
     const sb = document.getElementById('status-bar');
     if (sb) sb.textContent = `Boot failed: ${err.message}`;
-    btn.disabled = false;
-    btn.textContent = 'Boot Shell';
+    if (btn) { btn.disabled = false; btn.textContent = 'Boot Shell'; }
   }
 };
 
@@ -216,8 +247,11 @@ if ((window as any).webkit?.messageHandlers?.jitter) {
     if (el) el.style.display = 'none';
   };
   for (const id of ['controls', 'status-bar']) hide(id);
-  window.addEventListener('DOMContentLoaded', () => {
+  // boot exactly once: either the DOM is already parsed (fire now) or wait for it.
+  // bootShell is also idempotent as a backstop.
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', () => (window as any).bootShell?.(), { once: true });
+  } else {
     (window as any).bootShell?.();
-  });
-  if (document.readyState !== 'loading') (window as any).bootShell?.();
+  }
 }

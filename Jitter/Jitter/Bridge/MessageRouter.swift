@@ -1,6 +1,17 @@
 import Foundation
 import WebKit
 
+// Parse the guest process credentials the TS layer threads into path-op bridge args. Absent
+// creds default to root — only the trusted worker builds these, so "no creds" means an internal
+// app operation, which runs privileged.
+private func parseCreds(_ args: [String: Any]) -> FsCreds {
+    guard let c = args["creds"] as? [String: Any] else { return .root }
+    func u(_ k: String, _ d: UInt32) -> UInt32 { (c[k] as? Int).map { UInt32(truncatingIfNeeded: $0) } ?? d }
+    let groups = (c["groups"] as? [Int])?.map { UInt32(truncatingIfNeeded: $0) } ?? []
+    return FsCreds(ruid: u("ruid", 0), euid: u("euid", 0), rgid: u("rgid", 0), egid: u("egid", 0),
+                   umask: u("umask", 0o022), groups: groups)
+}
+
 /// Routes messages from JS to native handlers using WKScriptMessageHandlerWithReply (iOS 14+).
 ///
 /// JS calls: `const result = await window.webkit.messageHandlers.jitter.postMessage({method, args})`
@@ -12,6 +23,31 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
     var onTerminalData: ((Data) -> Void)?
     private var lastTermCols: Int = 0
     private var lastTermRows: Int = 0
+
+    // ── debug control channel ────────────────────────────────────────────────
+    // taps a rolling copy of everything written to the terminal and lets an external
+    // driver inject stdin / read output / reboot the guest over http (see LocalServer).
+    // dev tooling for the in-vivo test loop; gated on by ContentView.
+    private let ctlLock = NSLock()
+    private var ctlBuffer = Data()
+    private let ctlCap = 8 * 1024 * 1024
+    private func ctlAppend(_ d: Data) {
+        ctlLock.lock(); defer { ctlLock.unlock() }
+        ctlBuffer.append(d)
+        if ctlBuffer.count > ctlCap { ctlBuffer.removeFirst(ctlBuffer.count - ctlCap) }
+    }
+    func ctlReadOutput() -> Data {
+        ctlLock.lock(); defer { ctlLock.unlock() }
+        return ctlBuffer
+    }
+    func ctlClearOutput() {
+        ctlLock.lock(); ctlBuffer.removeAll(keepingCapacity: true); ctlLock.unlock()
+    }
+    func ctlInject(_ text: String) { sendStdin(Data(text.utf8)) }
+    func ctlReset() {
+        ctlClearOutput()
+        DispatchQueue.main.async { [weak self] in self?.webView?.reload() }
+    }
 
     override init() {
         super.init()
@@ -154,14 +190,17 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let mode = args["mode"] as? Int else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.open(path: path, flags: Int32(flags), mode: Int32(mode))], nil)
+            // truncatingIfNeeded, not Int32(_:): the guest can pass a 64-bit value with junk
+            // high bits (e.g. open() without O_CREAT leaves mode uninitialized), and Int32(_:)
+            // would trap on overflow, taking down the whole app.
+            reply(["ret": fs.open(path: path, flags: Int32(truncatingIfNeeded: flags), mode: Int32(truncatingIfNeeded: mode), creds: parseCreds(args))], nil)
         }
 
         handlers["fs_close"] = { args, reply in
             guard let fd = args["fd"] as? Int else {
                 reply(["ret": -9], nil); return
             }
-            reply(["ret": fs.close(fd: Int32(fd))], nil)
+            reply(["ret": fs.close(fd: Int32(truncatingIfNeeded: fd))], nil)
         }
 
         handlers["fs_read"] = { args, reply in
@@ -169,7 +208,7 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let count = args["count"] as? Int else {
                 reply(["ret": -9], nil); return
             }
-            let (ret, data) = fs.read(fd: Int32(fd), count: count)
+            let (ret, data) = fs.read(fd: Int32(truncatingIfNeeded: fd), count: count)
             if let data = data {
                 reply(["ret": ret, "data": data.base64EncodedString()], nil)
             } else {
@@ -183,7 +222,7 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let data = Data(base64Encoded: b64) else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.write(fd: Int32(fd), data: data)], nil)
+            reply(["ret": fs.write(fd: Int32(truncatingIfNeeded: fd), data: data)], nil)
         }
 
         handlers["fs_stat"] = { args, reply in
@@ -199,14 +238,14 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let whence = args["whence"] as? Int else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.lseek(fd: Int32(fd), offset: Int64(offset), whence: Int32(whence))], nil)
+            reply(["ret": fs.lseek(fd: Int32(truncatingIfNeeded: fd), offset: Int64(truncatingIfNeeded: offset), whence: Int32(truncatingIfNeeded: whence))], nil)
         }
 
         handlers["fs_getdents"] = { args, reply in
             guard let fd = args["fd"] as? Int else {
                 reply(["ret": -9], nil); return
             }
-            let (ret, entries) = fs.getdents(fd: Int32(fd))
+            let (ret, entries) = fs.getdents(fd: Int32(truncatingIfNeeded: fd))
             reply(["ret": ret, "entries": entries], nil)
         }
 
@@ -215,7 +254,7 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let mode = args["mode"] as? Int else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.mkdir(path: path, mode: Int32(mode))], nil)
+            reply(["ret": fs.mkdir(path: path, mode: Int32(truncatingIfNeeded: mode), creds: parseCreds(args))], nil)
         }
 
         handlers["fs_unlink"] = { args, reply in
@@ -257,7 +296,7 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
             guard let fd = args["fd"] as? Int else {
                 reply(["ret": -9], nil); return
             }
-            reply(fs.fstat(fd: Int32(fd)), nil)
+            reply(fs.fstat(fd: Int32(truncatingIfNeeded: fd)), nil)
         }
 
         handlers["fs_ftruncate"] = { args, reply in
@@ -265,14 +304,14 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let length = args["length"] as? Int else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.ftruncate(fd: Int32(fd), length: Int64(length))], nil)
+            reply(["ret": fs.ftruncate(fd: Int32(truncatingIfNeeded: fd), length: Int64(truncatingIfNeeded: length))], nil)
         }
 
         handlers["fs_dup"] = { args, reply in
             guard let fd = args["fd"] as? Int else {
                 reply(["ret": -9], nil); return
             }
-            reply(["ret": fs.dup(fd: Int32(fd))], nil)
+            reply(["ret": fs.dup(fd: Int32(truncatingIfNeeded: fd))], nil)
         }
 
         handlers["fs_faccessat"] = { args, reply in
@@ -280,7 +319,7 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let mode = args["mode"] as? Int else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.faccessat(path: path, mode: Int32(mode))], nil)
+            reply(["ret": fs.faccessat(path: path, mode: Int32(truncatingIfNeeded: mode), creds: parseCreds(args))], nil)
         }
 
         handlers["fs_chmod"] = { args, reply in
@@ -288,7 +327,19 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                   let mode = args["mode"] as? Int else {
                 reply(["ret": -22], nil); return
             }
-            reply(["ret": fs.chmod(path: path, mode: Int32(mode))], nil)
+            reply(["ret": fs.chmod(path: path, mode: Int32(truncatingIfNeeded: mode), creds: parseCreds(args))], nil)
+        }
+
+        handlers["fs_chown"] = { args, reply in
+            guard let path = args["path"] as? String,
+                  let uid = args["uid"] as? Int,
+                  let gid = args["gid"] as? Int else {
+                reply(["ret": -22], nil); return
+            }
+            reply(["ret": fs.chown(path: path,
+                                   uid: Int32(truncatingIfNeeded: uid),
+                                   gid: Int32(truncatingIfNeeded: gid),
+                                   creds: parseCreds(args))], nil)
         }
 
         handlers["term_size_query"] = { [weak self] _, reply in
@@ -297,9 +348,11 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
 
         handlers["term_data"] = { [weak self] args, reply in
             if let b64 = args["data"] as? String,
-               let data = Data(base64Encoded: b64),
-               let cb = self?.onTerminalData {
-                DispatchQueue.main.async { cb(data) }
+               let data = Data(base64Encoded: b64) {
+                self?.ctlAppend(data) // tee for the debug control channel
+                if let cb = self?.onTerminalData {
+                    DispatchQueue.main.async { cb(data) }
+                }
             }
             reply([:], nil)
         }
