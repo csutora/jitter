@@ -1,5 +1,5 @@
 import { CpuState } from './cpu.js';
-import { GUEST_MEM_BASE, TPIDR_OFFSET, PC_OFFSET } from './types.js';
+import { GUEST_MEM_BASE, TPIDR_OFFSET, PC_OFFSET, V_OFFSET } from './types.js';
 import type { NativeBridge } from './bridge.js';
 
 // ── Syscall result type ─────────────────────────────────────────────────────
@@ -10,7 +10,12 @@ export type SyscallResult =
   | { status: 'blocked_read'; fd: number }
   | { status: 'fork'; resumePC: bigint }
   | { status: 'execve'; path: string; argv: string[]; envp: string[] }
-  | { status: 'bridge'; method: string; args: Record<string, any>; apply: (resp: any) => void };
+  | { status: 'bridge'; method: string; args: Record<string, any>; apply: (resp: any) => void }
+  // cooperative-scheduler statuses (only produced when this.coop is set — the conformance
+  // harness drives real concurrent processes). the syscall is re-run when the process is
+  // rescheduled, so the handler leaves no partial side effects before returning these.
+  | { status: 'coop_block'; reason: 'pipe_read' | 'pipe_write' | 'lock' | 'futex'; addr?: number }
+  | { status: 'coop_wait'; kind: 'wait4' | 'waitid'; wantPid: number; wstatusAddr: number; options: number; infop: number };
 
 // base64-encode bytes for the bridge. must chunk: btoa(String.fromCharCode(...data))
 // spreads the whole buffer as call args and blows the stack on large writes (tar extract).
@@ -38,6 +43,9 @@ const EAGAIN = 11;
 const EFAULT = 14;
 const EACCES = 13;
 const ENOMEM = 12;
+const EEXIST = 17;
+const ESRCH  = 3;
+const EDEADLK = 35;
 const MAX_FDS = 1024;
 
 // per-process address-space ceiling (RLIMIT_AS-ish). a mmap/brk growth past this returns ENOMEM
@@ -71,7 +79,12 @@ const SIG_STOP_DEFAULT = new Set([19, 20, 21, 22]); // SIGSTOP, SIGTSTP, SIGTTIN
 // [264]     NZCV
 // [272]     signal number (for our use)
 // Total: 280 bytes, rounded to 16-byte alignment = 288 bytes
-const SIGNAL_FRAME_SIZE = 288;
+// GPRs+SP+PC+NZCV+signum+mask occupy the first 288 bytes; the 32 V (NEON/FP) registers (512 bytes)
+// follow at offset 288. saving them is mandatory: crypto and memcpy run in V registers, so a signal
+// (e.g. apk's SIGALRM network-timeout) delivered mid-computation would otherwise corrupt vector state
+// on rt_sigreturn and silently garble the result — the TLS "unexpected message" was exactly this.
+const SIGNAL_FRAME_V_OFFSET = 288;
+const SIGNAL_FRAME_SIZE = SIGNAL_FRAME_V_OFFSET + 512;
 
 // ── ioctl constants ─────────────────────────────────────────────────────────
 
@@ -136,6 +149,10 @@ export interface IOInterface {
   stdinHasData?(): boolean;
   /** Block until stdin has data or timeout fires (ms; negative = infinite). Returns whether data arrived. */
   waitStdin?(timeoutMs: number): 'data' | 'timeout';
+  /** Synchronously read up to `count` bytes at `offset` from a NATIVE (bridge-backed) fd. used by
+   * file-backed mmap + pread on real files (ld.so maps shared libraries this way). returns the bytes
+   * actually read (short at EOF); undefined when no bridge is available (tests use the vfs path). */
+  readFileAt?(nativeFd: number, offset: number, count: number): Uint8Array;
 }
 
 // ── Syscall handler ─────────────────────────────────────────────────────────
@@ -146,6 +163,12 @@ interface PipeBuffer {
   data: Uint8Array[];
   writeClosed: boolean;
   readClosed: boolean;
+  // open-fd refcounts. writeClosed/readClosed become true only when the last
+  // holder of that end is closed (across fork, both parent and child hold a
+  // reference). without this a single close would signal a premature EOF.
+  writers: number;
+  readers: number;
+  bytes: number; // queued byte count, for backpressure on a full pipe
 }
 
 type FdEntry =
@@ -161,7 +184,12 @@ type FdEntry =
   | { type: 'eventfd'; counter: bigint; semaphore: boolean }  // 8-byte counter (real semantics)
   | { type: 'epoll' };                                   // multiplexer (state in this.epollSets)
 
+const NET_TRACE = false; // socket trace for https diagnosis; flip to true when needed, remove before ship.
+const FD_TRACE = false; // fd-lifecycle trace; flip to true when needed, remove before ship.
+
 export class SyscallHandler {
+  private nt(s: string) { if (NET_TRACE) this.io.writeStderr(new TextEncoder().encode('[net] ' + s + '\n')); }
+  private ft(s: string) { if (FD_TRACE) this.io.writeStderr(new TextEncoder().encode('[fd] ' + s + '\n')); }
   private brk: bigint;
   // the exclusive-monitor shadow lives at ZIG_SHADOW_BASE (32MB) and is tiny
   // (1 byte per 512 guest bytes, so <=256KB for a 128MB guest). reserve [32MB,33MB)
@@ -176,9 +204,20 @@ export class SyscallHandler {
   // MAP_SHARED regions (guest offsets). shared across fork: a child's writes to these
   // must survive the parent-memory restore in the serialized fork model.
   private sharedRegions: Array<{ addr: number; len: number }> = [];
+  // writable MAP_SHARED mappings of real (native) files. the guest writes into the mapping and
+  // expects those bytes flushed back to the file on msync/munmap (this is how apk extracts
+  // binaries). we track them and pwrite the dirty range through the bridge on flush.
+  private fileMmaps: Array<{ start: number; len: number; fileLen: number; nativeFd: number; fileOffset: number }> = [];
   // guest ranges mapped PROT_NONE (inaccessible). a user pointer landing here faults with
   // EFAULT, which is how LTP's tst_get_bad_addr() probes are built.
   private protNone: Array<{ start: number; end: number }> = [];
+  // page-aligned, non-overlapping locked-memory intervals (mmap MAP_LOCKED / mlock). their
+  // total is reported as VmLck in /proc/self/status.
+  private lockedRegions: Array<{ start: number; end: number }> = [];
+  // virtual memory areas (guest offsets == guest-visible addresses), sorted, non-overlapping.
+  // drives MAP_FIXED_NOREPLACE overlap detection and the synthetic /proc/self/maps. prot holds
+  // the PROT_* bits; shared distinguishes p/s in the maps perms column.
+  private vmas: Array<{ start: number; end: number; prot: number; shared: boolean }> = [];
   private cwd = '/';
   private tpidr = 0n;
   private umask = 0o022;
@@ -234,6 +273,28 @@ export class SyscallHandler {
     return Math.max(0, this.itimerRealDeadlineMs - Number(this.nowMs()));
   }
   pendingSignals: number[] = [];  // queue of signals to deliver
+
+  // cooperative-scheduler mode. when set, blocking syscalls (pipe read on an empty
+  // pipe, wait4/waitid with live-but-not-yet-exited children) yield to the scheduler
+  // instead of using the serialized vfork fast path. off by default so the app's
+  // dispatch loop and busybox boot keep their existing single-runner behavior.
+  coop = false;
+  // set true whenever a syscall does something that could unblock another process
+  // (writes to a pipe, closes the last writer/reader end). the harness wakes blocked
+  // processes on this signal so a parked reader/writer re-checks its condition.
+  schedEvent = false;
+  // shared posix advisory-lock table (fcntl record locks), injected by the harness in
+  // coop mode. null in the serialized path, where locks are stubbed as always-granted.
+  locks: import('./scheduler.js').LockManager | null = null;
+  // cross-process signal delivery (kill) in coop mode. (pid, sig) => target existed.
+  // sig 0 is an existence probe. null in the serialized path.
+  killHook: ((pid: number, sig: number) => boolean) | null = null;
+  // wake up to `n` processes blocked in FUTEX_WAIT on a guest address; returns the
+  // count actually woken (what FUTEX_WAKE must report). null in the serialized path.
+  futexWakeHook: ((addr: number, n: number) => number) | null = null;
+  // set by a voluntarily-yielding syscall (nanosleep, sched_yield) in coop mode so the
+  // harness runs another process before resuming this one (cooperative preemption point).
+  wantYield = false;
   private epollSets?: Map<number, Map<number, { events: number; data: bigint }>>;
   private signalHandlers?: Map<number, { handler: bigint; flags: bigint; restorer: bigint; mask: bigint }>;
   private signalMask?: bigint;
@@ -241,6 +302,12 @@ export class SyscallHandler {
   bridgeAvailable = false;
   currentPid = 1;
   currentPpid = 0;
+  // returns true if `pid` is a live process (a suspended ancestor in the serialized fork model).
+  // wired by the dispatch/worker loop to the process manager so kill() can raise ESRCH correctly.
+  isLivePidFn: ((pid: number) => boolean) | null = null;
+  // wired by the dispatch loop to the page-protection table: records the PROT_* permission of the
+  // guest pages covering [addr, addr+len) so guest accesses to restricted pages fault (SIGSEGV).
+  protHook: ((addr: number, len: number, prot: number) => void) | null = null;
   /** thread-group id: 0 for a normal process (getpid == currentPid); for a thread it's the
    * process pid so getpid()==tgid while gettid()==currentPid(==tid). */
   tgid = 0;
@@ -263,7 +330,7 @@ export class SyscallHandler {
   private nativeRefs = new Map<number, number>(); // nativeFd -> refcount
   // Stat cache: populated from getdents, consumed by fs_stat. Avoids N+1 bridge calls for ls -l.
   // Path → {mode, size, nlink, mtime, expiresAt (ms since epoch)}
-  private statCache = new Map<string, { mode: number; size: number; nlink: number; mtime: number; uid: number; gid: number; expiresAt: number }>();
+  private statCache = new Map<string, { mode: number; size: number; nlink: number; mtime: number; uid: number; gid: number; ino: number; expiresAt: number }>();
   private readonly STAT_CACHE_TTL_MS = 1000;
   lastWaitStatus?: number;  // exit code from last child (set by dispatch loop)
   lastWaitPid?: number;     // PID of last exited child
@@ -294,6 +361,130 @@ export class SyscallHandler {
    * JS VFS handles: /proc, /dev (virtual, per-process)
    * Native Swift handles: everything else (/bin, /etc, /tmp, /root, /home, /var, /usr, ...)
    */
+  // resolve an *at()-family path against its dirfd. absolute paths and AT_FDCWD (-100) pass through
+  // (bridgePath/vfs resolve them against cwd). otherwise the path is relative to the directory the
+  // fd refers to, so join it onto that fd's known path. apk loads trust keys via openat(keys_fd, name),
+  // so without this the keys never open and every index signature reads as UNTRUSTED.
+  private resolveAt(dirfd: bigint, path: string): string {
+    if (path.startsWith('/')) return path;
+    const d = Number(BigInt.asIntN(64, dirfd));
+    if (d === -100) return path; // AT_FDCWD
+    const base = (this.getFdEntry(d) as any)?.path;
+    if (typeof base === 'string' && base.length) return (base.endsWith('/') ? base : base + '/') + path;
+    return path;
+  }
+
+  // flush a writable MAP_SHARED native-file mapping back to disk on msync/munmap. finds the mapping
+  // overlapping [reqStart, reqStart+reqLen), pwrites its dirty (real-file) bytes through the bridge,
+  // and drops the record when unmapping. returns a bridge action, or null if nothing to flush.
+  private buildMmapFlush(cpu: any, memory: WebAssembly.Memory, reqStart: number, reqLen: number, removeAfter: boolean): SyscallResult | null {
+    for (let i = 0; i < this.fileMmaps.length; i++) {
+      const m = this.fileMmaps[i];
+      if (reqStart >= m.start + m.len || reqStart + reqLen <= m.start) continue;
+      if (removeAfter) this.fileMmaps.splice(i, 1);
+      const fStart = Math.max(reqStart, m.start);
+      const fEnd = Math.min(reqStart + reqLen, m.start + m.fileLen);
+      if (fEnd <= fStart) return null;
+      const data = new Uint8Array(memory.buffer).slice(fStart + GUEST_MEM_BASE, fEnd + GUEST_MEM_BASE);
+      return {
+        status: 'bridge', method: 'fs_pwrite',
+        args: { fd: m.nativeFd, offset: m.fileOffset + (fStart - m.start), data: bytesToBase64(data) },
+        apply: () => { cpu.setReg(0, 0n); },
+      };
+    }
+    return null;
+  }
+
+  // mark [start,end) (page-aligned) as locked or unlocked in the VmLck accounting, keeping the
+  // interval set normalized (non-overlapping, merged), then republish the total to the vfs.
+  private setLocked(start: number, end: number, locked: boolean): void {
+    if (end <= start) return;
+    const next: Array<{ start: number; end: number }> = [];
+    for (const r of this.lockedRegions) {
+      if (r.end <= start || r.start >= end) { next.push(r); continue; }
+      if (r.start < start) next.push({ start: r.start, end: start });
+      if (r.end > end) next.push({ start: end, end: r.end });
+    }
+    if (locked) next.push({ start, end });
+    next.sort((a, b) => a.start - b.start);
+    const merged: Array<{ start: number; end: number }> = [];
+    for (const r of next) {
+      const last = merged[merged.length - 1];
+      if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+      else merged.push({ ...r });
+    }
+    this.lockedRegions = merged;
+    let total = 0;
+    for (const r of merged) total += r.end - r.start;
+    if (this.vfs) (this.vfs as any).vmLckKb = Math.floor(total / 1024);
+  }
+
+  // does [start,end) overlap any tracked vma? used for MAP_FIXED_NOREPLACE.
+  private vmaOverlaps(start: number, end: number): boolean {
+    for (const v of this.vmas) if (v.start < end && start < v.end) return true;
+    return false;
+  }
+
+  // register the lazy /proc/self/maps renderer once the vma set is live.
+  private publishVmas(): void {
+    if (this.vfs && !(this.vfs as any).procMapsGen) (this.vfs as any).procMapsGen = () => this.renderProcMaps();
+  }
+
+  // vmas is kept sorted and non-overlapping, so all edits are a single O(n) pass with inline
+  // coalescing of adjacent identical vmas: no re-sort, which keeps mapping-heavy loops linear.
+  private vmaEmit(out: Array<{ start: number; end: number; prot: number; shared: boolean }>, v: { start: number; end: number; prot: number; shared: boolean }): void {
+    const last = out[out.length - 1];
+    if (last && last.end === v.start && last.prot === v.prot && last.shared === v.shared) last.end = v.end;
+    else out.push(v);
+  }
+
+  // carve [start,end) out of the vma set (splitting boundary vmas), then optionally insert a fresh
+  // vma with the given prot/shared, all in sorted order.
+  private vmaSet(start: number, end: number, insert: { prot: number; shared: boolean } | null): void {
+    if (end <= start) return;
+    const out: Array<{ start: number; end: number; prot: number; shared: boolean }> = [];
+    let inserted = false;
+    for (const v of this.vmas) {
+      if (v.end <= start) { this.vmaEmit(out, v); continue; }
+      if (v.start >= end) {
+        if (!inserted && insert) { this.vmaEmit(out, { start, end, prot: insert.prot, shared: insert.shared }); inserted = true; }
+        this.vmaEmit(out, v);
+        continue;
+      }
+      if (v.start < start) this.vmaEmit(out, { start: v.start, end: start, prot: v.prot, shared: v.shared });
+      if (!inserted && insert) { this.vmaEmit(out, { start, end, prot: insert.prot, shared: insert.shared }); inserted = true; }
+      if (v.end > end) this.vmaEmit(out, { start: end, end: v.end, prot: v.prot, shared: v.shared });
+    }
+    if (!inserted && insert) this.vmaEmit(out, { start, end, prot: insert.prot, shared: insert.shared });
+    this.vmas = out;
+    this.publishVmas();
+  }
+
+  // set the protection of [start,end), splitting vmas at the boundaries (mprotect).
+  private vmaProtect(start: number, end: number, prot: number): void {
+    if (end <= start) return;
+    const out: Array<{ start: number; end: number; prot: number; shared: boolean }> = [];
+    for (const v of this.vmas) {
+      if (v.end <= start || v.start >= end) { this.vmaEmit(out, v); continue; }
+      if (v.start < start) this.vmaEmit(out, { start: v.start, end: start, prot: v.prot, shared: v.shared });
+      this.vmaEmit(out, { start: Math.max(v.start, start), end: Math.min(v.end, end), prot, shared: v.shared });
+      if (v.end > end) this.vmaEmit(out, { start: end, end: v.end, prot: v.prot, shared: v.shared });
+    }
+    this.vmas = out;
+    this.publishVmas();
+  }
+
+  private renderProcMaps(): string {
+    let out = '';
+    for (const v of this.vmas) {
+      const perms = (v.prot & 0x1 ? 'r' : '-') + (v.prot & 0x2 ? 'w' : '-') + (v.prot & 0x4 ? 'x' : '-') + (v.shared ? 's' : 'p');
+      const s = v.start.toString(16).padStart(8, '0');
+      const e = v.end.toString(16).padStart(8, '0');
+      out += `${s}-${e} ${perms} 00000000 00:00 0 \n`;
+    }
+    return out;
+  }
+
   private bridgePath(path: string): string | null {
     if (!this.bridge?.isNative && !this.bridgeAvailable) return null;
     // Resolve relative paths using cwd
@@ -399,6 +590,13 @@ export class SyscallHandler {
     view.setBigUint64(frameBase + 264, cpu.getNZCV(), true);   // saved NZCV
     view.setUint32(frameBase + 272, signum, true);              // signal number
     view.setBigUint64(frameBase + 280, this.signalMask ?? 0n, true); // saved signal mask
+    // save the 32 V registers (512 bytes) so the handler can't clobber in-flight vector state
+    {
+      const vBase = cpu.base + V_OFFSET;
+      for (let i = 0; i < 512; i += 8) {
+        view.setBigUint64(frameBase + SIGNAL_FRAME_V_OFFSET + i, view.getBigUint64(vBase + i, true), true);
+      }
+    }
 
     // block this signal (plus the handler's sa_mask) for the duration of the handler unless
     // SA_NODEFER — this is what stops a repeated signal (e.g. tst_test's SIGUSR1 heartbeat) from
@@ -432,6 +630,13 @@ export class SyscallHandler {
     const savedPC = view.getBigUint64(frameBase + 256, true);
     const savedNZCV = view.getBigUint64(frameBase + 264, true);
     this.signalMask = view.getBigUint64(frameBase + 280, true); // restore pre-handler mask
+    // restore the 32 V registers saved at delivery
+    {
+      const vBase = cpu.base + V_OFFSET;
+      for (let i = 0; i < 512; i += 8) {
+        view.setBigUint64(vBase + i, view.getBigUint64(frameBase + SIGNAL_FRAME_V_OFFSET + i, true), true);
+      }
+    }
 
     cpu.setSP(savedSP);
     cpu.setNZCV(savedNZCV);
@@ -549,6 +754,43 @@ export class SyscallHandler {
     return { ruid: this.ruid, euid: this.euid, rgid: this.rgid, egid: this.egid, umask: this.umask, groups: [] };
   }
 
+  /** high-water byte offset the cooperative scheduler must snapshot to capture a
+   * process image: cpu-state block + guest data + heap + stack + mmap allocations,
+   * which all live below the mmap bump pointer. */
+  get memImageBound(): number {
+    return Number(this.mmapBase) + GUEST_MEM_BASE + 0x10000;
+  }
+
+  // system-wide identity of the file behind `fd`, for advisory record locks. two
+  // descriptors onto the same file (dup, or a separate open of the same inode) share
+  // it. returns null for descriptors that can't hold record locks (pipes, sockets).
+  private lockKey(fd: number): string | null {
+    const e = this.fdTable.get(fd);
+    if (e?.type === 'native') return `n:${e.path}`;
+    const vfd = e?.type === 'vfs' ? e.fd : ((this.vfs?.hasFd(fd) ?? false) ? fd : -1);
+    if (vfd >= 0 && this.vfs) {
+      const ino = this.vfs.inoOfFd(vfd);
+      if (ino != null) return `v:${ino}`;
+    }
+    return null;
+  }
+
+  /** add an open-fd reference for every pipe end in an inherited fd table (fork). */
+  retainPipeRefs(fdTable: Map<number, FdEntry>): void {
+    for (const e of fdTable.values()) {
+      if (e.type === 'pipe_write') e.pipe.writers++;
+      else if (e.type === 'pipe_read') e.pipe.readers++;
+    }
+  }
+
+  /** release an open-fd reference for every pipe end in an fd table (process exit). */
+  releasePipeRefs(fdTable: Map<number, FdEntry>): void {
+    for (const e of fdTable.values()) {
+      if (e.type === 'pipe_write') { if (--e.pipe.writers <= 0) e.pipe.writeClosed = true; }
+      else if (e.type === 'pipe_read') { if (--e.pipe.readers <= 0) e.pipe.readClosed = true; }
+    }
+  }
+
   /** Get state for process snapshot */
   getState() {
     return {
@@ -564,12 +806,13 @@ export class SyscallHandler {
       sharedRegions: this.sharedRegions.map((r) => ({ ...r })),
       protNone: this.protNone.map((r) => ({ ...r })),
       nofileLimit: this.nofileLimit,
+      signalHandlers: this.signalHandlers ? new Map(this.signalHandlers) : undefined,
       vfsFdSnapshot: this.vfs ? this.vfs.snapshotFds() : undefined,
     };
   }
 
   /** Restore state from process snapshot */
-  restoreState(state: { brk: bigint; mmapBase: bigint; cwd: string; fdFlags: Map<number, number>; fdTable?: Map<number, FdEntry>; nativeRefs?: Map<number, number>; currentPid?: number; currentPpid?: number; creds?: { ruid: number; euid: number; suid: number; rgid: number; egid: number; sgid: number }; sharedRegions?: Array<{ addr: number; len: number }>; protNone?: Array<{ start: number; end: number }>; nofileLimit?: number; vfsFdSnapshot?: any }): void {
+  restoreState(state: { brk: bigint; mmapBase: bigint; cwd: string; fdFlags: Map<number, number>; fdTable?: Map<number, FdEntry>; nativeRefs?: Map<number, number>; currentPid?: number; currentPpid?: number; creds?: { ruid: number; euid: number; suid: number; rgid: number; egid: number; sgid: number }; sharedRegions?: Array<{ addr: number; len: number }>; protNone?: Array<{ start: number; end: number }>; nofileLimit?: number; signalHandlers?: Map<number, { handler: bigint; flags: bigint; restorer: bigint; mask: bigint }>; vfsFdSnapshot?: any }): void {
     this.brk = state.brk;
     this.mmapBase = state.mmapBase;
     this.cwd = state.cwd;
@@ -591,6 +834,7 @@ export class SyscallHandler {
     if (state.sharedRegions !== undefined) this.sharedRegions = state.sharedRegions.map((r) => ({ ...r }));
     if (state.protNone !== undefined) this.protNone = state.protNone.map((r) => ({ ...r }));
     if (state.nofileLimit !== undefined) this.nofileLimit = state.nofileLimit;
+    if (state.signalHandlers !== undefined) this.signalHandlers = new Map(state.signalHandlers);
   }
 
   /**
@@ -622,17 +866,21 @@ export class SyscallHandler {
   resetForExec(brkStart: bigint, closeFn?: (nativeFd: number) => void): void {
     this.brk = brkStart;
     this.mmapBase = 0x2100000n;
-    // Preserve stdio redirections (fds 0, 1, 2) — real Linux closes CLOEXEC fds,
-    // we close all fds >= 3 (pipe ends the child set up before exec). native fds we drop must be
+    // exec closes exactly the descriptors marked FD_CLOEXEC; every other fd survives into the new
+    // image (this is how programs pass fds to an exec'd child). native fds we drop must be
     // fs_close'd too, or exec leaks the Swift file handle behind them.
-    const preserved = new Map<number, FdEntry>();
-    for (const [fd, entry] of this.fdTable) {
-      if (fd <= 2) preserved.set(fd, entry);
-      else if (entry.type === 'native' && closeFn) closeFn(entry.nativeFd);
+    for (const fd of [...this.fdCloexec]) {
+      const entry = this.fdTable.get(fd);
+      if (entry) {
+        if (entry.type === 'native' && closeFn) closeFn(entry.nativeFd);
+        else if (entry.type === 'vfs' && this.vfs) this.vfs.close(entry.fd);
+        this.fdTable.delete(fd);
+      } else if (this.vfs?.hasFd(fd)) {
+        this.vfs.close(fd);
+      }
+      this.fdFlags.delete(fd);
     }
-    this.fdTable = preserved;
-    // Also close VFS fds >= 3 (child shouldn't inherit parent's open files after exec)
-    if (this.vfs) this.vfs.closeAllExcept(0, 1, 2);
+    this.fdCloexec.clear();
   }
 
   /** Allocate next available fd */
@@ -647,7 +895,10 @@ export class SyscallHandler {
   }
 
   private allocFd(): number {
-    return this.lowestFreeFd(3);
+    // linux hands out the lowest free descriptor including 0/1/2 once they are closed. starting at
+    // 3 meant a guest that closed a std fd and reopened (as neovim does) got a high fd instead of the
+    // reused low one, desyncing its fd bookkeeping. 0/1/2 stay reserved while their entries live.
+    return this.lowestFreeFd(0);
   }
 
   /** true if a new fd (>= min) can be allocated within RLIMIT_NOFILE. */
@@ -704,7 +955,7 @@ export class SyscallHandler {
       case 'pipe_write': return !entry.pipe.readClosed;
       case 'pipe_read': return false;
       case 'vfs': case 'native': return true;
-      case 'socket': return false;
+      case 'socket': return true; // connected TCP sockets accept writes (net_write queues via NWConnection)
       case 'eventfd': return entry.counter < 0xFFFFFFFFFFFFFFFEn;
       case 'inotify': case 'timerfd': case 'epoll': return false;
     }
@@ -756,6 +1007,8 @@ export class SyscallHandler {
 
     let ret: bigint;
 
+    if (NET_TRACE && (this as any)._netActive && nr !== 64 && nr !== 66 && nr !== 63) this.nt(`sys ${nr} a0=${Number(a0 & 0xffffn)}`);
+
     switch (nr) {
       // ── Process lifecycle ──
       case 93:  // exit
@@ -806,6 +1059,12 @@ export class SyscallHandler {
         // For our vfork model, redirect to wait4 semantics
         const WNOHANG = 1;
         const widOptions = Number(a3);
+
+        if (this.coop) {
+          const idtype = Number(a0);
+          const wantPid = idtype === 1 ? Number(a1) : -1; // P_PID targets a specific child
+          return { status: 'coop_wait', kind: 'waitid', wantPid, wstatusAddr: 0, options: widOptions, infop: Number(a2) };
+        }
         if (this.lastWaitStatus !== undefined) {
           const exitCode = this.lastWaitStatus;
           this.lastWaitStatus = undefined;
@@ -841,14 +1100,21 @@ export class SyscallHandler {
         const WNOHANG = 1;
         const options = Number(a2);
 
+        if (this.coop) {
+          // the scheduler owns the process table and zombie children; let the harness resolve.
+          return { status: 'coop_wait', kind: 'wait4', wantPid: Number(BigInt.asIntN(64, a0)), wstatusAddr: wstatus, options, infop: 0 };
+        }
+
         // In our vfork model, the child has already exited by the time
         // the parent resumes. The exit code was stored by the dispatch loop.
         if (this.lastWaitStatus !== undefined) {
           const exitCode = this.lastWaitStatus;
           this.lastWaitStatus = undefined;
           if (wstatus !== 0) {
-            // Write wstatus: exit code << 8 (WEXITSTATUS format)
-            view.setUint32(wstatus + GUEST_MEM_BASE, (exitCode & 0xFF) << 8, true);
+            // a child terminated by a signal is marked with the 0x10000 bit and carries the signal
+            // in the low 7 bits -> WIFSIGNALED (raw status = signum). otherwise WIFEXITED (code<<8).
+            const encoded = (exitCode & 0x10000) ? (exitCode & 0x7f) : ((exitCode & 0xFF) << 8);
+            view.setUint32(wstatus + GUEST_MEM_BASE, encoded, true);
           }
           ret = BigInt(this.lastWaitPid || 1);
           this.lastWaitPid = undefined;
@@ -869,6 +1135,10 @@ export class SyscallHandler {
 
         // Check fd table for overrides (pipes, dup'd fds)
         const readEntry = this.getFdEntry(fd);
+        // valid fd but the destination buffer is outside the address space -> EFAULT (count 0 is a no-op).
+        if ((readEntry !== undefined || (this.vfs?.hasFd(fd) ?? false)) && count > 0 && this.ptrFaults(bytes, buf, count)) {
+          ret = -BigInt(EFAULT); break;
+        }
         if (readEntry) {
           if (readEntry.type === 'pipe_write') {
             ret = -BigInt(EBADF); // can't read from write end of pipe
@@ -878,11 +1148,14 @@ export class SyscallHandler {
             const pipe = readEntry.pipe;
             if (pipe.data.length === 0) {
               if (pipe.writeClosed) {
-                ret = 0n; // EOF
+                ret = 0n; // EOF: all writers gone
               } else if (this.isNonBlocking(fd)) {
                 ret = -BigInt(EAGAIN);
+              } else if (this.coop) {
+                // a writer is still open: park until data arrives or the last writer closes.
+                return { status: 'coop_block', reason: 'pipe_read' };
               } else {
-                ret = 0n; // Pipes currently don't block; legacy behavior
+                ret = 0n; // serialized fast path has no scheduler to yield to
               }
             } else {
               const chunk = pipe.data.shift()!;
@@ -891,6 +1164,8 @@ export class SyscallHandler {
               if (toRead < chunk.length) {
                 pipe.data.unshift(chunk.subarray(toRead));
               }
+              pipe.bytes -= toRead;
+              this.schedEvent = true; // a parked writer may now have room
               ret = BigInt(toRead);
             }
             break;
@@ -930,9 +1205,13 @@ export class SyscallHandler {
             break;
           }
           if (readEntry.type === 'native') {
+            // the bridge response slot holds ~16 KB; a larger read overflows it and corrupts the data.
+            // cap to a slot-safe chunk (matches readGuestFile) and return a short read — the guest
+            // loops for the rest. this is what was corrupting md5sum/od/large binary reads.
+            const rcount = Math.min(count, 12288);
             return {
               status: 'bridge', method: 'fs_read',
-              args: { fd: readEntry.nativeFd, count },
+              args: { fd: readEntry.nativeFd, count: rcount },
               apply: (resp: any) => {
                 if (resp.ret < 0) {
                   cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
@@ -947,17 +1226,23 @@ export class SyscallHandler {
             };
           }
           if (readEntry.type === 'socket') {
+            // same slot-overflow cap as the native path: base64 of a 16 KB read exceeds the bridge
+            // response slot, so the data is dropped and the guest gets ret>0 with an unwritten buffer.
+            // that fed TLS record garbage ("unexpected message") and stalled bulk http. cap + short read.
+            const scount = Math.min(count, 12288);
             return {
               status: 'bridge', method: 'net_read',
-              args: { socketId: readEntry.socketId, count },
+              args: { socketId: readEntry.socketId, count: scount },
               apply: (resp: any) => {
                 if (resp.ret < 0) {
+                  this.nt(`read fd=${fd} req=${count} -> err ${resp.ret}`);
                   cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
                 } else if (resp.data) {
                   const decoded = Uint8Array.from(atob(resp.data), c => c.charCodeAt(0));
                   bytes.set(decoded, buf + GUEST_MEM_BASE);
                   cpu.setReg(0, BigInt(decoded.length));
                 } else {
+                  this.nt(`read fd=${fd} req=${count} -> EOF/0 (ret=${resp.ret})`);
                   cpu.setReg(0, BigInt(resp.ret));
                 }
               },
@@ -982,6 +1267,11 @@ export class SyscallHandler {
         const count = Number(a2);
 
         const writeEntry = this.getFdEntry(fd);
+        // for a valid fd, a source buffer outside the accessible address space faults EFAULT (the
+        // kernel validates the fd first, then the buffer). count 0 never touches the buffer.
+        if ((writeEntry !== undefined || (this.vfs?.hasFd(fd) ?? false)) && count > 0 && this.ptrFaults(bytes, buf, count)) {
+          ret = -BigInt(EFAULT); break;
+        }
         if (writeEntry) {
           if (writeEntry.type === 'pipe_read') {
             ret = -BigInt(EBADF); // can't write to read end of pipe
@@ -996,6 +1286,8 @@ export class SyscallHandler {
             }
             const data = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
             writeEntry.pipe.data.push(data);
+            writeEntry.pipe.bytes += data.length;
+            this.schedEvent = true; // a parked reader may now proceed
             ret = BigInt(count);
             break;
           }
@@ -1035,6 +1327,7 @@ export class SyscallHandler {
           if (writeEntry.type === 'socket') {
             const sockWriteData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
             const sockB64 = bytesToBase64(sockWriteData);
+            this.nt(`write fd=${fd} len=${count}`);
             return {
               status: 'bridge', method: 'net_write',
               args: { socketId: writeEntry.socketId, data: sockB64 },
@@ -1095,6 +1388,7 @@ export class SyscallHandler {
             off += len;
           }
           const b64 = bytesToBase64(combined);
+          this.nt(`writev fd=${fd} totalLen=${totalLen}`);
           return {
             status: 'bridge', method: 'net_write',
             args: { socketId: writevEntry.socketId, data: b64 },
@@ -1192,7 +1486,8 @@ export class SyscallHandler {
         const prBuf = Number(a1);
         const prCount = Number(a2);
         const prOffset = BigInt.asIntN(64, a3);
-        if (this.vfs) {
+        const prEntry = this.fdTable.get(prFd);
+        if (this.vfs && this.vfs.hasFd(prFd)) {
           // Save current position, seek, read, restore position
           const savedPos = this.vfs.lseek(prFd, 0n, 1); // SEEK_CUR
           if (savedPos < 0n) { ret = savedPos; break; }
@@ -1200,6 +1495,11 @@ export class SyscallHandler {
           const n = this.vfs.read(prFd, prBuf, prCount, view);
           this.vfs.lseek(prFd, savedPos, 0); // restore
           ret = BigInt(n);
+        } else if (prEntry?.type === 'native' && this.io.readFileAt) {
+          // real file on NativeFS: bridge pread at offset (ld.so preads ELF/program headers this way).
+          const data = this.io.readFileAt(prEntry.nativeFd, Number(prOffset), prCount);
+          new Uint8Array(memory.buffer).set(data, prBuf + GUEST_MEM_BASE);
+          ret = BigInt(data.length);
         } else {
           ret = -BigInt(EBADF);
         }
@@ -1227,13 +1527,23 @@ export class SyscallHandler {
       // ── Pipes & fd duplication ──
       case 59: { // pipe2(pipefd, flags)
         const pipefdAddr = Number(a0);
-        const pipe: PipeBuffer = { data: [], writeClosed: false, readClosed: false };
+        // a pipe consumes two descriptors; enforce RLIMIT_NOFILE so a create-until-failure loop
+        // terminates with EMFILE instead of allocating fds (and pipe buffers) forever.
+        if (!this.fdAvailable()) { ret = -BigInt(EMFILE); break; }
+        const pipe: PipeBuffer = { data: [], writeClosed: false, readClosed: false, writers: 1, readers: 1, bytes: 0 };
         // register the read end before allocating the write end, otherwise lowest-free
         // allocation hands out the same number twice (readFd isn't in the table yet)
         const readFd = this.allocFd();
         this.fdTable.set(readFd, { type: 'pipe_read', pipe });
+        if (!this.fdAvailable()) { this.fdTable.delete(readFd); ret = -BigInt(EMFILE); break; }
         const writeFd = this.allocFd();
         this.fdTable.set(writeFd, { type: 'pipe_write', pipe });
+        // the kernel writes the fd pair to user memory last (copy_to_user), so a bad pipefd buffer
+        // faults EFAULT after the descriptors are allocated; release them so nothing leaks.
+        if (this.ptrFaults(bytes, pipefdAddr, 8)) {
+          this.fdTable.delete(readFd); this.fdTable.delete(writeFd);
+          ret = -BigInt(EFAULT); break;
+        }
         // Write [readFd, writeFd] to guest memory
         view.setInt32(pipefdAddr + GUEST_MEM_BASE, readFd, true);
         view.setInt32(pipefdAddr + GUEST_MEM_BASE + 4, writeFd, true);
@@ -1255,6 +1565,8 @@ export class SyscallHandler {
             this.fdTable.set(newfd, { ...oldEntry });
             this.nativeRefs.set(oldEntry.nativeFd, (this.nativeRefs.get(oldEntry.nativeFd) ?? 1) + 1);
           } else {
+            if (oldEntry.type === 'pipe_write') oldEntry.pipe.writers++;
+            else if (oldEntry.type === 'pipe_read') oldEntry.pipe.readers++;
             this.fdTable.set(newfd, { ...oldEntry });
           }
           ret = BigInt(newfd);
@@ -1265,6 +1577,8 @@ export class SyscallHandler {
         } else {
           ret = -BigInt(EBADF);
         }
+        if (ret >= 0n) this.fdFlags.set(Number(ret), this.fdFlags.get(oldfd) ?? 0);
+        this.ft(`dup ${oldfd} -> ${BigInt.asIntN(64, ret)}`);
         break;
       }
 
@@ -1272,6 +1586,7 @@ export class SyscallHandler {
         const oldfd = Number(a0);
         const newfd = Number(BigInt.asIntN(32, a1));
         const dup3flags = Number(a2);
+        this.ft(`dup3 ${oldfd} -> ${newfd}`);
         // Per spec: dup3 with oldfd==newfd returns EINVAL
         if (oldfd === newfd) { ret = -BigInt(EINVAL); break; }
         // Validate fd range
@@ -1282,8 +1597,8 @@ export class SyscallHandler {
         // Close newfd if it's open (in the fd table or as a plain vfs fd)
         const existingEntry = this.fdTable.get(newfd);
         if (existingEntry) {
-          if (existingEntry.type === 'pipe_write') existingEntry.pipe.writeClosed = true;
-          if (existingEntry.type === 'pipe_read') existingEntry.pipe.readClosed = true;
+          if (existingEntry.type === 'pipe_write') { if (--existingEntry.pipe.writers <= 0) existingEntry.pipe.writeClosed = true; }
+          if (existingEntry.type === 'pipe_read') { if (--existingEntry.pipe.readers <= 0) existingEntry.pipe.readClosed = true; }
           if (existingEntry.type === 'vfs' && this.vfs) this.vfs.close(existingEntry.fd);
           if (existingEntry.type === 'native') {
             const refs = (this.nativeRefs.get(existingEntry.nativeFd) ?? 1) - 1;
@@ -1304,6 +1619,8 @@ export class SyscallHandler {
             this.fdTable.set(newfd, { ...srcEntry });
             this.nativeRefs.set(srcEntry.nativeFd, (this.nativeRefs.get(srcEntry.nativeFd) ?? 1) + 1);
           } else {
+            if (srcEntry.type === 'pipe_write') srcEntry.pipe.writers++;
+            else if (srcEntry.type === 'pipe_read') srcEntry.pipe.readers++;
             this.fdTable.set(newfd, { ...srcEntry });
           }
           ret = BigInt(newfd);
@@ -1314,6 +1631,8 @@ export class SyscallHandler {
           ret = -BigInt(EBADF);
           break;
         }
+        // shared open file description -> copy the status flags to the duplicate.
+        if (ret >= 0n) this.fdFlags.set(newfd, this.fdFlags.get(oldfd) ?? 0);
         // Per spec: dup3 O_CLOEXEC flag sets FD_CLOEXEC on the new fd
         if (dup3flags & 0o2000000) this.fdCloexec.add(newfd);
         else this.fdCloexec.delete(newfd);
@@ -1322,12 +1641,14 @@ export class SyscallHandler {
 
       // ── File operations ──
       case 56: { // openat(dirfd, path, flags, mode)
-        const path = readGuestString(bytes, Number(a1));
+        if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
+        const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const flags56 = Number(a2);
         const mode56 = Number(a3);
         if (path === '/dev/tty') {
           const ttyFd = this.allocFd();
           this.fdTable.set(ttyFd, { type: 'tty' });
+          this.ft(`open ${path} -> ${ttyFd}`);
           ret = BigInt(ttyFd);
           break;
         }
@@ -1344,6 +1665,7 @@ export class SyscallHandler {
               } else {
                 this.fdTable.set(guestFd, { type: 'native', nativeFd: resp.ret, path: bp56 });
                 this.nativeRefs.set(resp.ret, 1);
+                this.ft(`open ${bp56} -> ${guestFd} (native ${resp.ret})`);
                 cpu.setReg(0, BigInt(guestFd));
               }
             },
@@ -1359,6 +1681,7 @@ export class SyscallHandler {
             // O_CLOEXEC → set FD_CLOEXEC on the new fd
             if (flags56 & 0o2000000) this.fdCloexec.add(openRet);
           }
+          this.ft(`open ${path} -> ${openRet} (vfs)`);
           ret = BigInt(openRet);
         } else {
           ret = -BigInt(ENOENT);
@@ -1369,13 +1692,17 @@ export class SyscallHandler {
       case 57: { // close(fd)
         const fd = Number(a0);
         const closeEntry = this.fdTable.get(fd);
+        this.ft(`close ${fd} (type=${closeEntry?.type ?? (this.vfs?.hasFd(fd) ? 'vfs' : 'none')})`);
         // per-fd metadata never outlives the fd; clearing here keeps a later reuse
         // of the same number (lowest-free allocation) from inheriting stale state
         this.fdFlags.delete(fd);
         this.fdCloexec.delete(fd);
+        // posix: closing any descriptor to a file releases every advisory lock this
+        // process holds on that file. do it before the vfs close drops the inode.
+        if (this.locks) { const lk = this.lockKey(fd); if (lk) this.locks.releaseFile(lk, this.currentPid); this.schedEvent = true; }
         if (closeEntry) {
-          if (closeEntry.type === 'pipe_write') closeEntry.pipe.writeClosed = true;
-          if (closeEntry.type === 'pipe_read') closeEntry.pipe.readClosed = true;
+          if (closeEntry.type === 'pipe_write') { if (--closeEntry.pipe.writers <= 0) closeEntry.pipe.writeClosed = true; this.schedEvent = true; }
+          if (closeEntry.type === 'pipe_read') { if (--closeEntry.pipe.readers <= 0) closeEntry.pipe.readClosed = true; this.schedEvent = true; }
           if (closeEntry.type === 'vfs' && this.vfs) this.vfs.close(closeEntry.fd);
           if (closeEntry.type === 'native') {
             this.fdTable.delete(fd);
@@ -1472,8 +1799,15 @@ export class SyscallHandler {
 
         // Check fd table first
         const fstatEntry = this.getFdEntry(fd);
+        if (fd <= 4 || fstatEntry?.type === 'tty' || fstatEntry?.type === 'stdio') this.ft(`fstat ${fd} type=${fstatEntry?.type ?? (this.vfs?.hasFd(fd) ? 'vfs' : 'none')}`);
         if (fstatEntry) {
-          if (fstatEntry.type === 'stdio' || fstatEntry.type === 'tty' ||
+          if (fstatEntry.type === 'tty' && this.vfs) {
+            // report the /dev/tty inode so fstat(ttyfd) matches stat("/dev/tty"); musl's ttyname_r
+            // compares (st_dev, st_ino) of the readlink target against the fd, and libuv's tty
+            // reopen (hence neovim's TUI) hinges on that check passing. only the explicit /dev/tty
+            // fd is remapped; stdio (0/1/2) keeps its plain chardev stat so headless stays correct.
+            ret = BigInt(this.vfs.fstatat(-100, '/dev/tty', statBuf, 0, view));
+          } else if (fstatEntry.type === 'stdio' || fstatEntry.type === 'tty' ||
               fstatEntry.type === 'pipe_read' || fstatEntry.type === 'pipe_write' ||
               fstatEntry.type === 'inotify' || fstatEntry.type === 'timerfd' ||
               fstatEntry.type === 'eventfd' || fstatEntry.type === 'epoll') {
@@ -1506,7 +1840,7 @@ export class SyscallHandler {
       }
 
       case 79: { // fstatat(dirfd, path, statbuf, flags)
-        const path = readGuestString(bytes, Number(a1));
+        const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const statBuf79 = Number(a2);
         if (this.ptrFaults(bytes, statBuf79, 128)) { ret = -BigInt(EFAULT); break; }
         const bp79 = this.bridgePath(path);
@@ -1514,7 +1848,7 @@ export class SyscallHandler {
           // Check stat cache (populated by recent getdents) — avoids bridge round-trip
           const cached = this.statCache.get(bp79);
           if (cached && cached.expiresAt > Date.now()) {
-            writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime, cached.uid, cached.gid] });
+            writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime, cached.uid, cached.gid, cached.ino] });
             ret = 0n;
             break;
           }
@@ -1535,6 +1869,7 @@ export class SyscallHandler {
                     mtime: resp._meta[3],
                     uid: resp._meta[4] ?? 0,
                     gid: resp._meta[5] ?? 0,
+                    ino: resp._meta[6] ?? 0,
                     expiresAt: Date.now() + this.STAT_CACHE_TTL_MS,
                   });
                 }
@@ -1589,6 +1924,7 @@ export class SyscallHandler {
                     mtime: entry.mtime ?? 0,
                     uid: entry.uid ?? 0,
                     gid: entry.gid ?? 0,
+                    ino: entry.ino ?? 0,
                     expiresAt: cacheExpiry,
                   });
                 }
@@ -1620,7 +1956,8 @@ export class SyscallHandler {
       }
 
       case 34: { // mkdirat(dirfd, path, mode)
-        const path = readGuestString(bytes, Number(a1));
+        if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
+        const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const bp34 = this.bridgePath(path);
         if (bp34 !== null) {
           return {
@@ -1641,7 +1978,7 @@ export class SyscallHandler {
 
       case 35: { // unlinkat(dirfd, path, flags)
         if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
-        const path = readGuestString(bytes, Number(a1));
+        const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         if (path === '') { ret = -BigInt(ENOENT); break; } // empty path (no AT_EMPTY_PATH for unlink)
         const bp35 = this.bridgePath(path);
         if (bp35 !== null) {
@@ -1663,7 +2000,7 @@ export class SyscallHandler {
       }
 
       case 33: { // mknodat(dirfd, path, mode, dev)
-        const path = readGuestString(bytes, Number(a1));
+        const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const mode = Number(a2);
         if (this.vfs) {
           // S_IFIFO = 0o010000 — named pipe (mkfifo)
@@ -1691,8 +2028,8 @@ export class SyscallHandler {
 
       case 38: { // renameat(olddirfd, oldpath, newdirfd, newpath)
         if (this.ptrFaults(bytes, Number(a1)) || this.ptrFaults(bytes, Number(a3))) { ret = -BigInt(EFAULT); break; }
-        const oldpath = readGuestString(bytes, Number(a1));
-        const newpath = readGuestString(bytes, Number(a3));
+        const oldpath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
+        const newpath = this.resolveAt(a2, readGuestString(bytes, Number(a3)));
         const bOld = this.bridgePath(oldpath);
         if (bOld) {
           const bNew = this.bridgePath(newpath) ?? newpath;
@@ -1715,7 +2052,7 @@ export class SyscallHandler {
       case 36: { // symlinkat(target, newdirfd, linkpath)
         if (this.ptrFaults(bytes, Number(a0)) || this.ptrFaults(bytes, Number(a2))) { ret = -BigInt(EFAULT); break; }
         const target = readGuestString(bytes, Number(a0));
-        const linkpath = readGuestString(bytes, Number(a2));
+        const linkpath = this.resolveAt(a1, readGuestString(bytes, Number(a2)));
         const bLink = this.bridgePath(linkpath);
         if (bLink) {
           return {
@@ -1734,8 +2071,12 @@ export class SyscallHandler {
 
       case 37: { // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
         if (this.ptrFaults(bytes, Number(a1)) || this.ptrFaults(bytes, Number(a3))) { ret = -BigInt(EFAULT); break; }
-        const oldpath = readGuestString(bytes, Number(a1));
-        const newpath = readGuestString(bytes, Number(a3));
+        const oldStr = readGuestString(bytes, Number(a1));
+        const newStr = readGuestString(bytes, Number(a3));
+        // an empty pathname (without AT_EMPTY_PATH) is ENOENT, checked before any existence check.
+        if (oldStr === '' || newStr === '') { ret = -BigInt(ENOENT); break; }
+        const oldpath = this.resolveAt(a0, oldStr);
+        const newpath = this.resolveAt(a2, newStr);
         if (this.vfs) {
           ret = BigInt(this.vfs.linkat(oldpath, newpath));
         } else {
@@ -1751,9 +2092,31 @@ export class SyscallHandler {
       }
 
       case 78: { // readlinkat(dirfd, path, buf, bufsiz)
-        const path = readGuestString(bytes, Number(a1));
+        const rawPath = readGuestString(bytes, Number(a1));
+        const path = this.resolveAt(a0, rawPath);
         const buf = Number(a2);
         const bufsiz = Number(a3);
+        // an empty pathname is ENOENT (without AT_EMPTY_PATH); a non-positive buffer size is EINVAL.
+        if (rawPath === '') { ret = -BigInt(ENOENT); break; }
+        if (bufsiz <= 0) { ret = -BigInt(EINVAL); break; }
+        this.ft(`readlinkat ${path}`);
+        // /proc/self/fd/<n> (and /proc/<pid>/fd/<n>) resolve to the path behind the fd. musl's
+        // ttyname_r relies on this to reopen a tty, which is how neovim's libuv TUI comes up.
+        const pfd = path.match(/^\/proc\/(?:self|\d+)\/fd\/(\d+)$/);
+        if (pfd) {
+          const tfd = Number(pfd[1]);
+          const te = this.getFdEntry(tfd);
+          const link = (te?.type === 'tty' || te?.type === 'stdio') ? '/dev/tty' : ((te as any)?.path ?? ((this.vfs as any)?.fdPath?.(tfd) ?? null));
+          this.ft(`readlink /proc/self/fd/${tfd} -> ${link ?? 'NULL'} (type=${te?.type ?? '?'})`);
+          if (link) {
+            const enc = new TextEncoder().encode(link);
+            const len = Math.min(enc.length, bufsiz);
+            if (badGuestPtr(bytes, buf, len)) { ret = -BigInt(14); break; }
+            bytes.set(enc.subarray(0, len), buf + GUEST_MEM_BASE);
+            ret = BigInt(len);
+            break;
+          }
+        }
         const bPath = this.bridgePath(path);
         if (bPath) {
           return {
@@ -1778,7 +2141,7 @@ export class SyscallHandler {
         if (this.vfs) {
           const target = this.vfs.readlinkat(path);
           if (target === null) {
-            ret = -BigInt(EINVAL);
+            ret = BigInt((this.vfs as any).resolveErrno?.() ?? -EINVAL);
           } else {
             const encoded = new TextEncoder().encode(target);
             const len = Math.min(encoded.length, bufsiz);
@@ -1793,8 +2156,10 @@ export class SyscallHandler {
       }
 
       case 48: { // faccessat(dirfd, path, mode, flags)
+        // the kernel rejects any mode bits outside R_OK|W_OK|X_OK (F_OK is 0) with EINVAL first.
+        if (Number(BigInt.asUintN(32, a2)) & ~0x7) { ret = -BigInt(EINVAL); break; }
         if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
-        const path = readGuestString(bytes, Number(a1));
+        const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const bp48 = this.bridgePath(path);
         if (bp48 !== null) {
           return {
@@ -1815,6 +2180,7 @@ export class SyscallHandler {
 
       case 52: { // fchmod(fd, mode)
         const fchmodFd = Number(a0);
+        if (this.vfs?.isOPath(fchmodFd)) { ret = -BigInt(EBADF); break; } // O_PATH fd
         const fchmodMode = Number(a1);
         const fchmodEntry = this.getFdEntry(fchmodFd);
         if (fchmodEntry?.type === 'native') {
@@ -1831,7 +2197,7 @@ export class SyscallHandler {
         break;
       }
       case 53: { // fchmodat(dirfd, path, mode)
-        const fchmodatPath = readGuestString(bytes, Number(a1));
+        const fchmodatPath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const fchmodatMode = Number(a2);
         const bpChmod = this.bridgePath(fchmodatPath);
         if (bpChmod !== null) {
@@ -1857,7 +2223,7 @@ export class SyscallHandler {
           else ret = -BigInt(EBADF);
           break;
         }
-        const fchownatPath = readGuestString(bytes, Number(a1));
+        const fchownatPath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const bpChown = this.bridgePath(fchownatPath);
         if (bpChown !== null) {
           return {
@@ -1871,6 +2237,7 @@ export class SyscallHandler {
       }
       case 55: { // fchown(fd, owner, group)
         const fchownFd = Number(a0);
+        if (this.vfs?.isOPath(fchownFd)) { ret = -BigInt(EBADF); break; } // O_PATH fd
         const owner = Number(BigInt.asIntN(32, a1));
         const group = Number(BigInt.asIntN(32, a2));
         const ent = this.getFdEntry(fchownFd);
@@ -1915,10 +2282,12 @@ export class SyscallHandler {
       // ── ioctl ──
       case 29: { // ioctl(fd, request, ...)
         const fd = Number(a0);
+        if (this.vfs?.isOPath(fd)) { ret = -BigInt(EBADF); break; } // O_PATH fd
         const request = Number(a1);
 
         // Resolve fd through fd table — check if this is a dup'd stdio fd
         const ioctlEntry = this.getFdEntry(fd);
+        if (fd <= 4) this.ft(`ioctl ${fd} req=0x${request.toString(16)} type=${ioctlEntry?.type ?? (this.vfs?.hasFd(fd) ? 'vfs' : 'none')}`);
         const isStdio = ioctlEntry?.type === 'stdio' || ioctlEntry?.type === 'tty';
         const isPipe = ioctlEntry?.type === 'pipe_read' || ioctlEntry?.type === 'pipe_write';
         if (isPipe) {
@@ -1998,12 +2367,28 @@ export class SyscallHandler {
         const MAP_FIXED = 0x10;
         const MAP_SHARED = 0x01;
 
+        // the kernel looks up the file descriptor (fget) before validating length or flags, so a
+        // file-backed mmap on a closed/bogus fd faults EBADF even when length is 0 (mmap08). an
+        // O_PATH descriptor also can't back a mapping (mmap on it faults EBADF).
+        if (!(flags & MAP_ANONYMOUS)) {
+          const validFd = (this.vfs?.hasFd(mmapFd) ?? false) || this.fdTable.has(mmapFd);
+          if (mmapFd < 0 || !validFd || (this.vfs?.isOPath(mmapFd) ?? false)) { ret = -BigInt(EBADF); break; }
+        }
+
         // zero length is invalid; exactly one map type (MAP_SHARED/MAP_PRIVATE, or the
         // MAP_SHARED_VALIDATE superset) must be requested.
         const mapType = flags & 0xf;
         if (length === 0 || (mapType !== 0x01 && mapType !== 0x02 && mapType !== 0x03)) {
           ret = -BigInt(EINVAL);
           break;
+        }
+        // MAP_SHARED_VALIDATE (type 0x3) validates every flag bit and rejects unknown ones with
+        // EOPNOTSUPP; plain MAP_SHARED silently ignores them. known bits: type + fixed/anon/growsdown/
+        // denywrite/executable/locked/noreserve/populate/nonblock/stack/hugetlb/sync/fixed_noreplace
+        // + the 6-bit hugepage size field.
+        if (mapType === 0x03) {
+          const VALID_MMAP = 0x1f | 0x100 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 | 0x80000 | 0x100000 | 0xfc000000;
+          if ((flags & ~VALID_MMAP) !== 0) { ret = -BigInt(95); break; } // EOPNOTSUPP
         }
 
         // File-backed mmap always reads pages from the file, so the descriptor must be
@@ -2019,10 +2404,19 @@ export class SyscallHandler {
           }
         }
 
-        // Honor requested address if nonzero (MAP_FIXED or hint)
+        // only MAP_FIXED forces placement at the requested address (and legitimately replaces
+        // whatever is mapped there). a bare hint is advisory: linux never honors it if doing so
+        // would overlap an existing mapping, so we route hints to the monotonic arena instead.
+        // honoring hints literally was zero-filling live heap/mmap regions -> guest heap corruption.
+        const MAP_FIXED_NOREPLACE = 0x100000;
         let addr: bigint;
-        if (a0 !== 0n) {
+        if (a0 !== 0n && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
           addr = a0;
+          // MAP_FIXED_NOREPLACE refuses to clobber an existing mapping: EEXIST on any overlap.
+          if ((flags & MAP_FIXED_NOREPLACE) && this.vmaOverlaps(Number(addr), Number(addr) + aligned)) {
+            ret = -BigInt(EEXIST);
+            break;
+          }
           const end = a0 + BigInt(aligned);
           if (end > this.mmapBase) this.mmapBase = end;
         } else {
@@ -2044,15 +2438,28 @@ export class SyscallHandler {
         // Zero-fill the mapped region
         new Uint8Array(memory.buffer).fill(0, Number(addr) + GUEST_MEM_BASE, Number(addr) + GUEST_MEM_BASE + aligned);
 
-        // File-backed mmap: read file content into the mapped region
-        if (mmapFd >= 0 && !(flags & MAP_ANONYMOUS) && this.vfs) {
+        // File-backed mmap: read file content into the mapped region.
+        if (mmapFd >= 0 && !(flags & MAP_ANONYMOUS)) {
           const fileOffset = Number(a5); // sixth argument: file offset
-          // Save current file position, seek to requested offset, read, restore
-          const savedPos = this.vfs.lseek(mmapFd, 0n, 1); // SEEK_CUR
-          if (savedPos >= 0n) {
-            this.vfs.lseek(mmapFd, BigInt(fileOffset), 0); // SEEK_SET
-            this.vfs.read(mmapFd, Number(addr), aligned, new DataView(memory.buffer));
-            this.vfs.lseek(mmapFd, savedPos, 0); // restore
+          const entry = this.fdTable.get(mmapFd);
+          if (this.vfs && this.vfs.hasFd(mmapFd)) {
+            // vfs-backed file (synthetic /proc, or the whole fs in tests): seek + read in place.
+            const savedPos = this.vfs.lseek(mmapFd, 0n, 1); // SEEK_CUR
+            if (savedPos >= 0n) {
+              this.vfs.lseek(mmapFd, BigInt(fileOffset), 0); // SEEK_SET
+              this.vfs.read(mmapFd, Number(addr), aligned, new DataView(memory.buffer));
+              this.vfs.lseek(mmapFd, savedPos, 0); // restore
+            }
+          } else if (entry?.type === 'native' && this.io.readFileAt) {
+            // real file on NativeFS (the on-device case): bridge-read the segment at its file offset
+            // into the mapping. this is what lets ld.so map shared libraries. short reads at EOF leave
+            // the tail zero-filled (already done above), which is correct for a segment's bss overhang.
+            const data = this.io.readFileAt(entry.nativeFd, fileOffset, aligned);
+            if (data.length > 0) new Uint8Array(memory.buffer).set(data, Number(addr) + GUEST_MEM_BASE);
+            // writable shared mapping -> the guest's stores must reach the file (apk extracts here).
+            if ((flags & MAP_SHARED) && (prot & 0x2)) {
+              this.fileMmaps.push({ start: Number(addr), len: aligned, fileLen: length, nativeFd: entry.nativeFd, fileOffset });
+            }
           }
         }
 
@@ -2063,14 +2470,25 @@ export class SyscallHandler {
         this.protNone = this.protNone.filter((r) => r.end <= mmStart || r.start >= mmEnd);
         if ((prot & 0x7) === 0) this.protNone.push({ start: mmStart, end: mmEnd });
 
+        if (flags & 0x2000) this.setLocked(mmStart, mmEnd, true); // MAP_LOCKED
+
+        this.vmaSet(mmStart, mmEnd, { prot: prot & 0x7, shared: (flags & MAP_SHARED) !== 0 });
+        this.protHook?.(mmStart, aligned, prot & 0x7); // page-protection: enforce PROT_NONE/read-only
+
         ret = addr;
         break;
       }
 
       case 226: { // mprotect(addr, len, prot)
+        // the start must be page-aligned (EINVAL) and the whole range must be mapped; the null page
+        // and other clearly-unmapped low memory give ENOMEM (mprotect01).
+        if ((a0 & 0xFFFn) !== 0n) { ret = -BigInt(EINVAL); break; }
         const mpStart = Number(a0), mpEnd = mpStart + ((Number(a1) + 0xFFF) & ~0xFFF);
+        if (mpStart < 0x1000) { ret = -BigInt(ENOMEM); break; }
         this.protNone = this.protNone.filter((r) => r.end <= mpStart || r.start >= mpEnd);
         if ((Number(a2) & 0x7) === 0) this.protNone.push({ start: mpStart, end: mpEnd });
+        this.vmaProtect(mpStart, mpEnd, Number(a2) & 0x7);
+        this.protHook?.(mpStart, mpEnd - mpStart, Number(a2) & 0x7); // page-protection guard table
         ret = 0n;
         break;
       }
@@ -2086,6 +2504,10 @@ export class SyscallHandler {
         }
         const umStart = Number(a0), umEnd = umStart + ((unmapLen + 0xFFF) & ~0xFFF);
         this.protNone = this.protNone.filter((r) => r.end <= umStart || r.start >= umEnd);
+        this.setLocked(umStart, umEnd, false);
+        this.vmaSet(umStart, umEnd, null);
+        const umFlush = this.buildMmapFlush(cpu, memory, umStart, (unmapLen + 0xFFF) & ~0xFFF, true);
+        if (umFlush) return umFlush;
         ret = 0n;
         break;
       }
@@ -2226,19 +2648,17 @@ export class SyscallHandler {
         const size = Number(a1);
         const cwd = this.vfs ? this.vfs.getcwd() : this.cwd;
         const encoded = new TextEncoder().encode(cwd + '\0');
-        if (encoded.length > size) {
-          ret = -BigInt(34); // ERANGE
-        } else {
-          const dest = buf + GUEST_MEM_BASE;
-          if (dest + encoded.length <= memory.buffer.byteLength) {
-            new Uint8Array(memory.buffer).set(encoded, dest);
-          }
-          ret = a0;
-        }
+        // the kernel checks the buffer size against the path length before touching the buffer, so
+        // a too-small size faults ERANGE even for a bad/NULL buf; only then does a bad buf give EFAULT.
+        if (encoded.length > size) { ret = -BigInt(34); break; } // ERANGE
+        if (this.ptrFaults(new Uint8Array(memory.buffer), buf, encoded.length)) { ret = -BigInt(EFAULT); break; }
+        new Uint8Array(memory.buffer).set(encoded, buf + GUEST_MEM_BASE);
+        ret = a0;
         break;
       }
 
       case 49: { // chdir(path)
+        if (this.ptrFaults(bytes, Number(a0))) { ret = -BigInt(EFAULT); break; }
         const path = readGuestString(bytes, Number(a0));
         const bPath = this.bridgePath(path);
         if (bPath) {
@@ -2274,7 +2694,7 @@ export class SyscallHandler {
 
       // ── uname ──
       case 160: { // uname(buf)
-        if (badGuestPtr(new Uint8Array(memory.buffer), Number(a0), 6 * 65)) {
+        if (this.ptrFaults(new Uint8Array(memory.buffer), Number(a0), 6 * 65)) {
           ret = -BigInt(14); // EFAULT
           break;
         }
@@ -2299,7 +2719,7 @@ export class SyscallHandler {
       }
 
       case 169: { // gettimeofday(tv, tz)
-        if (badGuestPtr(new Uint8Array(memory.buffer), Number(a0), 16)) { ret = -BigInt(14); break; } // EFAULT
+        if (this.ptrFaults(new Uint8Array(memory.buffer), Number(a0), 16)) { ret = -BigInt(14); break; } // EFAULT
         const tv = Number(a0) + GUEST_MEM_BASE;
         const ns = this.clockNs(0); // wall clock
         view.setBigUint64(tv, ns / 1_000_000_000n, true);
@@ -2312,6 +2732,9 @@ export class SyscallHandler {
       case 25: { // fcntl(fd, cmd, ...)
         const fd = Number(a0);
         const cmd = Number(a1);
+        if (fd <= 4) this.ft(`fcntl ${fd} cmd=${cmd}`);
+        // every fcntl command operates on an open descriptor; a closed/invalid fd is EBADF.
+        if (!this.fdTable.has(fd) && !(this.vfs?.hasFd(fd) ?? false)) { ret = -BigInt(EBADF); break; }
         switch (cmd) {
           case F_DUPFD:
           case F_DUPFD_CLOEXEC: {
@@ -2336,6 +2759,9 @@ export class SyscallHandler {
               ret = -BigInt(EBADF);
               break;
             }
+            // a dup shares the open file description, so the status flags (access mode, O_APPEND,
+            // O_NONBLOCK) are shared -> copy them so F_GETFL on the new fd matches the original.
+            this.fdFlags.set(newfd, this.fdFlags.get(fd) ?? 0);
             // F_DUPFD_CLOEXEC sets close-on-exec on the new fd; plain F_DUPFD clears it
             if (cmd === F_DUPFD_CLOEXEC) this.fdCloexec.add(newfd);
             else this.fdCloexec.delete(newfd);
@@ -2366,20 +2792,76 @@ export class SyscallHandler {
             else this.fdCloexec.delete(fd);
             ret = 0n;
             break;
-          case 5: // F_GETLK — query lock status
-          case 12: { // F_GETLK64
-            // Report no conflicting lock: set l_type = F_UNLCK (2) in the flock struct
+          case 5:  // F_GETLK
+          case 12: // F_GETLK64
+          case 6:  // F_SETLK — non-blocking
+          case 7:  // F_SETLKW — blocking
+          case 13: // F_SETLK64
+          case 14: { // F_SETLKW64
+            const key = this.lockKey(fd);
+            if (!this.locks) { ret = 0n; break; } // serialized path: no lock table, always grant
+            // the kernel copies the flock struct from user space before checking the file
+            // type, so a bad pointer faults EFAULT ahead of the EINVAL for an unlockable fd.
+            if (this.ptrFaults(bytes, Number(a2), 32)) { ret = -BigInt(EFAULT); break; }
+            if (key === null) { ret = -BigInt(EINVAL); break; } // pipes/sockets/tty can't hold record locks
+
             const flockPtr = Number(a2) + GUEST_MEM_BASE;
-            view.setInt16(flockPtr, 2, true); // l_type = F_UNLCK
+            const lType = view.getInt16(flockPtr, true);       // 0=RDLCK 1=WRLCK 2=UNLCK
+            const lWhence = view.getInt16(flockPtr + 2, true); // 0=SET 1=CUR 2=END
+            const lStart = view.getBigInt64(flockPtr + 8, true);
+            const lLen = view.getBigInt64(flockPtr + 16, true);
+
+            // resolve the byte range. only SEEK_SET is modelled precisely; CUR/END fall
+            // back to the absolute l_start (ltp record-lock tests use SEEK_SET).
+            let start = Number(lWhence === 0 ? lStart : lStart);
+            let end: number;
+            const len = Number(lLen);
+            if (len === 0) end = Infinity;        // to end of file
+            else if (len > 0) end = start + len - 1;
+            else { start = start + len; end = start - len - 1; } // negative len locks bytes before l_start
+            const wantType: 'r' | 'w' | 'u' = lType === 0 ? 'r' : lType === 1 ? 'w' : 'u';
+
+            if (cmd === 5 || cmd === 12) { // F_GETLK: report a conflict, else F_UNLCK
+              const probe = wantType === 'u' ? 'w' : wantType;
+              const c = this.locks.conflict(key, this.currentPid, probe as 'r' | 'w', start, end);
+              if (c) {
+                view.setInt16(flockPtr, c.type === 'w' ? 1 : 0, true);
+                view.setInt16(flockPtr + 2, 0, true); // SEEK_SET
+                view.setBigInt64(flockPtr + 8, BigInt(c.start), true);
+                view.setBigInt64(flockPtr + 16, c.end === Infinity ? 0n : BigInt(c.end - c.start + 1), true);
+                view.setInt32(flockPtr + 24, c.pid, true); // l_pid
+              } else {
+                view.setInt16(flockPtr, 2, true); // F_UNLCK: no conflict
+              }
+              ret = 0n;
+              break;
+            }
+
+            // F_SETLK / F_SETLKW
+            this.locks.clearWaiter(this.currentPid); // fresh attempt: no longer waiting on a prior range
+            if (wantType === 'u') {
+              this.locks.set(key, this.currentPid, 'u', start, end);
+              this.schedEvent = true; // a waiter blocked on this range may now proceed
+              ret = 0n;
+              break;
+            }
+            const conflict = this.locks.conflict(key, this.currentPid, wantType, start, end);
+            if (conflict) {
+              if (cmd === 7 || cmd === 14) { // F_SETLKW: block until the range frees
+                if (this.coop) {
+                  if (this.locks.wouldDeadlock(this.currentPid, key, wantType, start, end)) { ret = -BigInt(EDEADLK); break; }
+                  this.locks.setWaiter(this.currentPid, key, wantType, start, end);
+                  return { status: 'coop_block', reason: 'lock' };
+                }
+                ret = 0n; break; // serialized fallback: grant
+              }
+              ret = -BigInt(EAGAIN); // F_SETLK: non-blocking -> EAGAIN
+              break;
+            }
+            this.locks.set(key, this.currentPid, wantType, start, end);
             ret = 0n;
             break;
           }
-          case 6:  // F_SETLK — set lock (non-blocking)
-          case 7:  // F_SETLKW — set lock (blocking)
-          case 13: // F_SETLK64
-          case 14: // F_SETLKW64
-            ret = 0n; // accept all locks (single-user system, no contention)
-            break;
           case 8: // F_SETOWN
             ret = 0n;
             break;
@@ -2446,20 +2928,28 @@ export class SyscallHandler {
         const futexVal = Number(a2);
 
         switch (futexOp) {
-          case 0: { // FUTEX_WAIT: if *uaddr == val, sleep until FUTEX_WAKE
+          case 0:   // FUTEX_WAIT
+          case 9: { // FUTEX_WAIT_BITSET
             const current = view.getInt32(futexAddr, true);
             if (current !== futexVal) {
-              ret = -BigInt(11); // EAGAIN — value mismatch
+              ret = -BigInt(11); // EAGAIN — value already changed (also how a wake-up returns)
+            } else if (this.coop) {
+              // block until another process changes the word and FUTEX_WAKEs it. the futex
+              // word lives in MAP_SHARED memory kept coherent across the context switch.
+              return { status: 'coop_block', reason: 'futex', addr: Number(a0) };
             } else {
-              // Single-threaded: no other thread can wake us, return EAGAIN
-              // Multi-threaded (future): would Atomics.wait here
-              ret = -BigInt(11); // EAGAIN
+              ret = -BigInt(11); // serialized path: nothing can wake us, don't hang
             }
             break;
           }
-          case 1: // FUTEX_WAKE: wake up to val waiters
-            ret = 0n; // no waiters in single-threaded mode
+          case 1:    // FUTEX_WAKE
+          case 10: { // FUTEX_WAKE_BITSET
+            // report the real number of waiters woken: tst_checkpoint_wake retries until
+            // it wakes the number it expects, so an inflated count would desynchronize it.
+            if (this.coop && this.futexWakeHook) ret = BigInt(this.futexWakeHook(Number(a0), Math.max(0, futexVal)));
+            else ret = 0n;
             break;
+          }
           case 2: // FUTEX_FD (deprecated)
             ret = -BigInt(ENOSYS);
             break;
@@ -2479,12 +2969,6 @@ export class SyscallHandler {
             ret = 0n;
             break;
           case 8: // FUTEX_TRYLOCK_PI
-            ret = 0n;
-            break;
-          case 9: // FUTEX_WAIT_BITSET: like WAIT but with bitmask
-            ret = -BigInt(11); // EAGAIN
-            break;
-          case 10: // FUTEX_WAKE_BITSET
             ret = 0n;
             break;
           default:
@@ -2592,6 +3076,8 @@ export class SyscallHandler {
             } else {
               this.fdTable.set(socketFd, { type: 'socket', socketId: resp.ret, domain, sockType });
               if (Number(a1) & 0o2000000) this.fdCloexec.add(socketFd); // SOCK_CLOEXEC
+              this.nt(`socket dom=${domain} type=${sockType} -> fd=${socketFd}`);
+              (this as any)._netActive = true;
               cpu.setReg(0, BigInt(socketFd));
             }
           },
@@ -2646,6 +3132,7 @@ export class SyscallHandler {
           status: 'bridge', method: 'net_connect',
           args: { socketId: connEntry.socketId, ...connAddr },
           apply: (resp: any) => {
+            this.nt(`connect fd=${Number(a0)} ${connAddr.host}:${connAddr.port} -> ${resp.ret}`);
             cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
           },
         };
@@ -2710,7 +3197,7 @@ export class SyscallHandler {
         const rfEntry = this.getFdEntry(Number(a0));
         if (!rfEntry || rfEntry.type !== 'socket') { ret = -BigInt(EBADF); break; }
         const recvBuf = Number(a1);
-        const recvLen = Number(a2);
+        const recvLen = Math.min(Number(a2), 12288); // slot-safe cap (see net_read in read())
         return {
           status: 'bridge', method: 'net_read',
           args: { socketId: rfEntry.socketId, count: recvLen },
@@ -2747,8 +3234,33 @@ export class SyscallHandler {
 
       // ── Process identity/groups ──
       case 129: { // kill(pid, sig)
-        // For now, ignore signals sent to self or children
-        ret = 0n;
+        const killPid = Number(BigInt.asIntN(32, a0));
+        const killSig = Number(a1);
+        if (killSig < 0 || killSig > 64) { ret = -BigInt(EINVAL); break; }
+        // a process exists (is signalable) if it's us, init, or a suspended ancestor. cross-process
+        // delivery isn't modeled in the serialized fork engine, but existence/permission is.
+        const pidExists = (p: number): boolean =>
+          p === this.currentPid || p === 1 || p === this.currentPpid || (this.isLivePidFn?.(p) ?? false);
+        if (killPid > 0) {
+          if (killPid === this.currentPid) {
+            if (killSig !== 0) this.raiseSignal(killSig); // deliver to self via the live queue
+            ret = 0n;
+          } else if (this.coop && this.killHook) {
+            // cross-process delivery through the scheduler's process table
+            if (!this.killHook(killPid, killSig)) { ret = -BigInt(ESRCH); break; }
+            ret = 0n;
+          } else {
+            if (!pidExists(killPid)) { ret = -BigInt(ESRCH); break; }
+            ret = 0n;
+          }
+        } else if (killPid === 0 || killPid === -1) {
+          // own process group (0) or every process we may signal (-1): at minimum deliver to self.
+          if (killSig !== 0) this.raiseSignal(killSig);
+          ret = 0n;
+        } else {
+          // pid < -1: the process group -pid. only our own group is modeled; others are ESRCH.
+          ret = -BigInt(ESRCH);
+        }
         break;
       }
 
@@ -2790,6 +3302,7 @@ export class SyscallHandler {
 
       case 115: { // clock_nanosleep (NOT sched_getscheduler — that's 120)
         // Per spec: sleep on specified clock. Return immediately in emulator.
+        if (this.coop) this.wantYield = true; // cooperative yield point while "sleeping"
         ret = 0n;
         break;
       }
@@ -2827,17 +3340,37 @@ export class SyscallHandler {
         break;
       }
 
-      case 233: // madvise — accept any advice
+      case 233: { // madvise(addr, length, advice)
+        // MADV_DONTNEED (4) on an anonymous private mapping must make subsequent reads
+        // return zero-filled pages (linux semantics). musl's mallocng relies on this to
+        // recycle freed slots; leaving stale bytes corrupts its inline chunk metadata.
+        // MADV_FREE (8) may also zero lazily, so zeroing eagerly is safe.
+        const advice = Number(a2);
+        if (advice === 4 || advice === 8) {
+          const start = Number(a0), len = Number(a1);
+          const end = start + len;
+          if (len > 0 && (start & 0xFFF) === 0 && end + GUEST_MEM_BASE <= memory.buffer.byteLength) {
+            new Uint8Array(memory.buffer).fill(0, start + GUEST_MEM_BASE, end + GUEST_MEM_BASE);
+          }
+        }
         ret = 0n;
         break;
+      }
 
       // ── Missing syscalls (spec-compliant implementations) ──
 
       case 50: { // fchdir(fd)
-        // Per spec: change cwd to the directory referenced by fd
-        // We need the path of the open dir — but our VFS doesn't track that easily
-        // For now, return ENOSYS (this is rare in practice)
-        ret = -BigInt(EBADF);
+        // change cwd to the directory the fd refers to. native (bridge) fds carry their
+        // guest path; that is what busybox's post-install triggers fchdir into.
+        const fchEntry = this.getFdEntry(Number(a0));
+        const fchPath = (fchEntry as any)?.path;
+        if (typeof fchPath === 'string' && fchPath.length) {
+          this.cwd = fchPath;
+          if (this.vfs) this.vfs.setCwd(fchPath);
+          ret = 0n;
+        } else {
+          ret = -BigInt(EBADF);
+        }
         break;
       }
 
@@ -2850,11 +3383,13 @@ export class SyscallHandler {
           view.setBigUint64(remAddr + GUEST_MEM_BASE, 0n, true);
           view.setBigUint64(remAddr + GUEST_MEM_BASE + 8, 0n, true);
         }
+        if (this.coop) this.wantYield = true; // let another process run while we "sleep"
         ret = 0n;
         break;
       }
 
-      case 124: // sched_yield — yield CPU (no-op in emulator)
+      case 124: // sched_yield — yield CPU
+        if (this.coop) this.wantYield = true;
         ret = 0n;
         break;
 
@@ -3128,15 +3663,24 @@ export class SyscallHandler {
         break;
 
       // ── Memory control (per spec: accept, no-op for our in-memory VFS) ──
-      case 228: // mlock
-      case 229: // munlock
+      case 228:   // mlock(addr, len)
+      case 229: { // munlock(addr, len)
+        const lkStart = Number(a0) & ~0xFFF;
+        const lkEnd = (Number(a0) + Number(a1) + 0xFFF) & ~0xFFF;
+        this.setLocked(lkStart, lkEnd, nr === 228);
+        ret = 0n;
+        break;
+      }
       case 230: // mlockall
       case 231: // munlockall
         ret = 0n;
         break;
-      case 227: // msync — sync memory mapping to file (no-op, our VFS is in-memory)
+      case 227: { // msync — flush a writable shared file mapping back to disk
+        const msFlush = this.buildMmapFlush(cpu, memory, Number(a0), Number(a1), false);
+        if (msFlush) return msFlush;
         ret = 0n;
         break;
+      }
       case 232: { // mincore(addr, length, vec) — check page residency
         // Per spec: fill vec with 1s (all pages resident in our model)
         const mcLen = Number(a1);
@@ -3148,9 +3692,42 @@ export class SyscallHandler {
         break;
       }
       case 216: { // mremap(old_addr, old_size, new_size, flags, new_addr)
-        // Per spec: resize memory mapping
-        // Simple implementation: return the same address (pretend resize succeeded)
-        ret = a0; // return old address
+        // returning old_addr while ignoring new_size let the guest write past the mapping into
+        // the next allocation -> heap corruption (musl mallocng grows large allocations via
+        // mremap). resize for real: extend in place if this is the top of the arena, otherwise
+        // move to a fresh region (MREMAP_MAYMOVE, which musl always sets) and copy the bytes over.
+        const MREMAP_MAYMOVE = 1;
+        const oldAddr = Number(a0), oldSize = Number(a1), newSize = Number(a2);
+        const mrFlags = Number(a3);
+        const alignedOld = (oldSize + 0xFFF) & ~0xFFF;
+        const alignedNew = (newSize + 0xFFF) & ~0xFFF;
+        if (alignedNew <= alignedOld) { ret = a0; break; } // shrink or same size: in place
+        // grow in place when the old mapping sits at the very top of the arena
+        if (BigInt(oldAddr + alignedOld) === this.mmapBase) {
+          const needed = oldAddr + alignedNew + GUEST_MEM_BASE;
+          if (needed > this.maxBytes) { ret = -BigInt(ENOMEM); break; }
+          if (needed > memory.buffer.byteLength) {
+            const pagesNeeded = Math.ceil(needed / 65536), currentPages = memory.buffer.byteLength / 65536;
+            if (pagesNeeded > currentPages) memory.grow(pagesNeeded - currentPages);
+          }
+          new Uint8Array(memory.buffer).fill(0, oldAddr + alignedOld + GUEST_MEM_BASE, oldAddr + alignedNew + GUEST_MEM_BASE);
+          this.mmapBase = BigInt(oldAddr + alignedNew);
+          ret = a0;
+          break;
+        }
+        if (!(mrFlags & MREMAP_MAYMOVE)) { ret = -BigInt(ENOMEM); break; }
+        const newAddr = this.mmapBase;
+        this.mmapBase += BigInt(alignedNew);
+        const needed = Number(newAddr) + alignedNew + GUEST_MEM_BASE;
+        if (needed > this.maxBytes) { this.mmapBase -= BigInt(alignedNew); ret = -BigInt(ENOMEM); break; }
+        if (needed > memory.buffer.byteLength) {
+          const pagesNeeded = Math.ceil(needed / 65536), currentPages = memory.buffer.byteLength / 65536;
+          if (pagesNeeded > currentPages) memory.grow(pagesNeeded - currentPages);
+        }
+        const mrMem = new Uint8Array(memory.buffer);
+        mrMem.copyWithin(Number(newAddr) + GUEST_MEM_BASE, oldAddr + GUEST_MEM_BASE, oldAddr + GUEST_MEM_BASE + oldSize);
+        mrMem.fill(0, Number(newAddr) + GUEST_MEM_BASE + oldSize, Number(newAddr) + GUEST_MEM_BASE + alignedNew);
+        ret = newAddr;
         break;
       }
 
@@ -3189,7 +3766,7 @@ export class SyscallHandler {
       case 281: { // execveat(dirfd, pathname, argv, envp, flags)
         // Per spec: exec relative to directory fd
         // Simple: treat as regular execve (ignore dirfd, use pathname as-is)
-        const pathname281 = readGuestString(bytes, Number(a1));
+        const pathname281 = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const argvPtrs281: string[] = [];
         let argvAddr281 = Number(a2);
         while (true) {
@@ -3238,17 +3815,21 @@ export class SyscallHandler {
       }
 
       case 276: { // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
-        const oldpath276 = readGuestString(bytes, Number(a1));
-        const newpath276 = readGuestString(bytes, Number(a3));
-        const renameFlags = Number(a4);
+        const oldpath276 = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
+        const newpath276 = this.resolveAt(a2, readGuestString(bytes, Number(a3)));
+        const bOld276 = this.bridgePath(oldpath276);
+        if (bOld276) {
+          const bNew276 = this.bridgePath(newpath276) ?? newpath276;
+          this.statCache.delete(bOld276);
+          this.statCache.delete(bNew276);
+          return {
+            status: 'bridge', method: 'fs_rename',
+            args: { oldPath: bOld276, newPath: bNew276 },
+            apply: (resp: any) => { cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret))); },
+          };
+        }
         if (this.vfs) {
-          if (renameFlags & 1) { // RENAME_NOREPLACE — check if target exists
-            // Our VFS rename already handles this correctly for existing targets
-            // but RENAME_NOREPLACE should fail if target exists
-            ret = BigInt(this.vfs.rename(oldpath276, newpath276));
-          } else {
-            ret = BigInt(this.vfs.rename(oldpath276, newpath276));
-          }
+          ret = BigInt(this.vfs.rename(oldpath276, newpath276));
         } else {
           ret = -BigInt(ENOSYS);
         }
@@ -3273,9 +3854,13 @@ export class SyscallHandler {
         // Per spec: extended stat returning struct statx (256 bytes)
         // We first get a regular stat into the LAST 128 bytes of the 256-byte statx buffer
         // (since statx is 256 bytes and stat is 128, they don't overlap), then rearrange.
-        const sxPath = readGuestString(bytes, Number(a1));
         const sxFlags = Number(a2);
+        // a bad pathname pointer faults EFAULT (stat(NULL)); AT_EMPTY_PATH (fstat) passes a valid ""
+        // so it is never caught here.
+        if (!(sxFlags & 0x1000) && this.ptrFaults(bytes, Number(a1), 1)) { ret = -BigInt(EFAULT); break; }
+        const sxPath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const sxBufAddr = Number(a4);
+        if (this.ptrFaults(bytes, sxBufAddr, 256)) { ret = -BigInt(EFAULT); break; } // musl routes fstat/stat here
         if (this.vfs) {
           // Write regular stat into the second half of the statx buffer (bytes 128-255)
           const tmpOffset = sxBufAddr + 128;
@@ -3429,6 +4014,38 @@ export class SyscallHandler {
         const wantRead = this.readFdSet(view, readPtr, nfds);
         const wantWrite = this.readFdSet(view, writePtr, nfds);
 
+        // socket readability is only knowable via the bridge. if a socket is watched for read and
+        // nothing else is already ready (writable sockets/readable local fds resolve synchronously),
+        // defer to net_poll — this mirrors ppoll and is what unblocks apk/openssl select loops.
+        const sockReadFd = [...wantRead].find((fd) => this.getFdEntry(fd)?.type === 'socket');
+        if (sockReadFd !== undefined && tmoMs !== 0) {
+          let preReady = 0;
+          for (const fd of wantRead) if (this.getFdEntry(fd)?.type !== 'socket' && this.isFdReadable(fd)) preReady++;
+          for (const fd of wantWrite) if (this.isFdWritable(fd)) preReady++;
+          if (preReady === 0) {
+            const sockEntry = this.getFdEntry(sockReadFd);
+            const pollTmo = tmoMs < 0 ? 30000 : tmoMs;
+            return {
+              status: 'bridge', method: 'net_poll',
+              args: { socketId: sockEntry!.socketId, timeoutMs: pollTmo },
+              apply: (resp: any) => {
+                const outR = new Set<number>(), outW = new Set<number>();
+                for (const fd of wantWrite) if (this.isFdWritable(fd)) outW.add(fd);
+                for (const fd of wantRead) {
+                  const t = this.getFdEntry(fd)?.type;
+                  if (t === 'socket') { if (resp.ret > 0) outR.add(fd); }
+                  else if (this.isFdReadable(fd)) outR.add(fd);
+                }
+                this.writeFdSet(view, readPtr, nfds, outR);
+                this.writeFdSet(view, writePtr, nfds, outW);
+                if (exceptPtr !== 0) this.writeFdSet(view, exceptPtr, nfds, new Set());
+                this.nt(`pselect.sock -> ret=${resp.ret} r=${outR.size} w=${outW.size}`);
+                cpu.setReg(0, BigInt(outR.size + outW.size));
+              },
+            };
+          }
+        }
+
         const readyRead = new Set<number>();
         const readyWrite = new Set<number>();
         let deadline = tmoMs < 0 ? -1 : Date.now() + tmoMs;
@@ -3543,6 +4160,7 @@ export class SyscallHandler {
         const watchingLocal = pfds.some((p) => p.fd >= 0 && this.getFdEntry(p.fd)?.type !== 'socket');
         if (!watchingLocal && socketEntry) {
           const pollTmo = tmoMs < 0 ? 30000 : tmoMs;
+          this.nt(`ppoll.enter sock=${socketEntry.fd} events=${socketEntry.entry ? pfds.find((p) => p.fd === socketEntry.fd)?.events : '?'} tmo=${tmoMs}`);
           return {
             status: 'bridge', method: 'net_poll',
             args: { socketId: socketEntry.entry.socketId, timeoutMs: pollTmo },
@@ -3556,6 +4174,7 @@ export class SyscallHandler {
               }
               writeBack();
               const c = pfds.filter((p) => p.revents !== 0).length;
+              this.nt(`ppoll.sock -> ret=${resp.ret} ready=${c}`);
               cpu.setReg(0, BigInt(c));
             },
           };
@@ -3595,12 +4214,28 @@ export class SyscallHandler {
 
       // ── Remaining syscalls from aarch64 spec ──
 
-      // Mount/unmount (needed for container/init, stub for now)
-      case 39: // mount
-      case 40: // mount_setattr
-        ret = 0n; // pretend mount succeeded
+      // mount(source, target, filesystemtype, mountflags, data). the emulator has a
+      // single in-memory tree, so a mount records the mount point in the namespace
+      // (visible via /proc/self/mounts and mountinfo) rather than grafting a real fs.
+      // the ltp scratch-device tests select tmpfs (LTP_DEV_FS_TYPE=tmpfs), which needs
+      // no backing device or mkfs; the mount point directory already exists.
+      case 40: { // mount
+        const target = readGuestString(bytes, Number(a1));
+        const fstype = a2 !== 0n ? readGuestString(bytes, Number(a2)) : '';
+        const source = a0 !== 0n ? readGuestString(bytes, Number(a0)) : fstype;
+        const tgt = this.absolutizePath(target);
+        if (!this.vfs || !this.vfs.exists(tgt)) { ret = -BigInt(ENOENT); break; }
+        this.vfs.addMount(source, tgt, fstype || 'tmpfs');
+        ret = 0n;
         break;
-      case 60: // umount2
+      }
+      case 39: { // umount2(target, flags)
+        const target = this.absolutizePath(readGuestString(bytes, Number(a0)));
+        if (!this.vfs || !this.vfs.removeMount(target)) { ret = -BigInt(EINVAL); break; }
+        ret = 0n;
+        break;
+      }
+      case 442: // mount_setattr
         ret = 0n;
         break;
       case 41: // pivot_root
@@ -3658,6 +4293,7 @@ export class SyscallHandler {
           off += len;
         }
         const smB64 = bytesToBase64(combined);
+        this.nt(`sendmsg fd=${Number(a0)} len=${totalLen}`);
         // Check for destination address (msg_name) for connectionless sendmsg
         const namePtr = Number(view.getBigUint64(mhdr, true));
         const nameLen = view.getUint32(mhdr + 8, true);
@@ -3697,8 +4333,9 @@ export class SyscallHandler {
         }
         return {
           status: 'bridge', method: 'net_read',
-          args: { socketId: rmEntry.socketId, count: rmCapacity },
+          args: { socketId: rmEntry.socketId, count: Math.min(rmCapacity, 12288) },
           apply: (resp: any) => {
+            this.nt(`recvmsg fd=${Number(a0)} cap=${rmCapacity} -> ret=${resp.ret} dlen=${resp.data ? Math.floor(resp.data.length * 3 / 4) : 0}`);
             if (resp.ret < 0) {
               cpu.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
               return;
@@ -4053,7 +4690,8 @@ export class SyscallHandler {
       case 235: // membarrier
         ret = 0n; // memory barrier — no-op in single-threaded
         break;
-      case 236: // mlock2
+      case 236: // mlock2(addr, len, flags)
+        this.setLocked(Number(a0) & ~0xFFF, (Number(a0) + Number(a1) + 0xFFF) & ~0xFFF, true);
         ret = 0n;
         break;
       case 237: // copy_file_range (same as 285)
@@ -4188,7 +4826,7 @@ export class SyscallHandler {
 
       case 437: { // openat2(dirfd, pathname, how, size) — extended open
         // Treat as regular openat
-        const path437 = readGuestString(bytes, Number(a1));
+        const path437 = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         const howPtr = Number(a2) + GUEST_MEM_BASE;
         const flags437 = Number(view.getBigUint64(howPtr, true)); // how.flags
         const mode437 = Number(view.getBigUint64(howPtr + 8, true)); // how.mode
@@ -4212,7 +4850,7 @@ export class SyscallHandler {
       case 439: { // faccessat2(dirfd, pathname, mode, flags)
         // Per spec: like faccessat but with flags (AT_SYMLINK_NOFOLLOW, AT_EACCESS)
         if (this.ptrFaults(bytes, Number(a1))) { ret = -BigInt(EFAULT); break; }
-        const fa2Path = readGuestString(bytes, Number(a1));
+        const fa2Path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
         if (this.vfs) {
           ret = BigInt(this.vfs.faccessat(Number(BigInt.asIntN(32, a0)), fa2Path, Number(a2), Number(a3)));
         } else {
@@ -4366,7 +5004,7 @@ function writeBridgeStat(view: DataView, guestAddr: number, resp: any): void {
   // struct stat (aarch64 Linux):
   // 0: st_dev (8), 8: st_ino (8), 16: st_mode (4), 20: st_nlink (4)
   // 48: st_size (8), 88: st_mtime (8)
-  // Meta layout for fs_stat: _meta = [mode, size, nlink, mtime, uid, gid]
+  // Meta layout for fs_stat: _meta = [mode, size, nlink, mtime, uid, gid, ino]
   const meta = resp._meta;
   const mode = meta ? meta[0] : (resp.mode ?? 0o100644);
   const size = meta ? meta[1] : (resp.size ?? 0);
@@ -4374,6 +5012,12 @@ function writeBridgeStat(view: DataView, guestAddr: number, resp: any): void {
   const mtime = meta ? meta[3] : (resp.mtime ?? 0);
   const uid = meta ? (meta[4] ?? 0) : (resp.uid ?? 0);
   const gid = meta ? (meta[5] ?? 0) : (resp.gid ?? 0);
+  const ino = meta ? (meta[6] ?? 0) : (resp.ino ?? 0);
+  // st_dev (nonzero) + st_ino (real inode, unique per file). CRITICAL: musl's ld.so dedups shared
+  // libraries by (st_dev, st_ino) — a zero/constant ino makes it treat every lib as already-loaded
+  // and silently skip all but the first, so their symbols never resolve.
+  view.setBigUint64(base + 0, 1n, true);              // st_dev
+  view.setBigUint64(base + 8, BigInt.asUintN(64, BigInt(Math.trunc(ino))), true); // st_ino
   view.setUint32(base + 16, mode, true);
   view.setUint32(base + 20, nlink, true);
   view.setUint32(base + 24, uid, true);   // st_uid

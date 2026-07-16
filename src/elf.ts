@@ -368,6 +368,13 @@ const AT_EXECFN = 31;
 // paths we support.
 const HWCAP_FP = 1 << 0;
 const HWCAP_ASIMD = 1 << 1;
+// crypto extensions we implement as host helpers (see crypto-ext.ts). advertising these makes
+// OpenSSL use its hardware-crypto path (aese/pmull) instead of the slower software vpaes/ghash path.
+const HWCAP_AES = 1 << 3;
+const HWCAP_PMULL = 1 << 4;
+const HWCAP_SHA1 = 1 << 5;
+const HWCAP_SHA2 = 1 << 6;   // SHA-256 (sha256h/su family)
+const HWCAP_SHA512 = 1 << 21;
 
 export function setupStack(
   memory: WebAssembly.Memory,
@@ -425,7 +432,7 @@ export function setupStack(
     [AT_PAGESZ, 4096n],
     [AT_ENTRY, elfInfo.entry],
     [AT_FLAGS, 0n],
-    [AT_HWCAP, BigInt(HWCAP_FP | HWCAP_ASIMD)],
+    [AT_HWCAP, BigInt(HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL | HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_SHA512)],
     [AT_CLKTCK, 100n],
     [AT_SECURE, 0n],
     [AT_UID, 0n],

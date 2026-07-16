@@ -1,5 +1,6 @@
 import Foundation
 import os.lock
+import Compression
 
 // File-scope wrappers for POSIX stat/lstat to disambiguate from NativeFS.stat method
 private func statCWrapper(_ path: UnsafePointer<CChar>, _ sb: UnsafeMutablePointer<stat>) -> Int32 {
@@ -32,7 +33,13 @@ struct FsCreds {
 ///
 /// Guest path "/root/test.txt" → <Documents>/rootfs/root/test.txt
 final class NativeFS {
-    let rootPath: URL
+    // the ACTIVE root's on-disk directory. all guest paths resolve under it. mutable: `switchRoot`
+    // repoints it at a different userspace under `rootsPath`. (the session is torn down + rebooted on
+    // switch, so no open fd outlives the change.)
+    private(set) var rootPath: URL
+    // <Documents>/roots — holds one directory per installed userspace (default, alpine, ...).
+    let rootsPath: URL
+    private(set) var activeRoot: String = "default"
     private let fm = FileManager.default
     private var openFiles: [Int32: FileHandle] = [:]
     private var openFilePaths: [Int32: String] = [:] // fd -> real path, for fstat ownership lookup
@@ -103,10 +110,76 @@ final class NativeFS {
 
     init() {
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
-        rootPath = docs.appendingPathComponent("rootfs", isDirectory: true)
-        try? fm.createDirectory(at: rootPath, withIntermediateDirectories: true)
+        rootsPath = docs.appendingPathComponent("roots", isDirectory: true)
+        try? fm.createDirectory(at: rootsPath, withIntermediateDirectories: true)
+
+        // migrate the pre-roots single rootfs (<Documents>/rootfs) into roots/default so existing
+        // installs keep their state. one-time; harmless once roots/default exists.
+        let legacy = docs.appendingPathComponent("rootfs", isDirectory: true)
+        let defaultRoot = rootsPath.appendingPathComponent("default", isDirectory: true)
+        if fm.fileExists(atPath: legacy.path) && !fm.fileExists(atPath: defaultRoot.path) {
+            try? fm.moveItem(at: legacy, to: defaultRoot)
+        }
+        try? fm.createDirectory(at: defaultRoot, withIntermediateDirectories: true)
+
+        // busybox + default configs are only ever seeded into `default` (pulled roots bring their own
+        // userspace). point rootPath at default for the bootstrap (which resolves writes via rootPath),
+        // then switch it to the persisted active root below.
+        rootPath = defaultRoot
         bootstrapIfNeeded()
+
+        // pick the persisted active root; fall back to default if it's gone.
+        let persisted = (try? String(contentsOf: rootsPath.appendingPathComponent(".active"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let p = persisted, !p.isEmpty,
+           fm.fileExists(atPath: rootsPath.appendingPathComponent(p, isDirectory: true).path) {
+            activeRoot = p
+        }
+        rootPath = rootsPath.appendingPathComponent(activeRoot, isDirectory: true)
         loadCacheConfig()
+    }
+
+    // MARK: - Roots (userspace management)
+
+    func rootURL(_ name: String) -> URL { rootsPath.appendingPathComponent(name, isDirectory: true) }
+
+    /// installed roots (directory names under rootsPath), sorted.
+    func listRoots() -> [String] {
+        let items = (try? fm.contentsOfDirectory(atPath: rootsPath.path)) ?? []
+        return items.filter { !$0.hasPrefix(".") &&
+            (try? rootURL($0).resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }.sorted()
+    }
+
+    func rootExists(_ name: String) -> Bool { fm.fileExists(atPath: rootURL(name).path) }
+
+    /// create an empty root directory (a pull extracts into it). returns false if it already exists.
+    @discardableResult
+    func createRoot(_ name: String) -> Bool {
+        guard isValidRootName(name), !rootExists(name) else { return false }
+        try? fm.createDirectory(at: rootURL(name), withIntermediateDirectories: true)
+        return true
+    }
+
+    /// repoint the active root. the caller (kernel/session) is responsible for the reboot; this just
+    /// changes where guest paths resolve and persists the choice.
+    @discardableResult
+    func switchRoot(_ name: String) -> Bool {
+        guard rootExists(name) else { return false }
+        activeRoot = name
+        rootPath = rootURL(name)
+        try? name.write(to: rootsPath.appendingPathComponent(".active"), atomically: true, encoding: .utf8)
+        return true
+    }
+
+    func removeRoot(_ name: String) -> Bool {
+        guard name != "default", name != activeRoot, rootExists(name) else { return false }
+        try? fm.removeItem(at: rootURL(name))
+        return true
+    }
+
+    // root names are single path components used to build directory paths + guest-visible under /roots.
+    private func isValidRootName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.hasPrefix(".")
     }
 
     // MARK: - Bootstrap
@@ -305,6 +378,162 @@ final class NativeFS {
             }
         }
         return finish(count, firstErr.isEmpty ? "ok" : firstErr)
+    }
+
+    // MARK: - Distro pull (extract a rootfs tarball into a root)
+
+    /// decompress a gzip member to a Data. strips the gzip wrapper (RFC 1952) and raw-inflates the
+    /// DEFLATE stream via the Compression framework (which speaks raw DEFLATE, not the gzip wrapper).
+    static func gunzip(_ data: Data) -> Data? {
+        let bytes = [UInt8](data)
+        guard bytes.count > 18, bytes[0] == 0x1f, bytes[1] == 0x8b, bytes[2] == 0x08 else { return nil }
+        let flg = bytes[3]
+        var pos = 10
+        if flg & 0x04 != 0 { // FEXTRA
+            guard pos + 2 <= bytes.count else { return nil }
+            let xlen = Int(bytes[pos]) | (Int(bytes[pos + 1]) << 8); pos += 2 + xlen
+        }
+        if flg & 0x08 != 0 { while pos < bytes.count && bytes[pos] != 0 { pos += 1 }; pos += 1 } // FNAME
+        if flg & 0x10 != 0 { while pos < bytes.count && bytes[pos] != 0 { pos += 1 }; pos += 1 } // FCOMMENT
+        if flg & 0x02 != 0 { pos += 2 } // FHCRC
+        let n = bytes.count
+        guard pos < n - 8 else { return nil }
+        // gzip footer: crc32(4) + isize(4, uncompressed size mod 2^32) — trust isize for the buffer.
+        var isize = Int(bytes[n - 4]) | (Int(bytes[n - 3]) << 8) | (Int(bytes[n - 2]) << 16) | (Int(bytes[n - 1]) << 24)
+        if isize <= 0 { isize = max(1, (n - pos - 8) * 8) } // fallback if isize is bogus/huge-wrapped
+        let deflate = Array(bytes[pos..<(n - 8)])
+        var dst = [UInt8](repeating: 0, count: isize)
+        let decoded = dst.withUnsafeMutableBufferPointer { d in
+            deflate.withUnsafeBufferPointer { s in
+                compression_decode_buffer(d.baseAddress!, isize, s.baseAddress!, deflate.count, nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard decoded > 0 else { return nil }
+        return Data(dst.prefix(decoded))
+    }
+
+    /// extract a (possibly gzipped) rootfs tarball into roots/<name>, preserving the directory tree,
+    /// symlinks, and permissions. returns (ok, fileCount, note). the root is wiped + recreated first.
+    func installRootfs(_ tarball: Data, into name: String) -> (ok: Bool, files: Int, note: String) {
+        guard isValidRootName(name) else { return (false, 0, "invalid root name") }
+        let tar: Data
+        if tarball.count > 2 && tarball[tarball.startIndex] == 0x1f && tarball[tarball.startIndex + 1] == 0x8b {
+            guard let un = Self.gunzip(tarball) else { return (false, 0, "gunzip failed") }
+            tar = un
+        } else {
+            tar = tarball
+        }
+        let dest = rootURL(name)
+        try? fm.removeItem(at: dest)
+        try? fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        let n = extractUstar(tar, into: dest)
+        return (n >= 0, max(0, n), n >= 0 ? "ok" : "extract failed")
+    }
+
+    // convert an absolute guest symlink target to one relative to the link's own directory, so the
+    // host OS follows it WITHIN the root (a chroot would; the host wouldn't for a leading "/"). a
+    // target that's already relative is returned unchanged. e.g. ("/bin/busybox", "/bin/cat") -> "busybox".
+    static func rootRelativeSymlink(_ target: String, linkGuestPath: String) -> String {
+        guard target.hasPrefix("/") else { return target }
+        let fromDir = (linkGuestPath as NSString).deletingLastPathComponent
+        let from = fromDir.split(separator: "/").map(String.init)
+        let to = target.split(separator: "/").map(String.init)
+        var i = 0
+        while i < from.count && i < to.count && from[i] == to[i] { i += 1 }
+        var rel = [String](repeating: "..", count: from.count - i)
+        rel.append(contentsOf: to[i...])
+        return rel.isEmpty ? "." : rel.joined(separator: "/")
+    }
+
+    // proper ustar/gnu tar extractor: nested paths, dirs, symlinks, hardlinks, GNU long names, modes.
+    // operates on an in-memory Data (decompressed tar). returns files+links written, or -1 on fatal.
+    private func extractUstar(_ tar: Data, into destDir: URL) -> Int {
+        let b = [UInt8](tar)
+        var pos = 0
+        var count = 0
+        var longName: String? = nil
+
+        func octal(_ off: Int, _ len: Int) -> Int {
+            var s = ""
+            for i in off..<min(off + len, b.count) { let c = b[pos + i]; if c == 0 || c == 0x20 { break }; s.append(Character(UnicodeScalar(c))) }
+            return Int(s, radix: 8) ?? 0
+        }
+        func cstr(_ off: Int, _ len: Int) -> String {
+            var end = off
+            while end < off + len && pos + end < b.count && b[pos + end] != 0 { end += 1 }
+            return String(decoding: b[(pos + off)..<(pos + end)], as: UTF8.self)
+        }
+        // sanitize a tar path to a safe relative path (strip leading ./ and /, drop any .. component).
+        func sanitize(_ raw: String) -> String? {
+            var parts: [String] = []
+            for c in raw.split(separator: "/").map(String.init) {
+                if c.isEmpty || c == "." { continue }
+                if c == ".." { return nil }
+                parts.append(c)
+            }
+            return parts.isEmpty ? nil : parts.joined(separator: "/")
+        }
+
+        while pos + 512 <= b.count {
+            // a name field starting with NUL => zero block => end of archive
+            if b[pos] == 0 { break }
+            let rawName = cstr(0, 100)
+            let prefix = cstr(345, 155)
+            let size = octal(124, 12)
+            let mode = octal(100, 8)
+            let typeflag = b[pos + 156]
+            let linkname = cstr(157, 100)
+            pos += 512
+
+            let dataStart = pos
+            pos += (size + 511) & ~511 // advance past the (padded) file body
+
+            let fullName = longName ?? (prefix.isEmpty ? rawName : prefix + "/" + rawName)
+            longName = nil
+
+            switch typeflag {
+            case 0x4C: // 'L' GNU long name: body is the real name of the NEXT entry
+                longName = String(decoding: b[dataStart..<min(dataStart + size, b.count)], as: UTF8.self)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+                continue
+            case 0x78, 0x67, 0x4B: // 'x'/'g' pax, 'K' GNU long link — skip (short names cover alpine)
+                continue
+            default: break
+            }
+
+            guard let rel = sanitize(fullName) else { continue }
+            let target = destDir.appendingPathComponent(rel)
+
+            switch typeflag {
+            case 0x35: // '5' directory
+                try? fm.createDirectory(at: target, withIntermediateDirectories: true)
+            case 0x32: // '2' symlink
+                try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? fm.removeItem(at: target)
+                // rewrite an ABSOLUTE target to root-relative so the host OS resolves it WITHIN the
+                // root instead of escaping to a (nonexistent) host-absolute path. e.g. a rootfs's
+                // /bin/cat -> "/bin/busybox" becomes "busybox"; resolving on the host stays in-root.
+                let dest = Self.rootRelativeSymlink(linkname, linkGuestPath: "/" + rel)
+                if (try? fm.createSymbolicLink(atPath: target.path, withDestinationPath: dest)) != nil { count += 1 }
+            case 0x31: // '1' hardlink -> copy the linked file's contents (simpler than real hardlinks here)
+                try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if let src = sanitize(linkname) {
+                    try? fm.removeItem(at: target)
+                    try? fm.copyItem(at: destDir.appendingPathComponent(src), to: target)
+                    count += 1
+                }
+            case 0x30, 0: // '0' or NUL regular file
+                try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let body = size > 0 ? Data(b[dataStart..<min(dataStart + size, b.count)]) : Data()
+                do {
+                    try body.write(to: target)
+                    try? fm.setAttributes([.posixPermissions: NSNumber(value: mode == 0 ? 0o644 : mode)], ofItemAtPath: target.path)
+                    count += 1
+                } catch { /* skip unwritable entry */ }
+            default: break // char/block/fifo devices etc — not represented on the host fs
+            }
+        }
+        return count
     }
 
     private func writeText(_ relativePath: String, _ content: String) {
@@ -514,6 +743,35 @@ final class NativeFS {
             return (0, nil) // EOF
         } catch {
             return (-EBADF, nil)
+        }
+    }
+
+    // read at an explicit offset without disturbing the fd's current position. used by file-backed
+    // mmap + pread (the dynamic loader maps shared libraries this way).
+    func pread(fd: Int32, offset: UInt64, count: Int) -> (Int32, Data?) {
+        guard let handle = openFiles[fd] else { return (-EBADF, nil) }
+        do {
+            let saved = handle.offsetInFile
+            try handle.seek(toOffset: offset)
+            let data = try handle.read(upToCount: count)
+            try handle.seek(toOffset: saved)
+            if let data = data, !data.isEmpty { return (Int32(data.count), data) }
+            return (0, nil) // EOF
+        } catch {
+            return (-EBADF, nil)
+        }
+    }
+
+    func pwrite(fd: Int32, offset: UInt64, data: Data) -> Int32 {
+        guard let handle = openFiles[fd] else { return -EBADF }
+        do {
+            let saved = handle.offsetInFile
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: data)
+            try handle.seek(toOffset: saved)
+            return Int32(data.count)
+        } catch {
+            return -EBADF
         }
     }
 
@@ -735,8 +993,10 @@ final class NativeFS {
         let parent = linkURL.deletingLastPathComponent()
         try? fm.createDirectory(at: parent, withIntermediateDirectories: true)
         do {
-            // Target is stored as-is (relative or absolute guest path)
-            try fm.createSymbolicLink(atPath: linkURL.path, withDestinationPath: target)
+            // rewrite an absolute guest target to root-relative so the host resolves it within the
+            // root (matches how a chrooted kernel would), not to a host-absolute path that escapes.
+            let dest = Self.rootRelativeSymlink(target, linkGuestPath: linkpath)
+            try fm.createSymbolicLink(atPath: linkURL.path, withDestinationPath: dest)
             return 0
         } catch {
             return -EEXIST

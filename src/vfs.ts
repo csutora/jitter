@@ -16,6 +16,7 @@ import type { VFS } from './syscall.js';
 
 const EPERM       = 1;
 const ENOENT      = 2;
+const ENXIO       = 6;
 const EBADF       = 9;
 const EAGAIN      = 11;
 const EACCES      = 13;
@@ -42,8 +43,9 @@ const O_EXCL      = 0o200;
 const O_TRUNC     = 0o1000;
 const O_APPEND    = 0o2000;
 const O_NONBLOCK  = 0o4000;
-const O_DIRECTORY = 0o200000;
-const O_NOFOLLOW  = 0o400000;
+const O_DIRECTORY = 0o40000;   // 0x4000
+const O_NOFOLLOW  = 0o100000;  // 0x8000 (0o400000 is O_LARGEFILE, which musl sets on every open)
+const O_PATH      = 0o10000000; // 0x200000: open the location only; read/write/etc. give EBADF
 const O_CLOEXEC   = 0o2000000;
 
 // ── S_IF constants ─────────────────────────────────────────────────────────
@@ -78,6 +80,8 @@ interface InodeBase {
 interface FileInode extends InodeBase {
   type: 'file';
   data: Uint8Array;
+  // synthetic /proc files whose content depends on live kernel state: refreshed on every open.
+  dynamic?: () => Uint8Array;
 }
 
 interface DirInode extends InodeBase {
@@ -98,6 +102,7 @@ interface SymlinkInode extends InodeBase {
 
 interface FifoInode extends InodeBase {
   type: 'fifo';
+  readers?: number; // count of open read-ends, so O_WRONLY|O_NONBLOCK with no reader gives ENXIO
 }
 
 type Inode = FileInode | DirInode | CharDevInode | SymlinkInode | FifoInode;
@@ -112,6 +117,7 @@ interface FileOFD {
   flags: number;     // O_ status flags (O_APPEND, O_NONBLOCK, etc.)
   accessMode: number; // O_RDONLY/O_WRONLY/O_RDWR (immutable after open)
   refcount: number;
+  oPath?: boolean;   // opened O_PATH: location-only, read/write/etc. give EBADF
 }
 
 interface DirOFD {
@@ -158,6 +164,42 @@ export class InMemoryVFS implements VFS {
   // errno for the most recent failed resolve() (ENOENT/ENOTDIR/EACCES/ELOOP/ENAMETOOLONG).
   // callers that get a null inode use resolveErrno() to return the correct negative errno.
   private lastResolveErrno = ENOENT;
+  // locked-memory accounting (kb) reported via /proc/self/status VmLck. updated by the syscall
+  // handler on mmap(MAP_LOCKED)/mlock/munlock/munmap of locked regions.
+  vmLckKb = 0;
+  // lazy /proc/self/maps: the syscall handler registers a renderer that walks its live vma set
+  // only when the file is actually read, so mapping-heavy workloads don't pay per-mmap rendering.
+  procMapsGen: (() => string) | null = null;
+
+  // mount table backing /proc/mounts, /proc/self/mounts and /proc/self/mountinfo.
+  // the emulator has a single flat in-memory tree, so a mount is a namespace record
+  // rather than a real filesystem graft: it makes the mount point observable to code
+  // that parses those files (ltp verifies its scratch mount actually appeared).
+  private mountTable: Array<{ source: string; target: string; fstype: string }> = [
+    { source: 'tmpfs', target: '/', fstype: 'tmpfs' },
+    { source: 'proc', target: '/proc', fstype: 'proc' },
+  ];
+
+  addMount(source: string, target: string, fstype: string): void {
+    this.mountTable = this.mountTable.filter((m) => m.target !== target);
+    this.mountTable.push({ source: source || fstype, target, fstype });
+  }
+
+  removeMount(target: string): boolean {
+    const before = this.mountTable.length;
+    this.mountTable = this.mountTable.filter((m) => m.target !== target || m.target === '/' || m.target === '/proc');
+    return this.mountTable.length < before;
+  }
+
+  private renderMounts(): string {
+    return this.mountTable.map((m) => `${m.source} ${m.target} ${m.fstype} rw,relatime 0 0`).join('\n') + '\n';
+  }
+
+  private renderMountinfo(): string {
+    // mount_id parent_id major:minor root mount_point options - fs_type source super_options
+    return this.mountTable.map((m, i) =>
+      `${36 + i} 35 0:${30 + i} / ${m.target} rw,relatime - ${m.fstype} ${m.source} rw`).join('\n') + '\n';
+  }
   private nextIno = 1;      // inode counter
   private cwd = '/';
   private cwdInode: DirInode;
@@ -237,6 +279,7 @@ export class InMemoryVFS implements VFS {
     this.addCharDev('/dev/zero', 2, 0o666);
     this.addCharDev('/dev/tty', 3, 0o666);
     this.addCharDev('/dev/urandom', 4, 0o444);
+    this.addBlockDev('/dev/ltp-scratch', 0x0700, 0o660);
 
     this.addSymlinkNode('/proc/self/exe', '/bin/busybox');
 
@@ -249,11 +292,20 @@ export class InMemoryVFS implements VFS {
     this.addFileContent('/proc/sys/kernel/pid_max', '32768\n');
     this.addFileContent('/proc/sys/fs/pipe-user-pages-soft', '16384\n');
     this.addFileContent('/proc/sys/fs/pipe-max-size', '1048576\n');
-    this.addFileContent('/proc/self/status',
+    this.addFileContent('/proc/self/status', '');
+    this.setDynamicFile('/proc/self/status', () => new TextEncoder().encode(
       'Name:\tjitter\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\n' +
       'TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n' +
-      'FDSize:\t64\nGroups:\t0\nVmPeak:\t    65536 kB\nVmSize:\t    65536 kB\nVmRSS:\t    32768 kB\nThreads:\t1\n');
-    this.addFileContent('/proc/mounts', 'tmpfs / tmpfs rw,relatime 0 0\nproc /proc proc rw,relatime 0 0\n');
+      'FDSize:\t64\nGroups:\t0\nVmPeak:\t    65536 kB\nVmSize:\t    65536 kB\nVmRSS:\t    32768 kB\n' +
+      `VmLck:\t${String(this.vmLckKb).padStart(8)} kB\nThreads:\t1\n`));
+    this.addFileContent('/proc/self/maps', '');
+    this.setDynamicFile('/proc/self/maps', () => new TextEncoder().encode(this.procMapsGen ? this.procMapsGen() : ''));
+    this.addFileContent('/proc/mounts', '');
+    this.setDynamicFile('/proc/mounts', () => new TextEncoder().encode(this.renderMounts()));
+    this.addFileContent('/proc/self/mounts', '');
+    this.setDynamicFile('/proc/self/mounts', () => new TextEncoder().encode(this.renderMounts()));
+    this.addFileContent('/proc/self/mountinfo', '');
+    this.setDynamicFile('/proc/self/mountinfo', () => new TextEncoder().encode(this.renderMountinfo()));
     this.addFileContent('/proc/filesystems', 'nodev\ttmpfs\n');
   }
 
@@ -322,6 +374,19 @@ export class InMemoryVFS implements VFS {
     this.setFileData(path, new TextEncoder().encode(content), 0o644);
   }
 
+  private setDynamicFile(path: string, gen: () => Uint8Array): void {
+    const parts = path.split('/').filter(p => p.length > 0);
+    const name = parts.pop()!;
+    let dir = this.root;
+    for (const part of parts) {
+      const child = dir.children.get(part);
+      if (!child || child.type !== 'dir') return;
+      dir = child;
+    }
+    const inode = dir.children.get(name);
+    if (inode && inode.type === 'file') inode.dynamic = gen;
+  }
+
   // public: inject a file (creating parent directories) with raw bytes. used to seed
   // the rootfs with binaries like /lib/ld-linux-aarch64.so.1 and /lib/libc.so.6.
   writeFileBytes(path: string, data: Uint8Array, mode = 0o755): void {
@@ -361,6 +426,21 @@ export class InMemoryVFS implements VFS {
       dir = child;
     }
     dir.children.set(name, this.makeCharDev(devno, mode));
+  }
+
+  // a scratch block device (stat reports S_IFBLK) so ltp's `.needs_device` tests can
+  // acquire it via LTP_DEV. it is never read/written: those tests mount it as tmpfs.
+  private addBlockDev(path: string, devno: number, mode: number): void {
+    const parts = path.split('/').filter(p => p.length > 0);
+    const name = parts.pop()!;
+    let dir = this.root;
+    for (const part of parts) {
+      const child = dir.children.get(part);
+      if (!child || child.type !== 'dir') return;
+      dir = child;
+    }
+    const t = this.now();
+    dir.children.set(name, { type: 'chardev', ino: this.nextIno++, mode: S_IFBLK | (mode & 0o7777), nlink: 1, uid: 0, gid: 0, atime: t, mtime: t, ctime: t, devno });
   }
 
   private addSymlinkNode(path: string, target: string): void {
@@ -422,7 +502,12 @@ export class InMemoryVFS implements VFS {
   }
 
   // the errno (negative) for the most recent failed resolve().
-  private resolveErrno(): number { return -this.lastResolveErrno; }
+  resolveErrno(): number { return -this.lastResolveErrno; }
+
+  // public: does a path resolve to an existing inode? used to validate a mount point.
+  exists(path: string): boolean {
+    return this.resolve(path) !== null;
+  }
 
   // execute (search) permission on a directory: needed to traverse into/through it. root can
   // always search. non-root needs the x bit for owner/group/other as applicable.
@@ -454,13 +539,19 @@ export class InMemoryVFS implements VFS {
   // write (modify) permission on a directory: needed to create, remove, or rename entries in
   // it. root bypasses; others need the +w bit for owner/group/other as applicable (effective).
   private canWrite(dir: InodeBase): boolean {
+    return this.canAccess(dir, 2);
+  }
+
+  // DAC check: does the effective uid/gid have all of `need` (4=read|2=write|1=exec) on the inode?
+  // root (euid 0) bypasses. mirrors the kernel's owner/group/other mode-bit selection.
+  private canAccess(inode: InodeBase, need: number): boolean {
     const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
     if (c.euid === 0) return true;
     let perms: number;
-    if (dir.uid === c.euid) perms = (dir.mode >> 6) & 7;
-    else if (dir.gid === c.egid) perms = (dir.mode >> 3) & 7;
-    else perms = dir.mode & 7;
-    return (perms & 2) !== 0;
+    if (inode.uid === c.euid) perms = (inode.mode >> 6) & 7;
+    else if (inode.gid === c.egid) perms = (inode.mode >> 3) & 7;
+    else perms = inode.mode & 7;
+    return (perms & need) === need;
   }
 
   private resolveFromParts(parts: string[], followFinal: boolean, depth: number): Inode | null {
@@ -512,9 +603,13 @@ export class InMemoryVFS implements VFS {
       const child = dir.children.get(part);
       if (!child) { this.lastResolveErrno = ENOENT; return null; }
       if (child.type === 'symlink') {
+        // a relative symlink target resolves against the directory holding the link (parts[0..idx-1]);
+        // only an absolute target resolves from root. omitting that prefix made relative "../x"
+        // self-loops resolve against cwd and disappear into ENOENT instead of looping to ELOOP.
         const target = child.target;
+        const base = target.startsWith('/') ? '' : '/' + parts.slice(0, idx).join('/');
         const remaining = parts.slice(idx + 1).join('/');
-        const newPath = remaining ? target + '/' + remaining + '/' + name : target + '/' + name;
+        const newPath = [base, target, remaining, name].filter(s => s.length > 0).join('/').replace(/\/+/g, '/');
         return this.resolveParent(newPath, depth + 1);
       }
       if (child.type !== 'dir') { this.lastResolveErrno = ENOTDIR; return null; }
@@ -545,11 +640,16 @@ export class InMemoryVFS implements VFS {
 
     const followSymlinks = !(flags & O_NOFOLLOW);
     let inode = this.resolve(path, followSymlinks);
+    let created = false;
 
-    // O_NOFOLLOW: if final component is symlink, return ELOOP
-    if ((flags & O_NOFOLLOW) && !inode) {
-      const raw = this.resolve(path, false);
-      if (raw && raw.type === 'symlink') return -ELOOP;
+    // O_NOFOLLOW: if the final component is itself a symlink, fail ELOOP (unless O_CREAT would make
+    // it, or O_PATH is set which we don't model). resolve(path,false) returns the symlink inode.
+    if ((flags & O_NOFOLLOW) && !(flags & O_CREAT)) {
+      if (inode && inode.type === 'symlink') return -ELOOP;
+      if (!inode) {
+        const raw = this.resolve(path, false);
+        if (raw && raw.type === 'symlink') return -ELOOP;
+      }
     }
 
     // O_CREAT | O_EXCL: fail if exists
@@ -568,9 +668,27 @@ export class InMemoryVFS implements VFS {
       dir.children.set(name, newFile);
       dir.mtime = dir.ctime = this.now();
       inode = newFile;
+      created = true;
     }
 
     if (!inode) return this.resolveErrno();
+
+    // enforce the target's DAC permissions against the requested access mode. skipped for a file we
+    // just created (the creator is granted access), for directories (handled via search/EISDIR), and
+    // for O_PATH (which opens the location only and needs no read/write permission on the file).
+    if (!created && inode.type !== 'dir' && !(flags & O_PATH)) {
+      const acc = flags & O_ACCMODE;
+      let need = 0;
+      if (acc === O_RDONLY || acc === O_RDWR) need |= 4;
+      if (acc === O_WRONLY || acc === O_RDWR) need |= 2;
+      if (need && !this.canAccess(inode, need)) return -EACCES;
+
+      // O_NOATIME is only honored for the file's owner (or root); others get EPERM.
+      if (flags & 0o1000000) {
+        const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+        if (c.euid !== 0 && inode.uid !== c.euid) return -EPERM;
+      }
+    }
 
     // O_DIRECTORY: must be a directory
     if ((flags & O_DIRECTORY) && inode.type !== 'dir') return -ENOTDIR;
@@ -594,15 +712,21 @@ export class InMemoryVFS implements VFS {
     }
 
     // Named pipe (fifo). we model it as a seekless endpoint: open succeeds (the test opens
-    // O_RDWR, which does not block), stat reports S_IFIFO, and lseek returns ESPIPE.
+    // O_RDWR, which does not block), stat reports S_IFIFO, and lseek returns ESPIPE. a write-only
+    // non-blocking open with no reader present faults ENXIO, matching the kernel.
     if (inode.type === 'fifo') {
+      const acc = flags & O_ACCMODE;
+      if (acc === O_WRONLY && (flags & O_NONBLOCK) && (inode.readers ?? 0) === 0) return -ENXIO;
       const fd = this.takeFd();
-      this.openFds.set(fd, { type: 'fifo', inode, accessMode: flags & O_ACCMODE, refcount: 1 });
+      if (acc === O_RDONLY || acc === O_RDWR) inode.readers = (inode.readers ?? 0) + 1;
+      this.openFds.set(fd, { type: 'fifo', inode, accessMode: acc, refcount: 1 });
       return fd;
     }
 
     // Symlink (only reached if O_NOFOLLOW and it's a symlink — already handled above)
     if (inode.type !== 'file') return -ENOENT;
+
+    if (inode.dynamic) inode.data = inode.dynamic();
 
     // O_TRUNC: truncate to 0 (requires write access)
     if ((flags & O_TRUNC) && ((flags & O_ACCMODE) !== O_RDONLY)) {
@@ -613,8 +737,14 @@ export class InMemoryVFS implements VFS {
     const fd = this.takeFd();
     const accessMode = flags & O_ACCMODE;
     const pos = (flags & O_APPEND) ? inode.data.length : 0;
-    this.openFds.set(fd, { type: 'file', inode, pos, flags, accessMode, refcount: 1 });
+    this.openFds.set(fd, { type: 'file', inode, pos, flags, accessMode, refcount: 1, oPath: (flags & O_PATH) !== 0 });
     return fd;
+  }
+
+  /** true if the fd was opened O_PATH: it references a location only, so read/write/fchmod/fchown/
+   *  ioctl/mmap on it must fail EBADF. */
+  isOPath(fd: number): boolean {
+    return (this.openFds.get(fd) as { oPath?: boolean } | undefined)?.oPath === true;
   }
 
   close(fd: number): number {
@@ -622,11 +752,23 @@ export class InMemoryVFS implements VFS {
     if (!ofd) return -EBADF;
     this.openFds.delete(fd);
     ofd.refcount--;
+    // last reference to a fifo read-end: drop the reader count so a later O_WRONLY|O_NONBLOCK
+    // open sees no reader and faults ENXIO.
+    if (ofd.refcount <= 0 && ofd.type === 'fifo' && (ofd.accessMode === O_RDONLY || ofd.accessMode === O_RDWR)) {
+      ofd.inode.readers = Math.max(0, (ofd.inode.readers ?? 0) - 1);
+    }
     return 0;
   }
 
   hasFd(fd: number): boolean {
     return this.openFds.has(fd);
+  }
+
+  // stable inode number backing a descriptor, or null if unknown. used as the
+  // system-wide identity for advisory record locks (fcntl F_SETLK/F_GETLK).
+  inoOfFd(fd: number): number | null {
+    const ofd = this.openFds.get(fd) as { inode?: { ino: number } } | undefined;
+    return ofd?.inode ? ofd.inode.ino : null;
   }
 
   // the O_RDONLY/O_WRONLY/O_RDWR access mode a file descriptor was opened with, or -1 if
@@ -660,6 +802,7 @@ export class InMemoryVFS implements VFS {
   read(fd: number, buf: number, count: number, memory: DataView): number {
     const ofd = this.openFds.get(fd);
     if (!ofd) return -EBADF;
+    if (ofd.type === 'file' && ofd.oPath) return -EBADF; // O_PATH fd: not readable
 
     if (ofd.type === 'chardev') {
       const bytes = new Uint8Array(memory.buffer);
@@ -678,6 +821,9 @@ export class InMemoryVFS implements VFS {
     }
 
     if (ofd.type === 'dir') return -EISDIR;
+    // fifos carry no buffered data in our model, so a read never has bytes ready: it would block,
+    // which a non-blocking reader observes as EAGAIN (LTP read03 reads an empty O_NONBLOCK fifo).
+    if (ofd.type === 'fifo') return -EAGAIN;
     if (ofd.type !== 'file') return -EBADF;
 
     // Check read permission
@@ -697,6 +843,7 @@ export class InMemoryVFS implements VFS {
   write(fd: number, buf: number, count: number, memory: DataView): number {
     const ofd = this.openFds.get(fd);
     if (!ofd) return -EBADF;
+    if (ofd.type === 'file' && ofd.oPath) return -EBADF; // O_PATH fd: not writable
 
     if (ofd.type === 'chardev') return count; // /dev/null etc: discard
     if (ofd.type === 'dir') return -EBADF;
@@ -943,7 +1090,8 @@ export class InMemoryVFS implements VFS {
 
   readlinkat(path: string): string | null {
     const inode = this.resolve(path, false); // don't follow final symlink
-    if (!inode || inode.type !== 'symlink') return null;
+    if (!inode) return null; // lastResolveErrno holds ENOENT/ENOTDIR/ENAMETOOLONG/ELOOP/EACCES
+    if (inode.type !== 'symlink') { this.lastResolveErrno = EINVAL; return null; } // exists, not a link
     return inode.target;
   }
 

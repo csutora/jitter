@@ -3,6 +3,10 @@
 // rounding, simd vector ops over linear memory, 128-bit multiply highs.
 
 import { V_OFFSET, GUEST_MEM_BASE } from './types.js';
+import { aese, aesd, aesmc, aesimc, pmull,
+         sha1_3reg, sha1h, sha1su0, sha1su1,
+         sha256h, sha256su0, sha256su1,
+         sha512h, sha512h2, sha512su0, sha512su1 } from './crypto-ext.js';
 
 const _fpBuf = new ArrayBuffer(8);
 const _f64View = new Float64Array(_fpBuf);
@@ -102,6 +106,16 @@ export const SIMD_SHRN = 72;
 export const SIMD_ADDHN = 73;
 export const SIMD_UMINP = 22;
 export const SIMD_EXT = 74;
+export const SIMD_REV = 76; // REV16/REV32/REV64: reverse `size`-byte elements within `extra`-byte containers
+export const SIMD_RBIT = 77; // RBIT (vector): reverse the bits within each byte
+export const SIMD_IDX_MUL = 78; // MUL/MLA/MLS + widening S/UMULL,S/UMLAL,S/UMLSL by indexed element
+export const SIMD_XTN = 79; // XTN/XTN2: narrow each element to its low half (size = dest element log2)
+export const SIMD_AESE = 80, SIMD_AESD = 81, SIMD_AESMC = 82, SIMD_AESIMC = 83, SIMD_PMULL = 84; // crypto ext
+// SHA crypto ext: SHA1 (85-90), SHA256 (91-94), SHA512 (95-98). sha1c/p/m share sha1_3reg via `size`.
+export const SIMD_SHA1C = 85, SIMD_SHA1P = 86, SIMD_SHA1M = 87, SIMD_SHA1H = 88, SIMD_SHA1SU0 = 89, SIMD_SHA1SU1 = 90;
+export const SIMD_SHA256H = 91, SIMD_SHA256H2 = 92, SIMD_SHA256SU0 = 93, SIMD_SHA256SU1 = 94;
+export const SIMD_SHA512H = 95, SIMD_SHA512H2 = 96, SIMD_SHA512SU0 = 97, SIMD_SHA512SU1 = 98;
+export const SIMD_LDST1_SINGLE = 99; // LD1/ST1 single-lane: extra = index | load<<4 | post<<5, rn=base gpr, rm=post gpr
 
 export function createSimdOp(memory: WebAssembly.Memory) {
   return function simd_op(packed: bigint, _extra: bigint): bigint {
@@ -216,6 +230,128 @@ export function createSimdOp(memory: WebAssembly.Memory) {
       const out = new Uint8Array(16);
       for (let i = 0; i < w; i++) out[i] = concat[index + i];
       for (let k = 0; k < 16; k++) buf[vdA + k] = out[k];
+      return 0n;
+    }
+
+    if (op === SIMD_REV) {
+      // reverse the order of `es`-byte elements within each `container`-byte group (REV16/32/64).
+      const w = Q ? 16 : 8;
+      const container = extra; // 2, 4, or 8 bytes
+      const es = 1 << size;    // element (sub-unit) byte width being reversed
+      const nElems = container / es;
+      const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+      const src = new Uint8Array(16); src.set(buf.subarray(vnA, vnA + 16));
+      for (let i = 0; i < 16; i++) {
+        if (i >= w) { buf[vdA + i] = 0; continue; }
+        const base = Math.floor(i / container) * container;
+        const pos = i % container;
+        const srcPos = base + (nElems - 1 - Math.floor(pos / es)) * es + (pos % es);
+        buf[vdA + i] = src[srcPos];
+      }
+      return 0n;
+    }
+
+    if (op === SIMD_RBIT) {
+      // reverse the bit order within each byte (operates on .8b / .16b).
+      const w = Q ? 16 : 8;
+      const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+      const src = new Uint8Array(16); src.set(buf.subarray(vnA, vnA + 16));
+      for (let i = 0; i < 16; i++) {
+        if (i >= w) { buf[vdA + i] = 0; continue; }
+        let b = src[i], r = 0;
+        for (let k = 0; k < 8; k++) { r = (r << 1) | (b & 1); b >>= 1; }
+        buf[vdA + i] = r;
+      }
+      return 0n;
+    }
+
+    if (op === SIMD_XTN) {
+      // narrow each source element to its low `destEs` bytes. XTN (Q=0) writes the low 64 bits of Vd
+      // and zeroes the high half; XTN2 (Q=1) writes the high 64 bits and preserves the low half.
+      const destEs = 1 << size;            // 1, 2, or 4 bytes
+      const srcEs = destEs * 2;
+      const n = 8 / destEs;                // number of narrowed elements (fills 64 bits)
+      const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+      const src = new Uint8Array(16); src.set(buf.subarray(vnA, vnA + 16));
+      const half = new Uint8Array(8);
+      for (let j = 0; j < n; j++) {
+        for (let k = 0; k < destEs; k++) half[j * destEs + k] = src[j * srcEs + k];
+      }
+      if (Q) { for (let k = 0; k < 8; k++) buf[vdA + 8 + k] = half[k]; }
+      else { for (let k = 0; k < 8; k++) buf[vdA + k] = half[k]; for (let k = 8; k < 16; k++) buf[vdA + k] = 0; }
+      return 0n;
+    }
+
+    if (op === SIMD_AESE) { aese(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16); return 0n; }
+    if (op === SIMD_AESD) { aesd(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16); return 0n; }
+    if (op === SIMD_AESMC) { aesmc(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16); return 0n; }
+    if (op === SIMD_AESIMC) { aesimc(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16); return 0n; }
+    if (op === SIMD_PMULL) { pmull(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16, V_OFFSET + rm * 16, Q === 1); return 0n; }
+    const D = V_OFFSET + rd * 16, N = V_OFFSET + rn * 16, Mv = V_OFFSET + rm * 16;
+    if (op === SIMD_SHA1C) { sha1_3reg(buf, D, N, Mv, 0); return 0n; }
+    if (op === SIMD_SHA1P) { sha1_3reg(buf, D, N, Mv, 1); return 0n; }
+    if (op === SIMD_SHA1M) { sha1_3reg(buf, D, N, Mv, 2); return 0n; }
+    if (op === SIMD_SHA1H) { sha1h(buf, D, N); return 0n; }
+    if (op === SIMD_SHA1SU0) { sha1su0(buf, D, N, Mv); return 0n; }
+    if (op === SIMD_SHA1SU1) { sha1su1(buf, D, N); return 0n; }
+    if (op === SIMD_SHA256H) { sha256h(buf, D, N, Mv, false); return 0n; }
+    if (op === SIMD_SHA256H2) { sha256h(buf, D, N, Mv, true); return 0n; }
+    if (op === SIMD_SHA256SU0) { sha256su0(buf, D, N); return 0n; }
+    if (op === SIMD_SHA256SU1) { sha256su1(buf, D, N, Mv); return 0n; }
+    if (op === SIMD_SHA512H) { sha512h(buf, D, N, Mv); return 0n; }
+    if (op === SIMD_SHA512H2) { sha512h2(buf, D, N, Mv); return 0n; }
+    if (op === SIMD_SHA512SU0) { sha512su0(buf, D, N); return 0n; }
+    if (op === SIMD_SHA512SU1) { sha512su1(buf, D, N, Mv); return 0n; }
+    if (op === SIMD_LDST1_SINGLE) {
+      const esize = 1 << size;
+      const index = extra & 0xf;
+      const isLoad = (extra >> 4) & 1;
+      const isPost = (extra >> 5) & 1;
+      const gv = new DataView(memory.buffer);
+      const addr = Number(gv.getBigUint64(rn * 8, true)) + GUEST_MEM_BASE;
+      const laneAddr = V_OFFSET + rd * 16 + index * esize;
+      if (isLoad) for (let k = 0; k < esize; k++) buf[laneAddr + k] = buf[addr + k];
+      else for (let k = 0; k < esize; k++) buf[addr + k] = buf[laneAddr + k];
+      if (isPost) {
+        const inc = rm === 31 ? esize : Number(gv.getBigUint64(rm * 8, true));
+        gv.setBigUint64(rn * 8, gv.getBigUint64(rn * 8, true) + BigInt(inc), true);
+      }
+      return 0n;
+    }
+
+    if (op === SIMD_IDX_MUL) {
+      // multiply (mul/mla/mls, same-width) or widening multiply (s/umull, s/umlal, s/umlsl) by a
+      // single indexed element of vm. `size` is log2 of the source element bytes (1=16b, 2=32b).
+      const srcEs = 1 << size;                    // 2 or 4 bytes
+      const uns = ((extra >> 6) & 1) === 1;
+      const variant = (extra >> 3) & 7;           // 0mul 1mla 2mls 3mull 4mlal 5mlsl
+      const idx = extra & 7;
+      const widening = variant >= 3;
+      const isSub = variant === 2 || variant === 5;
+      const isAcc = variant !== 0 && variant !== 3;
+      const destEs = widening ? srcEs * 2 : srcEs;
+      const vnA = V_OFFSET + rn * 16, vmA = V_OFFSET + rm * 16, vdA = V_OFFSET + rd * 16;
+      const oldVd = new Uint8Array(16); oldVd.set(buf.subarray(vdA, vdA + 16));
+      const readEl = (b: Uint8Array, base: number, es: number, i: number, signed: boolean): bigint => {
+        let v = 0n;
+        for (let k = 0; k < es; k++) v |= BigInt(b[base + i * es + k]) << BigInt(k * 8);
+        if (signed) { const bits = BigInt(es * 8); if (v >= (1n << (bits - 1n))) v -= (1n << bits); }
+        return v;
+      };
+      const elem = readEl(buf, vmA, srcEs, idx, !uns);
+      const nDest = widening ? (16 / destEs) : ((Q ? 16 : 8) / srcEs);
+      const srcBase = widening && Q ? nDest : 0; // umull2/umlal2 use the high half of vn
+      const out = new Uint8Array(16);
+      for (let j = 0; j < nDest; j++) {
+        let prod = BigInt.asUintN(destEs * 8, readEl(buf, vnA, srcEs, srcBase + j, !uns) * elem);
+        if (isAcc) {
+          let acc = 0n;
+          for (let k = 0; k < destEs; k++) acc |= BigInt(oldVd[j * destEs + k]) << BigInt(k * 8);
+          prod = BigInt.asUintN(destEs * 8, isSub ? acc - prod : acc + prod);
+        }
+        for (let k = 0; k < destEs; k++) out[j * destEs + k] = Number((prod >> BigInt(k * 8)) & 0xffn);
+      }
+      buf.set(out, vdA);
       return 0n;
     }
 
@@ -459,10 +595,19 @@ export function createSimdOp(memory: WebAssembly.Memory) {
   };
 }
 
-export function createEnv(memory: WebAssembly.Memory, regBase?: WebAssembly.Global | null): Record<string, unknown> {
+export function createEnv(
+  memory: WebAssembly.Memory,
+  regBase?: WebAssembly.Global | null,
+  protActive?: WebAssembly.Global | null,
+  memFault?: ((addr: number, isWrite: number) => void) | null,
+): Record<string, unknown> {
   const env: Record<string, unknown> = { memory, ...helperFunctions, simd_op: createSimdOp(memory) };
   // threaded modules import `env.reg_base` (the per-thread register-block base). single-threaded
   // modules don't import it, so it's only added when provided.
   if (regBase) env.reg_base = regBase;
+  // page-protection modules import `env.prot_active` (the guard on/off flag) and `env.mem_fault`
+  // (raises SIGSEGV/SIGBUS). only added when protection is enabled.
+  if (protActive) env.prot_active = protActive;
+  if (memFault) env.mem_fault = memFault;
   return env;
 }

@@ -41,6 +41,12 @@ pub const Options = struct {
     /// value-CAS in STXR — correct for sequential execution where no other agent can
     /// modify monitored memory between LDXR and STXR
     shared_monitor: bool = false,
+    /// when true, guest loads/stores emit a software page-protection guard (see emitProtGuard):
+    /// a per-page permission byte at prot_base is checked while the imported prot_active global is
+    /// nonzero, calling the imported mem_fault on a violation.
+    protection: bool = false,
+    /// linear-memory offset of the per-page permission table (1 byte/page, bit0=read bit1=write).
+    prot_base: u32 = 0,
 };
 
 /// imported env helper functions. these are js callbacks that operate on i64
@@ -114,6 +120,16 @@ pub fn translateRegion(arena: std.mem.Allocator, region: *const block.Region, op
     else
         null;
 
+    // page-protection: an imported mutable i32 global the host flips on when a restricted page
+    // exists (fast path skips the guard while it's 0), and a void import raising SIGSEGV/SIGBUS.
+    var prot_active_global: ?u32 = null;
+    var mem_fault_fn: u32 = 0;
+    if (opts.protection) {
+        const prot_fault_type = try module.addType(&.{ .i32, .i32 }, &.{});
+        prot_active_global = try module.addImportGlobal("env", "prot_active", .i32, true);
+        mem_fault_fn = try module.addImportFunc("env", "mem_fault", prot_fault_type);
+    }
+
     const helpers: Helpers = .{
         .f64_add = try module.addImportFunc("env", "f64_add", helper_2_type),
         .f64_sub = try module.addImportFunc("env", "f64_sub", helper_2_type),
@@ -143,6 +159,9 @@ pub fn translateRegion(arena: std.mem.Allocator, region: *const block.Region, op
 
     var body = wasm.Body.init(arena);
     body.reg_base_global = reg_base_global;
+    body.prot_active_global = prot_active_global;
+    body.mem_fault_fn = mem_fault_fn;
+    body.prot_base = opts.prot_base;
 
     const n: u32 = @intCast(region.blocks.len);
     if (n == 0) {
@@ -155,8 +174,13 @@ pub fn translateRegion(arena: std.mem.Allocator, region: *const block.Region, op
         return out.items;
     }
 
-    // locals: 2 × i32 ($cur, $nzcv_tmp) then 4 × i64 ($a, $b, $res, $iter)
-    const locals: []const wasm.Module.Local = &.{
+    // locals: 2 × i32 ($cur, $nzcv_tmp) then 4 × i64 ($a, $b, $res, $iter); protection adds a
+    // trailing i32 ($addr, index 6) that parks the access address for the guard.
+    const locals: []const wasm.Module.Local = if (opts.protection) &.{
+        .{ .count = 2, .ty = .i32 },
+        .{ .count = 4, .ty = .i64 },
+        .{ .count = 1, .ty = .i32 },
+    } else &.{
         .{ .count = 2, .ty = .i32 },
         .{ .count = 4, .ty = .i64 },
     };
@@ -569,6 +593,7 @@ fn translateInsn(
         .strb_reg => |x| try emitStoreReg(ctx, x, 1),
         .strh_reg => |x| try emitStoreReg(ctx, x, 2),
         .ldr_lit => |x| try emitLoadLit(body, x, pc),
+        .ldr_lit_fp => |x| try emitLoadLitFp(body, x, pc),
 
         .mrs => |x| try emitMrs(body, x),
         .msr => |x| try emitMsr(body, x),
@@ -603,6 +628,7 @@ fn translateInsn(
         .fsqrt => |x| try emitFpArith1(ctx, x, .sqrt),
         .fmov_fp => |x| try emitFmovFp(ctx, x),
         .fcvt => |x| try emitFcvt(ctx, x),
+        .fcsel => |x| try emitFcsel(body, x),
         .fmadd => |x| try emitFpArith3(ctx, x, .add, false),
         .fmsub => |x| try emitFpArith3(ctx, x, .sub, false),
         .fnmadd => |x| try emitFpArith3(ctx, x, .add, true),
@@ -656,6 +682,36 @@ fn translateInsn(
         .simd_tbl => |x| try emitSimdTbl(ctx, x),
         .simd_sshll => |x| try emitSimdShiftLong(body, x, true),
         .simd_ushll => |x| try emitSimdShiftLong(body, x, false),
+        .simd_shift_imm => |x| try emitSimdShiftImm(body, x),
+        .simd_rev => |x| try emitSimdOpCall(ctx, .{ .q = x.q, .rd = x.rd, .rn = x.rn, .rm = 0, .size = x.size }, simd_op_rev, x.container),
+        .simd_ins_elem => |x| try emitSimdInsElem(body, x),
+        .simd_dup_scalar => |x| try emitSimdDupScalar(body, x),
+        .simd_rbit => |x| try emitSimdOpCall(ctx, .{ .q = x.q, .rd = x.rd, .rn = x.rn, .rm = 0, .size = 0 }, simd_op_rbit, 0),
+        .simd_idx_mul => |x| try emitSimdIdxMul(ctx, x),
+        .simd_xtn => |x| try emitSimdOpCall(ctx, .{ .q = x.q, .rd = x.rd, .rn = x.rn, .rm = 0, .size = x.size }, simd_op_xtn, 0),
+        .crypto_aes => |x| try emitSimdOpCall(ctx, .{ .q = false, .rd = x.rd, .rn = x.rn, .rm = 0, .size = 0 }, switch (x.op) {
+            .aese => simd_op_aese,
+            .aesd => simd_op_aesd,
+            .aesmc => simd_op_aesmc,
+            .aesimc => simd_op_aesimc,
+        }, 0),
+        .crypto_pmull => |x| try emitSimdOpCall(ctx, .{ .q = x.part, .rd = x.rd, .rn = x.rn, .rm = x.rm, .size = 0 }, simd_op_pmull, 0),
+        .crypto_sha => |x| try emitSimdOpCall(ctx, .{ .q = false, .rd = x.rd, .rn = x.rn, .rm = x.rm, .size = 0 }, switch (x.op) {
+            .sha1c => simd_op_sha1c,
+            .sha1p => simd_op_sha1p,
+            .sha1m => simd_op_sha1m,
+            .sha1h => simd_op_sha1h,
+            .sha1su0 => simd_op_sha1su0,
+            .sha1su1 => simd_op_sha1su1,
+            .sha256h => simd_op_sha256h,
+            .sha256h2 => simd_op_sha256h2,
+            .sha256su0 => simd_op_sha256su0,
+            .sha256su1 => simd_op_sha256su1,
+            .sha512h => simd_op_sha512h,
+            .sha512h2 => simd_op_sha512h2,
+            .sha512su0 => simd_op_sha512su0,
+            .sha512su1 => simd_op_sha512su1,
+        }, 0),
         .simd_shrn => |x| {
             try body.emitConstI64(packSimdArgs(simd_op_shrn, x.q, x.size, x.shift, x.rd, x.rn, 0));
             try body.emitConstI64(0);
@@ -673,6 +729,16 @@ fn translateInsn(
         .vec_across => |x| try emitVecAcross(ctx, x),
         .simd_ldst_multi => |x| try emitSimdLdstMulti(ctx, x),
         .simd_ld1r => |x| try emitSimdLd1r(body, x),
+        .simd_ldst1_single => |x| {
+            const sz: u2 = switch (x.esize) {
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                else => 0,
+            };
+            const extra: u8 = x.index | (@as(u8, if (x.load) 1 else 0) << 4) | (@as(u8, if (x.post) 1 else 0) << 5);
+            try emitSimdOpCall(ctx, .{ .q = false, .rd = x.rt, .rn = x.rn, .rm = x.rm, .size = sz }, simd_op_ldst1_single, extra);
+        },
 
         .unknown => {
             try emitExit(body, pc, exit_unknown_insn);
@@ -1019,6 +1085,30 @@ fn emitFcvt(ctx: *Ctx, x: decode.Fcvt) !void {
     }
     // storeFp will narrow to f32 if dest_ftype == 0, so we leave the f64 bits on the stack
     try storeFp(ctx, x.rd, x.dest_ftype);
+}
+
+// FCSEL: copy the selected scalar source register (bit-for-bit) to the dest. it is a pure data
+// move, so we select the low 64 bits then mask to the operand width and zero the upper lane.
+fn emitFcsel(body: *wasm.Body, x: decode.Fcsel) !void {
+    const width: u8 = switch (x.ftype) { 0 => 4, 1 => 8, else => 2 }; // s / d / h
+    try body.emitRegAddr(vregBaseAddr(x.rd));
+    try body.emitRegAddr(vregBaseAddr(x.rn));
+    try body.loadI64(0);
+    try body.emitRegAddr(vregBaseAddr(x.rm));
+    try body.loadI64(0);
+    try body.emitRegAddr(@bitCast(cpu.nzcv_offset));
+    try body.emit(.i32_load);
+    try body.emitMemArg(2, 0);
+    try emitConditionEval(body, x.cond);
+    try body.emit(.select);
+    if (width < 8) {
+        try body.emitConstI64(@bitCast((@as(u64, 1) << @intCast(width * 8)) - 1));
+        try body.emit(.i64_and);
+    }
+    try body.storeI64(0);
+    try body.emitRegAddr(vregBaseAddr(x.rd) + 8);
+    try body.emitConstI64(0);
+    try body.storeI64(0);
 }
 
 fn emitFpArith3(ctx: *Ctx, x: decode.FpArith3, op: FpOp2, negate: bool) !void {
@@ -1880,6 +1970,7 @@ fn emitSimdLdstMulti(ctx: *Ctx, x: decode.SimdLdstMulti) !void {
         while (i < x.reg_count) : (i += 1) {
             const vreg: u5 = @truncate((@as(u32, x.rt) + i) & 31);
             const off: u32 = @as(u32, i) * lane_bytes;
+            try emitProtGuardLocalOff(body, local_nzcv_tmp, off, !x.is_load);
             if (x.is_load) {
                 try body.emitRegAddr(vregBaseAddr(vreg));
                 try body.emit(.local_get);
@@ -2045,6 +2136,42 @@ const simd_op_shrn: u8 = 72;
 const simd_op_addhn: u8 = 73;
 const simd_op_uminp: u8 = 22;
 const simd_op_ext: u8 = 74;
+const simd_op_rev: u8 = 76;
+const simd_op_rbit: u8 = 77;
+const simd_op_idx_mul: u8 = 78;
+const simd_op_xtn: u8 = 79;
+const simd_op_aese: u8 = 80;
+const simd_op_aesd: u8 = 81;
+const simd_op_aesmc: u8 = 82;
+const simd_op_aesimc: u8 = 83;
+const simd_op_pmull: u8 = 84;
+const simd_op_sha1c: u8 = 85;
+const simd_op_sha1p: u8 = 86;
+const simd_op_sha1m: u8 = 87;
+const simd_op_sha1h: u8 = 88;
+const simd_op_sha1su0: u8 = 89;
+const simd_op_sha1su1: u8 = 90;
+const simd_op_sha256h: u8 = 91;
+const simd_op_sha256h2: u8 = 92;
+const simd_op_sha256su0: u8 = 93;
+const simd_op_sha256su1: u8 = 94;
+const simd_op_sha512h: u8 = 95;
+const simd_op_sha512h2: u8 = 96;
+const simd_op_sha512su0: u8 = 97;
+const simd_op_sha512su1: u8 = 98;
+const simd_op_ldst1_single: u8 = 99;
+
+// NEON multiply (mul/mla/mls) and widening multiply (s/umull, s/umlal, s/umlsl) by indexed element,
+// via the js helper. extra packs: bit6=unsigned, bits5:3=op variant, bits2:0=element index.
+fn emitSimdIdxMul(ctx: *Ctx, x: decode.SimdIdxMul) !void {
+    const variant: u8 = switch (x.op) { .mul => 0, .mla => 1, .mls => 2, .mull => 3, .mlal => 4, .mlsl => 5 };
+    const extra: u8 = (@as(u8, @intFromBool(x.u)) << 6) | (variant << 3) | @as(u8, @truncate(x.index & 0x7));
+    try ctx.body.emitConstI64(packSimdArgs(simd_op_idx_mul, x.q, @as(u8, x.size), extra, x.rd, x.rn, x.rm));
+    try ctx.body.emitConstI64(0);
+    try ctx.body.emit(.call);
+    try ctx.body.emitU32(ctx.helpers.simd_op);
+    try ctx.body.emit(.drop);
+}
 
 fn sizeToLog2(size: u2) u8 {
     return size;
@@ -2077,6 +2204,93 @@ fn emitSimdTbl(ctx: *Ctx, x: decode.SimdTbl) !void {
 }
 
 // ── SIMD shift long (SSHLL/USHLL): widen each element of Vn by 2x, shift left ──
+
+// copy esize bytes from a source register offset to a dest register offset (a single lane move).
+fn emitLaneCopy(body: *wasm.Body, dst: i32, src: i32, esize: u8) !void {
+    try body.emitRegAddr(dst);
+    try body.emitRegAddr(src);
+    switch (esize) {
+        1 => { try body.emit(.i32_load8_u); try body.emitMemArg(0, 0); try body.emit(.i32_store8); try body.emitMemArg(0, 0); },
+        2 => { try body.emit(.i32_load16_u); try body.emitMemArg(1, 0); try body.emit(.i32_store16); try body.emitMemArg(1, 0); },
+        4 => { try body.emit(.i32_load); try body.emitMemArg(2, 0); try body.emit(.i32_store); try body.emitMemArg(2, 0); },
+        8 => { try body.loadI64(0); try body.storeI64(0); },
+        else => {},
+    }
+}
+
+// INS (element): Vd.T[dst] = Vn.T[src] — copy one lane, leave the rest of Vd intact.
+fn emitSimdInsElem(body: *wasm.Body, x: decode.SimdInsElem) !void {
+    try emitLaneCopy(body, vregBaseAddr(x.rd) + @as(i32, x.dst_index) * @as(i32, x.esize), vregBaseAddr(x.rn) + @as(i32, x.src_index) * @as(i32, x.esize), x.esize);
+}
+
+// DUP (element -> scalar): Dd = Vn.T[index]. write the element (zero-extended) to lane 0, zero the rest.
+fn emitSimdDupScalar(body: *wasm.Body, x: decode.SimdDupScalar) !void {
+    const src = vregBaseAddr(x.rn) + @as(i32, x.index) * @as(i32, x.esize);
+    try body.emitRegAddr(vregBaseAddr(x.rd));
+    try body.emitRegAddr(src);
+    switch (x.esize) {
+        1 => { try body.emit(.i64_load8_u); try body.emitMemArg(0, 0); },
+        2 => { try body.emit(.i64_load16_u); try body.emitMemArg(1, 0); },
+        4 => { try body.emit(.i64_load32_u); try body.emitMemArg(2, 0); },
+        8 => { try body.loadI64(0); },
+        else => return,
+    }
+    try body.storeI64(0);
+    try body.emitRegAddr(vregBaseAddr(x.rd) + 8);
+    try body.emitConstI64(0);
+    try body.storeI64(0);
+}
+
+// same-width vector shift by immediate (USHR/SSHR/SHL/SLI/SRI) via native v128 lane shifts. the shift
+// count is a runtime i32 operand. SLI/SRI merge the shifted Vn with the preserved bits of Vd via a mask.
+// (edge: a shift == element width is masked to 0 by wasm — rare; not hit by the crypto paths using this.)
+fn emitSimdShiftImm(body: *wasm.Body, x: decode.SimdShiftImm) !void {
+    const is_insert = x.op == .sli or x.op == .sri;
+    const left = x.op == .shl or x.op == .sli;
+    const shl_sub: u32 = switch (x.esize) { 1 => simd.i8x16_shl, 2 => simd.i16x8_shl, 4 => simd.i32x4_shl, 8 => simd.i64x2_shl, else => return };
+    const shr_sub: u32 = switch (x.esize) {
+        1 => if (x.op == .sshr) simd.i8x16_shr_s else simd.i8x16_shr_u,
+        2 => if (x.op == .sshr) simd.i16x8_shr_s else simd.i16x8_shr_u,
+        4 => if (x.op == .sshr) simd.i32x4_shr_s else simd.i32x4_shr_u,
+        8 => if (x.op == .sshr) simd.i64x2_shr_s else simd.i64x2_shr_u,
+        else => return,
+    };
+    try body.emitRegAddr(vregBaseAddr(x.rd));
+    if (!is_insert) {
+        // plain shift: op(Vn, shift)
+        try loadVreg(body, x.rn);
+        try body.emitConstI32(@intCast(x.shift));
+        try body.emitSimd(if (left) shl_sub else shr_sub);
+    } else {
+        // insert: (Vn shifted) OR (Vd AND keep-mask). keep-mask preserves the bits the shift vacates.
+        const ebits: u6 = @intCast(x.esize * 8);
+        const keep: u64 = if (left) ((@as(u64, 1) << @intCast(x.shift)) - 1) else (~((@as(u64, 1) << @intCast(ebits - x.shift)) - 1));
+        try loadVreg(body, x.rn);
+        try body.emitConstI32(@intCast(x.shift));
+        try body.emitSimd(if (left) shl_sub else shr_sub);
+        try loadVreg(body, x.rd);
+        // splat the keep-mask across lanes (each esize-wide element gets `keep` in its low `ebits`)
+        try emitMaskSplat(body, x.esize, keep);
+        try body.emitSimd(simd.v128_and);
+        try body.emitSimd(simd.v128_or);
+    }
+    try body.storeV128(0);
+    if (!x.q) {
+        try body.emitRegAddr(vregBaseAddr(x.rd) + 8);
+        try body.emitConstI64(0);
+        try body.storeI64(0);
+    }
+}
+
+// push a v128 constant with `mask` replicated into every esize-wide lane (used for SLI/SRI keep-masks).
+fn emitMaskSplat(body: *wasm.Body, esize: u8, mask: u64) !void {
+    var m: u128 = 0;
+    var i: usize = 0;
+    const lane_mask: u128 = (@as(u128, 1) << @intCast(esize * 8)) - 1;
+    const lm: u128 = @as(u128, mask) & lane_mask;
+    while (i < @as(usize, 16) / esize) : (i += 1) m |= lm << @intCast(i * esize * 8);
+    try body.emitV128Const(m);
+}
 
 fn emitSimdShiftLong(body: *wasm.Body, x: decode.SimdShiftLong, signed: bool) !void {
     // sshll/ushll widen each element of the source's low (or high, for the "2"
@@ -3076,7 +3290,7 @@ fn writebackRn(body: *wasm.Body, rn: u5, mode: decode.AddrMode) !void {
     try body.storeI64(0);
 }
 
-fn pushAccessAddrI32(body: *wasm.Body, mode: decode.AddrMode) !void {
+fn pushAccessAddrI32(body: *wasm.Body, mode: decode.AddrMode, is_write: bool) !void {
     // address used for the memory access: $b for pre/offset, $a for post
     const which: u32 = if (mode == .post_index) local_a else local_b;
     try body.emit(.local_get);
@@ -3084,6 +3298,7 @@ fn pushAccessAddrI32(body: *wasm.Body, mode: decode.AddrMode) !void {
     try body.emit(.i32_wrap_i64);
     try body.emitConstI32(@bitCast(cpu.guest_mem_base));
     try body.emit(.i32_add);
+    try emitProtGuard(body, is_write);
 }
 
 fn emitLoadOp(body: *wasm.Body, size: u8, signed: bool, sf: bool) !void {
@@ -3124,7 +3339,7 @@ fn emitLoadImm(body: *wasm.Body, x: decode.LoadStoreImm, size: u8, signed: bool)
     if (x.rt != 31) {
         try body.emitRegAddr(@bitCast(cpu.gpr_offset(x.rt)));
     }
-    try pushAccessAddrI32(body, x.mode);
+    try pushAccessAddrI32(body, x.mode, false);
     try emitLoadOp(body, size, signed, x.sf);
     if (x.rt == 31) {
         try body.emit(.drop);
@@ -3145,7 +3360,7 @@ fn emitStoreImm(ctx: *Ctx, x: decode.LoadStoreImm, size: u8) !void {
     const access_local: u32 = if (x.mode == .post_index) local_a else local_b;
     if (ctx.shared_monitor) try emitShadowClearSpan(body, ctx.shadow_base, access_local, size);
 
-    try pushAccessAddrI32(body, x.mode);
+    try pushAccessAddrI32(body, x.mode, true);
     try loadGpr(body, x.rt, true);
     switch (size) {
         1 => { try body.emit(.i64_store8); try body.emitMemArg(0, 0); },
@@ -3168,13 +3383,13 @@ fn emitLoadPair(body: *wasm.Body, x: decode.LoadStorePair, signed: bool) !void {
     // documented as unpredictable; common impl loads win)
     if (x.rt != 31) {
         try body.emitRegAddr(@bitCast(cpu.gpr_offset(x.rt)));
-        try pushAccessAddrI32(body, x.mode);
+        try pushAccessAddrI32(body, x.mode, false);
         try emitLoadOp(body, size, signed, x.sf);
         try body.storeI64(0);
     }
     if (x.rt2 != 31) {
         try body.emitRegAddr(@bitCast(cpu.gpr_offset(x.rt2)));
-        try pushAccessAddrI32(body, x.mode);
+        try pushAccessAddrI32(body, x.mode, false);
         try body.emitConstI32(@as(i32, size));
         try body.emit(.i32_add);
         try emitLoadOp(body, size, signed, x.sf);
@@ -3196,14 +3411,14 @@ fn emitStorePair(ctx: *Ctx, x: decode.LoadStorePair) !void {
     if (ctx.shared_monitor) try emitShadowClearSpan(body, ctx.shadow_base, access_local, @intCast(size * 2));
 
     // store rt at access_addr, rt2 at access_addr + size
-    try pushAccessAddrI32(body, x.mode);
+    try pushAccessAddrI32(body, x.mode, true);
     try loadGpr(body, x.rt, true);
     switch (size) {
         4 => { try body.emit(.i64_store32); try body.emitMemArg(2, 0); },
         8 => { try body.emit(.i64_store); try body.emitMemArg(3, 0); },
         else => unreachable,
     }
-    try pushAccessAddrI32(body, x.mode);
+    try pushAccessAddrI32(body, x.mode, true);
     try body.emitConstI32(@as(i32, size));
     try body.emit(.i32_add);
     try loadGpr(body, x.rt2, true);
@@ -3623,6 +3838,7 @@ fn emitLoadReg(body: *wasm.Body, x: decode.LoadStoreReg, size: u8, signed: bool)
     try body.emit(.i32_wrap_i64);
     try body.emitConstI32(@bitCast(cpu.guest_mem_base));
     try body.emit(.i32_add);
+    try emitProtGuard(body, false);
     try emitLoadOp(body, size, signed, x.sf);
     if (x.rt == 31) {
         try body.emit(.drop);
@@ -3648,6 +3864,7 @@ fn emitStoreReg(ctx: *Ctx, x: decode.LoadStoreReg, size: u8) !void {
     try body.emit(.i32_wrap_i64);
     try body.emitConstI32(@bitCast(cpu.guest_mem_base));
     try body.emit(.i32_add);
+    try emitProtGuard(body, true);
     try loadGpr(body, x.rt, true);
     switch (size) {
         1 => { try body.emit(.i64_store8); try body.emitMemArg(0, 0); },
@@ -3659,6 +3876,29 @@ fn emitStoreReg(ctx: *Ctx, x: decode.LoadStoreReg, size: u8) !void {
 }
 
 /// LDR literal: rt = mem[pc + offset]. offset is in bytes (already in decoder)
+fn emitLoadLitFp(body: *wasm.Body, x: decode.LoadLitFp, pc: u64) !void {
+    const addr: u64 = @bitCast(@as(i64, @intCast(pc)) + @as(i64, x.offset));
+    try body.emitRegAddr(vregBaseAddr(x.rt));
+    try body.emitConstI32(@bitCast(@as(u32, @truncate(addr))));
+    try body.emitConstI32(@bitCast(cpu.guest_mem_base));
+    try body.emit(.i32_add);
+    if (x.bytes == 16) {
+        try body.loadV128(0);
+        try body.storeV128(0);
+    } else {
+        if (x.bytes == 8) {
+            try body.loadI64(0);
+        } else {
+            try body.emit(.i64_load32_u);
+            try body.emitMemArg(2, 0);
+        }
+        try body.storeI64(0);
+        try body.emitRegAddr(vregBaseAddr(x.rt) + 8);
+        try body.emitConstI64(0);
+        try body.storeI64(0);
+    }
+}
+
 fn emitLoadLit(body: *wasm.Body, x: decode.LoadLit, pc: u64) !void {
     if (x.rt == 31) return;
     try body.emitRegAddr(@bitCast(cpu.gpr_offset(x.rt)));
@@ -4156,6 +4396,69 @@ fn emitDiv(body: *wasm.Body, x: decode.DivReg, signed: bool) !void {
     try body.storeI64(0);
 }
 
+// ── software page-protection guard ──
+//
+// index of the i32 local that parks a memory-access address for the guard. only declared (and
+// referenced) when protection is enabled, so the unprotected translator is byte-identical.
+const local_addr: u32 = 6;
+
+/// emit a page-protection guard for a guest access whose wasm address (i32) is on top of the
+/// stack. no-op (stack untouched) when protection is disabled. otherwise tees the address (leaving
+/// it on the stack for the caller's load/store) and — only while the imported prot_active global
+/// is non-zero — checks the per-page permission byte and calls mem_fault(addr, is_write) on a
+/// violation. mem_fault throws on the host side, unwinding out of run() to the dispatcher.
+/// guard the page containing (base_local + off) for a read/write access, leaving
+/// the value stack unchanged. used where the effective address lives in a local
+/// plus a static offset rather than on top of the stack.
+fn emitProtGuardLocalOff(body: *wasm.Body, base_local: u32, off: u32, is_write: bool) !void {
+    if (body.prot_active_global == null) return;
+    try body.emit(.local_get);
+    try body.emitU32(base_local);
+    if (off != 0) {
+        try body.emitConstI32(@bitCast(off));
+        try body.emit(.i32_add);
+    }
+    try emitProtGuard(body, is_write);
+    try body.emit(.drop);
+}
+
+fn emitProtGuard(body: *wasm.Body, is_write: bool) !void {
+    const pa = body.prot_active_global orelse return;
+    try body.emit(.local_tee);
+    try body.emitU32(local_addr);
+    // if (prot_active != 0)
+    try body.emit(.global_get);
+    try body.emitU32(pa);
+    try body.emit(.@"if");
+    try body.bytes.append(body.arena, @intFromEnum(wasm.BlockType.empty));
+    // prot_byte = prot_base[(addr - guest_mem_base) >> 12]
+    try body.emit(.local_get);
+    try body.emitU32(local_addr);
+    try body.emitConstI32(@bitCast(cpu.guest_mem_base));
+    try body.emit(.i32_sub);
+    try body.emitConstI32(12);
+    try body.emit(.i32_shr_u);
+    try body.emitConstI32(@bitCast(body.prot_base));
+    try body.emit(.i32_add);
+    try body.emit(.i32_load8_u);
+    try body.emitMemArg(0, 0);
+    const need: i32 = if (is_write) 2 else 1; // bit1=write, bit0=read
+    try body.emitConstI32(need);
+    try body.emit(.i32_and);
+    try body.emitConstI32(need);
+    try body.emit(.i32_ne);
+    // if ((prot_byte & need) != need) mem_fault(addr, is_write)
+    try body.emit(.@"if");
+    try body.bytes.append(body.arena, @intFromEnum(wasm.BlockType.empty));
+    try body.emit(.local_get);
+    try body.emitU32(local_addr);
+    try body.emitConstI32(if (is_write) 1 else 0);
+    try body.emit(.call);
+    try body.emitU32(body.mem_fault_fn);
+    try body.emit(.end);
+    try body.emit(.end);
+}
+
 // ── exclusive monitor shadow protocol ──
 //
 // the shadow bitmap (per-worker, inside the same linear memory) has 1 bit per
@@ -4554,6 +4857,7 @@ fn emitSimdLoad(ctx: *Ctx, x: decode.SimdMem) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         try body.emit(.i64_load);
         try body.emitMemArg(3, 0);
         try body.storeI64(0);
@@ -4565,6 +4869,7 @@ fn emitSimdLoad(ctx: *Ctx, x: decode.SimdMem) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base + 8));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         try body.emit(.i64_load);
         try body.emitMemArg(3, 0);
         try body.storeI64(0);
@@ -4576,6 +4881,7 @@ fn emitSimdLoad(ctx: *Ctx, x: decode.SimdMem) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         switch (x.size) {
             1 => { try body.emit(.i64_load8_u); try body.emitMemArg(0, 0); },
             2 => { try body.emit(.i64_load16_u); try body.emitMemArg(1, 0); },
@@ -4610,6 +4916,7 @@ fn emitSimdStore(ctx: *Ctx, x: decode.SimdMem) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off));
         try body.loadI64(0);
         try body.emit(.i64_store);
@@ -4621,6 +4928,7 @@ fn emitSimdStore(ctx: *Ctx, x: decode.SimdMem) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base + 8));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off + 8));
         try body.loadI64(0);
         try body.emit(.i64_store);
@@ -4631,6 +4939,7 @@ fn emitSimdStore(ctx: *Ctx, x: decode.SimdMem) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off));
         try body.loadI64(0);
         switch (x.size) {
@@ -4683,6 +4992,7 @@ fn doSimdMemLoad(body: *wasm.Body, size: u8, addr_local: u32, extra_offset: i32,
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(@as(u32, @bitCast(@as(i32, @bitCast(cpu.guest_mem_base)) + extra_offset))));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         try body.emit(.i64_load);
         try body.emitMemArg(3, 0);
         try body.storeI64(0);
@@ -4693,6 +5003,7 @@ fn doSimdMemLoad(body: *wasm.Body, size: u8, addr_local: u32, extra_offset: i32,
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(@as(u32, @bitCast(@as(i32, @bitCast(cpu.guest_mem_base)) + extra_offset + 8))));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         try body.emit(.i64_load);
         try body.emitMemArg(3, 0);
         try body.storeI64(0);
@@ -4703,6 +5014,7 @@ fn doSimdMemLoad(body: *wasm.Body, size: u8, addr_local: u32, extra_offset: i32,
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(@as(u32, @bitCast(@as(i32, @bitCast(cpu.guest_mem_base)) + extra_offset))));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         switch (size) {
             1 => { try body.emit(.i64_load8_u); try body.emitMemArg(0, 0); },
             2 => { try body.emit(.i64_load16_u); try body.emitMemArg(1, 0); },
@@ -4727,6 +5039,7 @@ fn doSimdMemStore(body: *wasm.Body, size: u8, addr_local: u32, extra_offset: i32
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(@as(u32, @bitCast(@as(i32, @bitCast(cpu.guest_mem_base)) + extra_offset))));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off));
         try body.loadI64(0);
         try body.emit(.i64_store);
@@ -4737,6 +5050,7 @@ fn doSimdMemStore(body: *wasm.Body, size: u8, addr_local: u32, extra_offset: i32
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(@as(u32, @bitCast(@as(i32, @bitCast(cpu.guest_mem_base)) + extra_offset + 8))));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off + 8));
         try body.loadI64(0);
         try body.emit(.i64_store);
@@ -4747,6 +5061,7 @@ fn doSimdMemStore(body: *wasm.Body, size: u8, addr_local: u32, extra_offset: i32
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(@as(u32, @bitCast(@as(i32, @bitCast(cpu.guest_mem_base)) + extra_offset))));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off));
         try body.loadI64(0);
         switch (size) {
@@ -4780,6 +5095,7 @@ fn emitSimdLoadReg(ctx: *Ctx, x: decode.SimdMemReg) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         try body.emit(.i64_load);
         try body.emitMemArg(3, 0);
         try body.storeI64(0);
@@ -4790,6 +5106,7 @@ fn emitSimdLoadReg(ctx: *Ctx, x: decode.SimdMemReg) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base + 8));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         try body.emit(.i64_load);
         try body.emitMemArg(3, 0);
         try body.storeI64(0);
@@ -4800,6 +5117,7 @@ fn emitSimdLoadReg(ctx: *Ctx, x: decode.SimdMemReg) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, false);
         switch (x.size) {
             1 => { try body.emit(.i64_load8_u); try body.emitMemArg(0, 0); },
             2 => { try body.emit(.i64_load16_u); try body.emitMemArg(1, 0); },
@@ -4834,6 +5152,7 @@ fn emitSimdStoreReg(ctx: *Ctx, x: decode.SimdMemReg) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off));
         try body.loadI64(0);
         try body.emit(.i64_store);
@@ -4844,6 +5163,7 @@ fn emitSimdStoreReg(ctx: *Ctx, x: decode.SimdMemReg) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base + 8));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off + 8));
         try body.loadI64(0);
         try body.emit(.i64_store);
@@ -4854,6 +5174,7 @@ fn emitSimdStoreReg(ctx: *Ctx, x: decode.SimdMemReg) !void {
         try body.emit(.i32_wrap_i64);
         try body.emitConstI32(@bitCast(cpu.guest_mem_base));
         try body.emit(.i32_add);
+        try emitProtGuard(body, true);
         try body.emitRegAddr(@bitCast(v_off));
         try body.loadI64(0);
         switch (x.size) {

@@ -36,6 +36,8 @@ interface TranslatorExports {
     code_len: number,
     shadow_base: number,
     shared_monitor: number,
+    protection: number,
+    prot_base: number,
   ): number;
   translator_result_offset(): number;
   translator_result_len(): number;
@@ -118,6 +120,7 @@ export function translateRegionZig(
   singleBlock = false,
   threaded = false,
   regBase: WebAssembly.Global | null = null,
+  protection: { protBase: number; protActive: WebAssembly.Global; memFault: (addr: number, isWrite: number) => void } | null = null,
 ): CompiledRegion | null {
   if (!ensureInit()) return null;
 
@@ -148,7 +151,7 @@ export function translateRegionZig(
   // shared_monitor: threaded processes emit reg_base-relative registers, real atomics (LDXR/STXR
   // shadow protocol + LSE), and fences on a SHARED memory. single-threaded (each fork has its own
   // private memory) uses plain value-CAS and skips the shadow protocol entirely.
-  const rc = ex.translator_translate_region(basePCLo, basePCHi, entryLo, entryHi, codeBytes.length, shadowBase, threaded ? 1 : 0);
+  const rc = ex.translator_translate_region(basePCLo, basePCHi, entryLo, entryHi, codeBytes.length, shadowBase, threaded ? 1 : 0, protection ? 1 : 0, protection ? protection.protBase : 0);
   if (rc !== 0) return null;
 
   const outLen = ex.translator_result_len();
@@ -177,7 +180,7 @@ export function translateRegionZig(
 
   let inst: WebAssembly.Instance;
   try {
-    inst = new WebAssembly.Instance(mod, { env: createEnv(memory, regBase) });
+    inst = new WebAssembly.Instance(mod, { env: createEnv(memory, regBase, protection?.protActive ?? null, protection?.memFault ?? null) });
   } catch {
     return null;
   }

@@ -69,6 +69,44 @@ struct ContentView: View {
             } else if path.hasPrefix("/ctl/reset") {
                 router.ctlReset()
                 return ("text/plain", Data("reset".utf8))
+            } else if path.hasPrefix("/ctl/pull") {
+                // body: "<name> <url>" — download + extract a distro tarball into roots/<name>
+                let s = String(data: body, encoding: .utf8) ?? ""
+                let parts = s.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 1).map(String.init)
+                guard parts.count == 2 else { return ("text/plain", Data("usage: <name> <url>".utf8)) }
+                return ("text/plain", Data(router.performPull(parts[0], parts[1]).utf8))
+            } else if path.hasPrefix("/ctl/exec") {
+                // body: a shell command, optionally prefixed with "@<ms> " to override the 30s timeout.
+                // blocks until it completes (or times out, sending SIGINT); returns output + [exit N].
+                var cmd = String(data: body, encoding: .utf8) ?? ""
+                var ms = 30000
+                if cmd.hasPrefix("@"), let sp = cmd.firstIndex(of: " ") {
+                    ms = Int(cmd[cmd.index(after: cmd.startIndex)..<sp]) ?? 30000
+                    cmd = String(cmd[cmd.index(after: sp)...])
+                }
+                return ("text/plain", Data(router.execCommand(cmd, timeoutMs: ms).utf8))
+            } else if path.hasPrefix("/ctl/switch") {
+                // body: "<name>" — repoint the active root + reboot the session into it
+                let name = (String(data: body, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let ok = router.nativeFS?.switchRoot(name) ?? false
+                if ok { router.ctlReset() }
+                return ("text/plain", Data((ok ? "switched to \(name)" : "no such root: \(name)").utf8))
+            } else if path.hasPrefix("/ctl/instkat") {
+                // temporary crypto-diagnosis helper: drop a bundled diagnostic binary into the active root.
+                // body = resource name (default crypto_kat).
+                let resName = (String(data: body, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let name = resName.isEmpty ? "crypto_kat" : resName
+                guard let src = Bundle.main.url(forResource: name, withExtension: nil),
+                      let data = try? Data(contentsOf: src),
+                      let fs = router.nativeFS else { return ("text/plain", Data("no \(name) or fs".utf8)) }
+                let dstDir = fs.rootPath.appendingPathComponent("root", isDirectory: true)
+                let dst = dstDir.appendingPathComponent(name)
+                do {
+                    try FileManager.default.createDirectory(at: dstDir, withIntermediateDirectories: true)
+                    try data.write(to: dst)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
+                    return ("text/plain", Data("installed \(data.count) bytes to /root/\(name)".utf8))
+                } catch { return ("text/plain", Data("err: \(error)".utf8)) }
             }
             return ("text/plain", Data("unknown ctl path".utf8))
         }

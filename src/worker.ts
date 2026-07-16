@@ -192,6 +192,7 @@ function init(config: WorkerInitConfig) {
       readStdin: (count) => readStdin(count),
       stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
       waitStdin: (timeoutMs) => waitStdin(timeoutMs),
+      readFileAt: (fd, offset, count) => readNativeFileAt(fd, offset, count),
     }, vfs);
     syscalls.bridgeAvailable = true;
     syscalls.setThreadIds(ts.tid, ts.tgid);             // gettid=tid, getpid=tgid
@@ -217,6 +218,7 @@ function init(config: WorkerInitConfig) {
       readStdin: (count) => readStdin(count),
       stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
       waitStdin: (timeoutMs) => waitStdin(timeoutMs),
+      readFileAt: (fd, offset, count) => readNativeFileAt(fd, offset, count),
     }, vfs);
     syscalls.bridgeAvailable = true; // Worker can relay bridge calls to kernel
     if (config.syscallState) {
@@ -263,6 +265,7 @@ function init(config: WorkerInitConfig) {
       readStdin: (count) => readStdin(count),
       stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
       waitStdin: (timeoutMs) => waitStdin(timeoutMs),
+      readFileAt: (fd, offset, count) => readNativeFileAt(fd, offset, count),
     }, vfs);
     syscalls.bridgeAvailable = true;
 
@@ -402,6 +405,20 @@ function runLoop(startPC: bigint) {
     blockCount++;
     const region = getRegion(pc);
     pc = region.run();
+
+    // Undecodable / unsupported instruction (reason 3): raise SIGILL at the faulting PC instead of
+    // looping. this is real CPU behaviour and is what lets feature-probing code (e.g. OpenSSL testing
+    // for the AES/PMULL/SHA crypto extensions we don't implement) catch the trap and fall back to its
+    // generic path. without it the block re-exits at the same PC forever (a hang).
+    if ((region as any).lastExitReason === 3 /* exit_unknown_insn */) {
+      { const _i = new DataView(memory.buffer).getUint32(Number(pc) + GUEST_MEM_BASE, true); postWrite(2, new TextEncoder().encode(`[SIGILL pc=0x${pc.toString(16)} insn=0x${_i.toString(16).padStart(8,'0')}]\r\n`)); } // DEBUG (remove before ship)
+      cpu.setPC(pc);
+      syscalls.raiseSignal(4); // SIGILL
+      const next = deliverQueuedSignals(pc);
+      if (next === null) return; // default action terminated the process
+      pc = next;
+      continue;
+    }
 
     // Refresh view in case memory grew
     view = new DataView(memory.buffer);
@@ -1148,7 +1165,7 @@ function handleKernelPipeDup3(cpu: CpuState): void {
   // Also let the SyscallHandler know (it manages fd table for other ops like fcntl)
   syscalls.registerFd(newFd, {
     type: pipeInfo.mode === 'read' ? 'pipe_read' : 'pipe_write',
-    pipe: { data: [], writeClosed: false, readClosed: false },
+    pipe: { data: [], writeClosed: false, readClosed: false, writers: 1, readers: 1, bytes: 0 },
   });
 
   cpu.setReg(0, BigInt(newFd));
@@ -1183,8 +1200,8 @@ function handlePipe2(cpu: CpuState, view: DataView): void {
   // Also register in the SyscallHandler's fd table so dup2/close know about them
   // We use a shim pipe buffer that the SyscallHandler won't actually read from
   // (the Worker intercepts all I/O on these fds)
-  syscalls.registerFd(readFd, { type: 'pipe_read', pipe: { data: [], writeClosed: false, readClosed: false } });
-  syscalls.registerFd(writeFd, { type: 'pipe_write', pipe: { data: [], writeClosed: false, readClosed: false } });
+  syscalls.registerFd(readFd, { type: 'pipe_read', pipe: { data: [], writeClosed: false, readClosed: false, writers: 1, readers: 1, bytes: 0 } });
+  syscalls.registerFd(writeFd, { type: 'pipe_write', pipe: { data: [], writeClosed: false, readClosed: false, writers: 1, readers: 1, bytes: 0 } });
 
   // Write [readFd, writeFd] to guest memory
   view.setInt32(pipefdAddr + GUEST_MEM_BASE, readFd, true);
@@ -1335,6 +1352,32 @@ function readGuestFile(path: string): Uint8Array {
   let off = 0;
   for (const c of chunks) { out.set(c, off); off += c.length; }
   return out;
+}
+
+// synchronous offset-read of a NATIVE (bridge-backed) file, chunked to fit the bridge response slot.
+// this is what makes file-backed mmap + pread work on real files -> the dynamic loader can map shared
+// libraries from NativeFS. returns the bytes actually read (short at EOF).
+function readNativeFileAt(fd: number, offset: number, count: number): Uint8Array {
+  const CHUNK = 12288; // raw bytes per read; base64 fits the 16KB response slot
+  const out = new Uint8Array(count);
+  let got = 0;
+  while (got < count) {
+    const want = Math.min(CHUNK, count - got);
+    const h = { data: new Uint8Array(0) };
+    handleBridgeCall('fs_pread', { fd, offset: offset + got, count: want }, (r) => {
+      if (r && typeof r.data === 'string' && r.data.length) {
+        const bin = atob(r.data);
+        const u = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+        h.data = u;
+      }
+    });
+    if (h.data.length === 0) break; // EOF or error
+    out.set(h.data, got);
+    got += h.data.length;
+    if (h.data.length < want) break; // short read -> EOF
+  }
+  return got === count ? out : out.subarray(0, got);
 }
 
 function handleBridgeCall(method: string, args: Record<string, unknown>, apply: (resp: any) => void): void {

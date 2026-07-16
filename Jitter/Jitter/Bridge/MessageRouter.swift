@@ -44,6 +44,78 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
         ctlLock.lock(); ctlBuffer.removeAll(keepingCapacity: true); ctlLock.unlock()
     }
     func ctlInject(_ text: String) { sendStdin(Data(text.utf8)) }
+
+    // run a shell command and BLOCK until it finishes, returning exactly its output + exit code.
+    // injects `<cmd>; echo <marker>$?<end>` and polls the in-memory output tap for the marker (which
+    // carries the exit status) so the caller (a dev driver over http) never has to guess a wait time.
+    // the marker literal is split in the injected source ("==J""X..") so the shell's echo of the typed
+    // line doesn't itself match the search string — only the command's actual output does.
+    private var execCounter = 0
+    func execCommand(_ cmd: String, timeoutMs: Int = 30000) -> String {
+        ctlLock.lock()
+        execCounter += 1
+        let id = execCounter
+        let startLen = ctlBuffer.count
+        ctlLock.unlock()
+        let marker = [UInt8]("==JX\(id)=".utf8) // appears only in output (echoed source is ==J""X..)
+        ctlInject("\(cmd); echo \"==J\"\"X\(id)=$?==\"\n")
+
+        // find the first occurrence of `needle` in `hay` at/after `from`, byte-wise (Swift Characters
+        // fold "\r\n" into one grapheme, so all of this must operate on raw bytes).
+        func find(_ hay: [UInt8], _ needle: [UInt8], _ from: Int = 0) -> Int? {
+            guard !needle.isEmpty, hay.count >= needle.count else { return nil }
+            var i = from
+            while i <= hay.count - needle.count {
+                if Array(hay[i..<i+needle.count]) == needle { return i }
+                i += 1
+            }
+            return nil
+        }
+
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        while Date() < deadline {
+            ctlLock.lock()
+            let tail = ctlBuffer.count > startLen ? [UInt8](ctlBuffer.subdata(in: startLen..<ctlBuffer.count)) : []
+            ctlLock.unlock()
+            if let m = find(tail, marker) {
+                // exit code = digits right after the marker
+                var j = m + marker.count
+                var rc = ""
+                while j < tail.count, tail[j] >= 0x30, tail[j] <= 0x39 { rc.append(Character(UnicodeScalar(tail[j]))); j += 1 }
+                // output = everything after the echoed command line (ends at the first \n) up to the marker
+                let lf = tail.firstIndex(of: 0x0a)
+                let start = (lf != nil && lf! + 1 <= m) ? lf! + 1 : 0
+                let out = start < m ? String(decoding: tail[start..<m], as: UTF8.self) : ""
+                return out + "[exit \(rc.isEmpty ? "?" : rc)]\n"
+            }
+            usleep(15000) // 15ms — local, cheap, responsive
+        }
+        // the command never produced the marker within the budget (likely a hang). send ^C to
+        // interrupt it so the shell recovers for the next exec, and return what output we captured.
+        sendStdin(Data([0x03]))
+        ctlLock.lock()
+        let tail = ctlBuffer.count > startLen ? ctlBuffer.subdata(in: startLen..<ctlBuffer.count) : Data()
+        ctlLock.unlock()
+        return String(decoding: tail, as: UTF8.self) + "\n[timeout after \(timeoutMs)ms — sent SIGINT]\n"
+    }
+
+    // synchronous pull for the debug /ctl channel: download a tarball + install into roots/<name>.
+    // blocks the caller (a LocalServer connection thread) until done. the guest-facing async path is
+    // the jitter_pull bridge handler.
+    func performPull(_ name: String, _ urlStr: String) -> String {
+        guard let url = URL(string: urlStr), let fs = nativeFS else { return "bad url or no fs" }
+        let sem = DispatchSemaphore(value: 0)
+        var result = "download failed"
+        URLSession.shared.dataTask(with: url) { data, _, err in
+            defer { sem.signal() }
+            if let err = err { result = "download error: \(err.localizedDescription)"; return }
+            guard let data = data, !data.isEmpty else { result = "empty download"; return }
+            let r = fs.installRootfs(data, into: name)
+            result = "\(r.note): \(r.files) files -> roots/\(name) (\(data.count) bytes)"
+        }.resume()
+        _ = sem.wait(timeout: .now() + 180)
+        return result
+    }
     func ctlReset() {
         ctlClearOutput()
         DispatchQueue.main.async { [weak self] in self?.webView?.reload() }
@@ -216,6 +288,48 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
             }
         }
 
+        // read a whole file from the ACTIVE root (symlinks followed) — used to boot the root's login
+        // shell as pid 1 so `jitter switch` boots the chosen distro.
+        handlers["load_root_file"] = { args, reply in
+            guard let path = args["path"] as? String else { reply(["error": "no path"], nil); return }
+            if let data = try? Data(contentsOf: fs.resolve(path)) {
+                reply(["data": data.base64EncodedString()], nil)
+            } else {
+                reply(["error": "cannot read \(path)"], nil)
+            }
+        }
+
+        // pull a distro tarball into roots/<name>. async download; installRootfs does gunzip + untar.
+        handlers["jitter_pull"] = { args, reply in
+            guard let name = args["name"] as? String, let urlStr = args["url"] as? String,
+                  let url = URL(string: urlStr) else { reply(["ret": -22, "output": "usage: name url"], nil); return }
+            URLSession.shared.dataTask(with: url) { data, _, err in
+                if let err = err { reply(["ret": -1, "output": "download failed: \(err.localizedDescription)"], nil); return }
+                guard let data = data, !data.isEmpty else { reply(["ret": -1, "output": "empty download"], nil); return }
+                let r = fs.installRootfs(data, into: name)
+                reply(["ret": r.ok ? 0 : -1, "output": "\(r.note): \(r.files) files -> roots/\(name)"], nil)
+            }.resume()
+        }
+
+        handlers["jitter_ls"] = { _, reply in
+            let fsRef = fs
+            reply(["roots": fsRef.listRoots(), "active": fsRef.activeRoot], nil)
+        }
+
+        handlers["fs_pread"] = { args, reply in
+            guard let fd = args["fd"] as? Int,
+                  let offset = args["offset"] as? Int,
+                  let count = args["count"] as? Int else {
+                reply(["ret": -9], nil); return
+            }
+            let (ret, data) = fs.pread(fd: Int32(truncatingIfNeeded: fd), offset: UInt64(max(0, offset)), count: count)
+            if let data = data {
+                reply(["ret": ret, "data": data.base64EncodedString()], nil)
+            } else {
+                reply(["ret": ret], nil)
+            }
+        }
+
         handlers["fs_write"] = { args, reply in
             guard let fd = args["fd"] as? Int,
                   let b64 = args["data"] as? String,
@@ -223,6 +337,16 @@ class MessageRouter: NSObject, WKScriptMessageHandlerWithReply {
                 reply(["ret": -22], nil); return
             }
             reply(["ret": fs.write(fd: Int32(truncatingIfNeeded: fd), data: data)], nil)
+        }
+
+        handlers["fs_pwrite"] = { args, reply in
+            guard let fd = args["fd"] as? Int,
+                  let offset = args["offset"] as? Int,
+                  let b64 = args["data"] as? String,
+                  let data = Data(base64Encoded: b64) else {
+                reply(["ret": -22], nil); return
+            }
+            reply(["ret": fs.pwrite(fd: Int32(truncatingIfNeeded: fd), offset: UInt64(max(0, offset)), data: data)], nil)
         }
 
         handlers["fs_stat"] = { args, reply in

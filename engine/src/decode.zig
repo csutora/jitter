@@ -98,6 +98,7 @@ pub const Kind = enum(u32) {
     strb_reg,
     strh_reg,
     ldr_lit,
+    ldr_lit_fp,
     ldp,
     stp,
     ldxr,
@@ -111,6 +112,7 @@ pub const Kind = enum(u32) {
     // float / simd
     fcmp,
     fcvt,
+    fcsel,
     fmov_imm,
     fmov_fp,
     fmov_to_fp,
@@ -177,6 +179,16 @@ pub const Kind = enum(u32) {
     simd_sshll,
     simd_ushll,
     simd_shrn,
+    simd_shift_imm,
+    simd_rev,
+    simd_ins_elem,
+    simd_dup_scalar,
+    simd_rbit,
+    simd_idx_mul,
+    simd_xtn,
+    crypto_aes,
+    crypto_pmull,
+    crypto_sha,
     simd_tbl,
     simd_zip1,
     simd_zip2,
@@ -194,6 +206,7 @@ pub const Kind = enum(u32) {
     vec_widen, // three-different widening: smull/umull/saddl/ssubl/smlal...
     simd_ldst_multi, // LD1/ST1 .. LD4/ST4 multiple structures
     simd_ld1r, // LD1R replicate
+    simd_ldst1_single, // LD1/ST1 single-lane
 
     // lse atomics (armv8.1)
     cas,
@@ -289,6 +302,7 @@ pub const Op = union(Kind) {
     strb_reg: LoadStoreReg,
     strh_reg: LoadStoreReg,
     ldr_lit: LoadLit,
+    ldr_lit_fp: LoadLitFp,
     ldp: LoadStorePair,
     stp: LoadStorePair,
     ldxr: LoadStoreEx,
@@ -300,6 +314,7 @@ pub const Op = union(Kind) {
 
     fcmp: Fcmp,
     fcvt: Fcvt,
+    fcsel: Fcsel,
     fmov_imm: FmovImm,
     fmov_fp: FpArith1, // FMOV Vd, Vn — register copy
     fmov_to_fp: FmovGprFp, // FMOV Sd/Dd from Wn/Xn
@@ -366,6 +381,16 @@ pub const Op = union(Kind) {
     simd_sshll: SimdShiftLong,
     simd_ushll: SimdShiftLong,
     simd_shrn: SimdShrn,
+    simd_shift_imm: SimdShiftImm,
+    simd_rev: SimdRev,
+    simd_ins_elem: SimdInsElem,
+    simd_dup_scalar: SimdDupScalar,
+    simd_rbit: SimdTwoRegNoSize,
+    simd_idx_mul: SimdIdxMul,
+    simd_xtn: SimdTwoReg,
+    crypto_aes: CryptoAes,
+    crypto_pmull: CryptoPmull,
+    crypto_sha: CryptoSha,
     simd_tbl: SimdTbl,
     simd_zip1: SimdThreeSame,
     simd_zip2: SimdThreeSame,
@@ -382,6 +407,7 @@ pub const Op = union(Kind) {
     vec_widen: VecWiden,
     simd_ldst_multi: SimdLdstMulti,
     simd_ld1r: SimdLd1r,
+    simd_ldst1_single: SimdLdSt1Single,
 
     cas: Cas,
     lse: Lse,
@@ -389,6 +415,7 @@ pub const Op = union(Kind) {
 
 pub const SimdLdstMulti = struct { q: bool, is_load: bool, rt: u5, rn: u5, rm: u5, post: bool, reg_count: u3, deinterleave: bool, size: u2 };
 pub const SimdLd1r = struct { q: bool, rt: u5, rn: u5, rm: u5, post: bool, size: u2 };
+pub const SimdLdSt1Single = struct { load: bool, rt: u5, rn: u5, rm: u5, post: bool, esize: u8, index: u8 };
 
 pub const VecAcrossOp = enum { addv, saddlv, uaddlv, smaxv, umaxv, sminv, uminv, fmaxv, fminv };
 pub const VecAcross = struct { q: bool, size: u2, rd: u5, rn: u5, op: VecAcrossOp };
@@ -503,6 +530,7 @@ pub const LoadStoreReg = struct {
     shift: bool,
 };
 pub const LoadLit = struct { sf: bool, rt: u5, offset: i32, signed: bool = false };
+pub const LoadLitFp = struct { rt: u5, offset: i32, bytes: u8 };
 pub const LoadStorePair = struct {
     sf: bool,
     rt: u5,
@@ -518,6 +546,7 @@ pub const BarrierOp = struct { crm: u4, op2: u3 };
 
 pub const Fcmp = struct { ftype: u2, rn: u5, rm: u5, with_zero: bool };
 pub const Fcvt = struct { rd: u5, rn: u5, ftype: u2, dest_ftype: u2 };
+pub const Fcsel = struct { rd: u5, rn: u5, rm: u5, ftype: u2, cond: u4 };
 pub const FmovImm = struct { ftype: u2, rd: u5, bits64: u64 };
 pub const FmovGprFp = struct { rd: u5, rn: u5, sf: bool };
 pub const FmovTop = struct { rd: u5, rn: u5 };
@@ -543,7 +572,23 @@ pub const SimdElem = struct { rd: u5, rn: u5, esize: u8, index: u5, q: bool };
 pub const SimdThreeSame = struct { q: bool, rd: u5, rn: u5, rm: u5, size: u2 };
 pub const SimdTwoReg = struct { q: bool, rd: u5, rn: u5, size: u2 };
 pub const SimdTwoRegNoSize = struct { q: bool, rd: u5, rn: u5 };
+pub const IdxMulOp = enum { mul, mla, mls, mull, mlal, mlsl };
+pub const SimdIdxMul = struct { q: bool, u: bool, rd: u5, rn: u5, rm: u5, size: u2, index: u8, op: IdxMulOp };
+pub const CryptoAesOp = enum { aese, aesd, aesmc, aesimc };
+pub const CryptoAes = struct { op: CryptoAesOp, rd: u5, rn: u5 };
+pub const CryptoPmull = struct { part: bool, rd: u5, rn: u5, rm: u5 };
+pub const CryptoShaOp = enum { sha1c, sha1p, sha1m, sha1h, sha1su0, sha1su1, sha256h, sha256h2, sha256su0, sha256su1, sha512h, sha512h2, sha512su0, sha512su1 };
+pub const CryptoSha = struct { op: CryptoShaOp, rd: u5, rn: u5, rm: u5 };
 pub const SimdShiftLong = struct { q: bool, rd: u5, rn: u5, esize: u8, shift: u8 };
+// same-width vector shift by immediate (USHR/SSHR/SHL over .8b/.16b/.4h/.8h/.2s/.4s/.2d).
+pub const ShiftImmOp = enum { ushr, sshr, shl, sli, sri };
+pub const SimdShiftImm = struct { q: bool, rd: u5, rn: u5, esize: u8, shift: u8, op: ShiftImmOp };
+// REV16/REV32/REV64 (vector): reverse the `size`-encoded elements within each `container`-byte group.
+pub const SimdRev = struct { q: bool, rd: u5, rn: u5, size: u2, container: u8 };
+// INS (element): Vd.T[dst] = Vn.T[src] (leaves other lanes of Vd).
+pub const SimdInsElem = struct { rd: u5, rn: u5, esize: u8, dst_index: u5, src_index: u5 };
+// DUP (element -> scalar): Dd = Vn.T[index] (writes lane 0, zeros the rest of Vd).
+pub const SimdDupScalar = struct { rd: u5, rn: u5, esize: u8, index: u5 };
 pub const SimdShrn = struct { q: bool, rd: u5, rn: u5, size: u2, shift: u8 };
 pub const SimdExt = struct { q: bool, rd: u5, rn: u5, rm: u5, index: u4 };
 pub const SimdTbl = struct { q: bool, rd: u5, rn: u5, rm: u5, len: u2, is_tbx: bool };
@@ -825,7 +870,8 @@ fn decodeLoadStore(insn: u32) Op {
     const bits_29_28: u2 = @truncate((insn >> 28) & 0x3);
     const v: u1 = @truncate(insn >> 26);
 
-    if (bits_29_27 == 0b011 and v == 0) return decodeLoadLit(insn);
+    if (bits_29_27 == 0b011 and v == 0 and (insn >> 24) & 0x3 == 0) return decodeLoadLit(insn);
+    if (bits_29_27 == 0b011 and v == 1 and (insn >> 24) & 0x3 == 0) return decodeLoadLitFp(insn);
     if (bits_29_28 == 0b00 and v == 0) return decodeLoadStoreEx(insn);
     if (bits_29_27 == 0b101 and v == 0) return decodeLoadStorePair(insn);
 
@@ -916,6 +962,22 @@ fn decodeSimdLoadSingle(insn: u32) Op {
     // LD1R: L=1, R=0, opcode=110 — replicate one element across all lanes
     if (l == 1 and r == 0 and opcode == 0b110) {
         return Op{ .simd_ld1r = .{ .q = q, .rt = rt, .rn = rn, .rm = rm, .post = post, .size = size } };
+    }
+    // single-lane LD1/ST1 (1 register, R=0): element size + lane index from opcode/S/size/Q.
+    if (r == 0 and (opcode == 0b000 or opcode == 0b010 or opcode == 0b100)) {
+        const s: u1 = @truncate((insn >> 12) & 1);
+        const qn: u8 = if (q) 1 else 0;
+        var esize: u8 = 0;
+        var index: u8 = 0;
+        switch (opcode) {
+            0b000 => { esize = 1; index = (qn << 3) | (@as(u8, s) << 2) | @as(u8, size); },
+            0b010 => if ((size & 1) == 0) { esize = 2; index = (qn << 2) | (@as(u8, s) << 1) | @as(u8, size >> 1); },
+            0b100 => {
+                if (size == 0b00) { esize = 4; index = (qn << 1) | @as(u8, s); } else if (size == 0b01 and s == 0) { esize = 8; index = qn; }
+            },
+            else => {},
+        }
+        if (esize != 0) return Op{ .simd_ldst1_single = .{ .load = l == 1, .rt = rt, .rn = rn, .rm = rm, .post = post, .esize = esize, .index = index } };
     }
     return Op{ .unknown = insn };
 }
@@ -1076,9 +1138,21 @@ fn decodeLoadStoreEx(insn: u32) Op {
     return Op{ .unknown = insn };
 }
 
+// LDR (literal, SIMD&FP): PC-relative load of 4/8/16 bytes into a V register.
+// software crypto (vpaes/gcm) loads its constant tables this way, so it is on the apk path.
+fn decodeLoadLitFp(insn: u32) Op {
+    const opc: u2 = @truncate(insn >> 30);
+    if (opc == 0b11) return Op{ .unknown = insn }; // reserved
+    const imm19: u32 = (insn >> 5) & 0x7ffff;
+    var offset: i32 = @bitCast(imm19 << 2);
+    if (offset & (1 << 20) != 0) offset |= @as(i32, @bitCast(@as(u32, 0xFFE0_0000)));
+    const bytes: u8 = switch (opc) { 0b00 => 4, 0b01 => 8, else => 16 };
+    return Op{ .ldr_lit_fp = .{ .rt = @truncate(insn & 0x1f), .offset = offset, .bytes = bytes } };
+}
+
 fn decodeLoadLit(insn: u32) Op {
     const opc: u2 = @truncate(insn >> 30);
-    if (opc == 0b11) return Op{ .unknown = insn }; // PRFM literal
+    if (opc == 0b11) return Op{ .nop = {} }; // PRFM literal: prefetch hint, no architectural effect
     const imm19: u32 = (insn >> 5) & 0x7ffff;
     var offset: i32 = @bitCast(imm19 << 2);
     if (offset & (1 << 20) != 0) offset |= @as(i32, @bitCast(@as(u32, 0xFFE0_0000)));
@@ -1218,6 +1292,7 @@ fn decodeLoadStoreReg(insn: u32) Op {
         0b11 => blk: {
             if (opc == 0b00) break :blk Op{ .str_reg = ls };
             if (opc == 0b01) break :blk Op{ .ldr_reg = ls };
+            if (opc == 0b10) break :blk Op{ .nop = {} }; // PRFM (register): prefetch hint
             break :blk Op{ .unknown = insn };
         },
     };
@@ -1256,7 +1331,8 @@ fn classifyLoadStore(size: u2, opc: u2, rt: u5, rn: u5, offset: i32, mode: AddrM
         0b11 => switch (opc) {
             0b00 => Op{ .str_imm = ls },
             0b01 => Op{ .ldr_imm = ls },
-            else => Op{ .unknown = 0 },
+            0b10 => Op{ .nop = {} }, // PRFM: prefetch hint, no architectural effect
+            0b11 => Op{ .unknown = 0 },
         },
     };
 }
@@ -1500,10 +1576,53 @@ fn decodeFpSimd(insn: u32) Op {
     const bit_15: u1 = @truncate(insn >> 15);
     const bit_10: u1 = @truncate(insn >> 10);
 
+    // cryptographic SHA512 (FEAT_SHA512): 0xCE group. three-register (bits 23:21 == 011, 15:12 == 1000)
+    // covers SHA512H/H2/SU1 (11 = RAX1, a SHA3 op we don't provide); two-register SHA512SU0 is fixed.
+    if ((insn >> 24) & 0xff == 0xce) {
+        if ((insn >> 21) & 0x7 == 0b011 and (insn >> 12) & 0xf == 0b1000) {
+            const so: ?CryptoShaOp = switch (@as(u2, @truncate((insn >> 10) & 0x3))) {
+                0b00 => .sha512h, 0b01 => .sha512h2, 0b10 => .sha512su1, else => null,
+            };
+            if (so) |o| return Op{ .crypto_sha = .{ .op = o, .rd = @truncate(insn & 0x1f), .rn = @truncate((insn >> 5) & 0x1f), .rm = @truncate((insn >> 16) & 0x1f) } };
+        }
+        if ((insn & 0xfffffc00) == 0xcec08000) {
+            return Op{ .crypto_sha = .{ .op = .sha512su0, .rd = @truncate(insn & 0x1f), .rn = @truncate((insn >> 5) & 0x1f), .rm = 0 } };
+        }
+    }
+    // cryptographic SHA1/SHA256 (0x5E group, bit28==1 so it is NOT in the 0x4E AES block below).
+    if ((insn >> 24) & 0xff == 0x5e) {
+        // three-register: 0101 1110 000 Rm 0 opcode(3) 00 Rn Rd.
+        if ((insn >> 21) & 0x7 == 0 and (insn >> 15) & 1 == 0 and (insn >> 10) & 0x3 == 0) {
+            const so: ?CryptoShaOp = switch (@as(u3, @truncate((insn >> 12) & 0x7))) {
+                0b000 => .sha1c, 0b001 => .sha1p, 0b010 => .sha1m, 0b011 => .sha1su0,
+                0b100 => .sha256h, 0b101 => .sha256h2, 0b110 => .sha256su1, else => null,
+            };
+            if (so) |o| return Op{ .crypto_sha = .{ .op = o, .rd = @truncate(insn & 0x1f), .rn = @truncate((insn >> 5) & 0x1f), .rm = @truncate((insn >> 16) & 0x1f) } };
+        }
+        // two-register: 0101 1110 0010 1000 0 opcode(5) 10 Rn Rd.
+        if ((insn >> 17) & 0x1f == 0b10100 and (insn >> 10) & 0x3 == 0b10) {
+            const so: ?CryptoShaOp = switch (@as(u5, @truncate((insn >> 12) & 0x1f))) {
+                0b00000 => .sha1h, 0b00001 => .sha1su1, 0b00010 => .sha256su0, else => null,
+            };
+            if (so) |o| return Op{ .crypto_sha = .{ .op = o, .rd = @truncate(insn & 0x1f), .rn = @truncate((insn >> 5) & 0x1f), .rm = 0 } };
+        }
+    }
+
     // advanced simd vector group: 0|Q|U|01110|... — bit 31 must be 0.
     // scalar simd (01|U|11110) has different bits 28-24 and is handled (rejected)
     // in the fp space below via the m/s gates
     if (bit_31 == 0 and bits_28_24 == 0b01110) {
+        // cryptographic AES: 0100 1110 00 10100 opcode(5) 10 Rn Rd (fixed Q=1, U=0, size=00).
+        if ((insn >> 24) & 0x7f == 0x4e and (insn >> 17) & 0x1f == 0b10100 and (insn >> 10) & 0x3 == 0b10) {
+            const aes_op: ?CryptoAesOp = switch (@as(u5, @truncate((insn >> 12) & 0x1f))) {
+                0b00100 => .aese,
+                0b00101 => .aesd,
+                0b00110 => .aesmc,
+                0b00111 => .aesimc,
+                else => null,
+            };
+            if (aes_op) |o| return Op{ .crypto_aes = .{ .op = o, .rd = @truncate(insn & 0x1f), .rn = @truncate((insn >> 5) & 0x1f) } };
+        }
         // tbl/tbx and permute share bit_29==0,bit_21==0,bit_15==0 and are distinguished
         // by bits 11:10 -- TBL/TBX have 00, ZIP/UZP/TRN permutes have 10. the old check
         // keyed only on bit_10==0, which also matched permutes and wrongly rejected them.
@@ -1569,6 +1688,23 @@ fn decodeFpSimd(insn: u32) Op {
         if (immh == 0) return decodeSimdModifiedImm(insn);
         if (decodeSimdShiftImm(insn)) |op| return op;
         return Op{ .unknown = insn };
+    }
+
+    // advanced simd vector x indexed element: 0|Q|U|01111|size|L|M|Rm|opcode|H|0|Rn|Rd.
+    // integer mul/mla/mls (same-width) and smull/umull/smlal/umlal/smlsl/umlsl (widening) by element.
+    // openssl's NEON poly1305 uses umull/umlal-by-element, so this is on the TLS path.
+    if (bit_31 == 0 and bits_28_24 == 0b01111 and bit_10 == 0) {
+        return decodeSimdIndexedElem(insn);
+    }
+
+    // scalar advanced-simd copy: 01|0|11110000|imm5|0|0000|1|Rn|Rd = DUP (element -> scalar), e.g.
+    // `mov d0, v1.d[1]` (extract a vector lane into a D register). only op=0, imm4=0000 exists.
+    if (bit_31 == 0 and bit_30 == 1 and bits_28_24 == 0b11110 and bit_23 == 0 and ((insn >> 22) & 1) == 0 and
+        bit_21 == 0 and bit_15 == 0 and bit_10 == 1 and ((insn >> 29) & 1) == 0 and ((insn >> 11) & 0xf) == 0)
+    {
+        const imm5c: u5 = @truncate((insn >> 16) & 0x1f);
+        const idxc = decodeSimdElemIndex(imm5c);
+        if (idxc.esize != 0) return Op{ .simd_dup_scalar = .{ .rd = @truncate(insn & 0x1f), .rn = @truncate((insn >> 5) & 0x1f), .esize = idxc.esize, .index = idxc.index } };
     }
 
     // scalar advanced-simd two-reg-misc: 01|U|11110|size|10000|opcode|10|Rn|Rd.
@@ -1664,6 +1800,8 @@ fn decodeFpSimd(insn: u32) Op {
         // fp 2-source: bits 11-10 == 10
         const lo2: u2 = @truncate((insn >> 10) & 0x3);
         if (lo2 == 0b10) return decodeFpDataProc2(insn);
+        // fp conditional select: bits 11-10 == 11
+        if (lo2 == 0b11) return decodeFpCsel(insn);
         // fp immediate: bits 12-10 == 100, bits 9-5 == 0
         const lo3: u3 = @truncate((insn >> 10) & 0x7);
         const rn_field: u5 = @truncate((insn >> 5) & 0x1f);
@@ -1722,6 +1860,18 @@ fn decodeFpDataProc2(insn: u32) Op {
     };
 }
 
+fn decodeFpCsel(insn: u32) Op {
+    const ftype: u2 = @truncate((insn >> 22) & 0x3);
+    if (ftype == 0b10) return Op{ .unknown = insn }; // unallocated type
+    return Op{ .fcsel = .{
+        .rd = @truncate(insn & 0x1f),
+        .rn = @truncate((insn >> 5) & 0x1f),
+        .rm = @truncate((insn >> 16) & 0x1f),
+        .ftype = ftype,
+        .cond = @truncate((insn >> 12) & 0xf),
+    } };
+}
+
 fn decodeFpDataProc1(insn: u32) Op {
     const ftype: u2 = @truncate((insn >> 22) & 0x3);
     const opcode: u6 = @truncate((insn >> 15) & 0x3f);
@@ -1733,7 +1883,13 @@ fn decodeFpDataProc1(insn: u32) Op {
         0b000001 => Op{ .fabs = arith },
         0b000010 => Op{ .fneg = arith },
         0b000011 => Op{ .fsqrt = arith },
-        0b000100 => Op{ .fcvt = .{ .rd = rd, .rn = rn, .ftype = ftype, .dest_ftype = @truncate((insn >> 15) & 0x3) } },
+        0b000100, 0b000101 => blk: {
+            // FCVT between precisions. opcode low 2 bits = dest ftype. we support single<->double
+            // only; half needs real f16 conversion so leave it to SIGILL rather than mis-emit.
+            const dst: u2 = @truncate((insn >> 15) & 0x3);
+            if (ftype > 1 or dst > 1) break :blk Op{ .unknown = insn };
+            break :blk Op{ .fcvt = .{ .rd = rd, .rn = rn, .ftype = ftype, .dest_ftype = dst } };
+        },
         else => Op{ .unknown = insn },
     };
 }
@@ -1849,6 +2005,11 @@ fn decodeVecWiden(insn: u32) ?Op {
     if (opcode == 0b0100 and u == 0) {
         return Op{ .simd_addhn = .{ .q = q, .rd = rd, .rn = rn, .rm = rm, .size = size } };
     }
+    // PMULL/PMULL2 (opcode 1110, u=0): 64x64->128 carryless multiply (size=11) for GHASH. q selects
+    // the high (PMULL2) vs low (PMULL) 64-bit source lanes. (the 8x8->16 size=00 form is not emitted here.)
+    if (opcode == 0b1110 and u == 0 and size == 0b11) {
+        return Op{ .crypto_pmull = .{ .part = q, .rd = rd, .rn = rn, .rm = rm } };
+    }
     const op: ?VecWidenOp = switch (opcode) {
         0b1100 => if (u == 0) @as(VecWidenOp, .smull) else .umull, // SMULL/UMULL
         0b1000 => if (u == 0) @as(VecWidenOp, .smlal) else .umlal, // SMLAL/UMLAL
@@ -1944,6 +2105,7 @@ fn decodeSimdTwoRegMisc(insn: u32) ?Op {
     const no_sz = SimdTwoRegNoSize{ .q = q, .rd = rd, .rn = rn };
     const sized = SimdTwoReg{ .q = q, .rd = rd, .rn = rn, .size = size };
     if (u == 1 and size == 0 and opcode == 0b00101) return Op{ .simd_not = no_sz };
+    if (u == 1 and size == 1 and opcode == 0b00101) return Op{ .simd_rbit = no_sz }; // RBIT (vector): reverse bits in each byte
     // integer neg/abs + compare-against-zero via native v128. glibc string/mem
     // routines lean heavily on cmeq #0 (strlen/memchr/strcmp).
     const iop: ?VecIntMiscOp = switch (opcode) {
@@ -1957,7 +2119,49 @@ fn decodeSimdTwoRegMisc(insn: u32) ?Op {
     if (u == 0 and size == 0 and opcode == 0b00101) return Op{ .simd_cnt = no_sz };
     if (u == 0 and opcode == 0b00100) return Op{ .simd_cls_vec = sized };
     if (u == 1 and opcode == 0b00100) return Op{ .simd_clz_vec = sized };
+    // REV64 (u=0, op 00000), REV32 (u=1, op 00000), REV16 (u=0, op 00001). `size` gives the
+    // sub-element byte width being reversed within the container. used by NEON SHA/byteswap code.
+    if (opcode == 0b00000 and u == 0) return Op{ .simd_rev = .{ .q = q, .rd = rd, .rn = rn, .size = size, .container = 8 } };
+    if (opcode == 0b00000 and u == 1) return Op{ .simd_rev = .{ .q = q, .rd = rd, .rn = rn, .size = size, .container = 4 } };
+    if (opcode == 0b00001 and u == 0) return Op{ .simd_rev = .{ .q = q, .rd = rd, .rn = rn, .size = size, .container = 2 } };
+    // XTN/XTN2 (u=0, opcode 10010): narrow each element to its low half. `size` is the dest element
+    // size (0=.8b<-.8h, 1=.4h<-.4s, 2=.2s<-.2d); q selects XTN2 (write the high 64 bits). poly1305 uses this.
+    if (u == 0 and opcode == 0b10010) return Op{ .simd_xtn = .{ .q = q, .rd = rd, .rn = rn, .size = size } };
     return null;
+}
+
+fn decodeSimdIndexedElem(insn: u32) Op {
+    const q: bool = ((insn >> 30) & 1) == 1;
+    const u: bool = ((insn >> 29) & 1) == 1;
+    const size: u2 = @truncate((insn >> 22) & 0x3);
+    const l: u1 = @truncate((insn >> 21) & 1);
+    const m: u1 = @truncate((insn >> 20) & 1);
+    const h: u1 = @truncate((insn >> 11) & 1);
+    const opcode: u4 = @truncate((insn >> 12) & 0xf);
+    const rn: u5 = @truncate((insn >> 5) & 0x1f);
+    const rd: u5 = @truncate(insn & 0x1f);
+    var rm: u5 = @truncate((insn >> 16) & 0x1f);
+    var index: u8 = 0;
+    // element size 16 uses index=H:L:M with a 3-bit Rm; size 32 uses index=H:L with a 4-bit Rm.
+    if (size == 0b01) {
+        index = (@as(u8, h) << 2) | (@as(u8, l) << 1) | @as(u8, m);
+        rm = @truncate((insn >> 16) & 0x7);
+    } else if (size == 0b10) {
+        index = (@as(u8, h) << 1) | @as(u8, l);
+    } else return Op{ .unknown = insn };
+    // mul is U=0; mla/mls are U=0 in the encoding table? no — MLA/MLS use U=1, MUL uses U=0. the
+    // widening s/u variants use U as the signedness flag. same-width mul/mla/mls are modular so
+    // signedness is irrelevant to the low bits.
+    const op: IdxMulOp = switch (opcode) {
+        0b1000 => if (u) return Op{ .unknown = insn } else .mul, // MUL (U=0)
+        0b0000 => if (u) .mla else return Op{ .unknown = insn }, // MLA (U=1)
+        0b0100 => if (u) .mls else return Op{ .unknown = insn }, // MLS (U=1)
+        0b1010 => .mull, // S/UMULL
+        0b0010 => .mlal, // S/UMLAL
+        0b0110 => .mlsl, // S/UMLSL
+        else => return Op{ .unknown = insn }, // fp-indexed / saturating handled elsewhere / not yet
+    };
+    return Op{ .simd_idx_mul = .{ .q = q, .u = u, .rd = rd, .rn = rn, .rm = rm, .size = size, .index = index, .op = op } };
 }
 
 fn decodeSimdShiftImm(insn: u32) ?Op {
@@ -1992,6 +2196,26 @@ fn decodeSimdShiftImm(insn: u32) ?Op {
         const size2: u2 = switch (esize) { 1 => 0, 2 => 1, 4 => 2, else => return null };
         const shift: u8 = @intCast(@as(u16, esize) * 16 - imm);
         return Op{ .simd_shrn = .{ .q = q, .rd = rd, .rn = rn, .size = size2, .shift = shift } };
+    }
+    if (opcode == 0b00000) {
+        // SSHR (u=0) / USHR (u=1): same-width right shift. shift = 2*esize_bits - imm.
+        const shift: u8 = @intCast(@as(u16, esize) * 16 - imm);
+        return Op{ .simd_shift_imm = .{ .q = q, .rd = rd, .rn = rn, .esize = esize, .shift = shift, .op = if (u == 0) .sshr else .ushr } };
+    }
+    if (opcode == 0b01010 and u == 0) {
+        // SHL: same-width left shift. shift = imm - esize_bits.
+        const shift: u8 = @intCast(imm - @as(u16, esize) * 8);
+        return Op{ .simd_shift_imm = .{ .q = q, .rd = rd, .rn = rn, .esize = esize, .shift = shift, .op = .shl } };
+    }
+    if (opcode == 0b01010 and u == 1) {
+        // SLI: shift-left-insert. shift = imm - esize_bits. (reads Vd for the preserved low bits)
+        const shift: u8 = @intCast(imm - @as(u16, esize) * 8);
+        return Op{ .simd_shift_imm = .{ .q = q, .rd = rd, .rn = rn, .esize = esize, .shift = shift, .op = .sli } };
+    }
+    if (opcode == 0b01000 and u == 1) {
+        // SRI: shift-right-insert. shift = 2*esize_bits - imm. (reads Vd for the preserved high bits)
+        const shift: u8 = @intCast(@as(u16, esize) * 16 - imm);
+        return Op{ .simd_shift_imm = .{ .q = q, .rd = rd, .rn = rn, .esize = esize, .shift = shift, .op = .sri } };
     }
     return null;
 }
@@ -2045,6 +2269,12 @@ fn decodeSimdCopy(insn: u32) Op {
             0b0111 => return Op{ .simd_umov = .{ .rd = rd, .rn = rn, .esize = idx.esize, .index = idx.index, .q = q } },
             else => return Op{ .unknown = insn },
         }
+    }
+    if (op == 1) {
+        // INS (element): Vd.T[dst] = Vn.T[src]. dst index from imm5, src index from imm4 >> log2(esize).
+        const size_log2: u3 = switch (idx.esize) { 1 => 0, 2 => 1, 4 => 2, 8 => 3, else => return Op{ .unknown = insn } };
+        const src_index: u5 = @truncate(@as(u32, imm4) >> size_log2);
+        return Op{ .simd_ins_elem = .{ .rd = rd, .rn = rn, .esize = idx.esize, .dst_index = idx.index, .src_index = src_index } };
     }
     return Op{ .unknown = insn };
 }

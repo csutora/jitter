@@ -70,6 +70,8 @@ export fn translator_translate_region(
     code_len: u32,
     shadow_base: u32,
     shared_monitor: u32,
+    protection: u32,
+    prot_base: u32,
 ) u32 {
     if (code_len > input_buf_size) return 1;
     arena_fba.reset();
@@ -86,6 +88,8 @@ export fn translator_translate_region(
     const opts: translate.Options = .{
         .shadow_base = shadow_base,
         .shared_monitor = shared_monitor != 0,
+        .protection = protection != 0,
+        .prot_base = prot_base,
     };
     const wasm_bytes = translate.translateRegion(arena_fba.allocator(), &region, opts) catch return 3;
 

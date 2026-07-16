@@ -835,6 +835,7 @@ export class Kernel {
         meta[3] = (resp as any).mtime ?? 0;
         meta[4] = (resp as any).uid ?? 0;
         meta[5] = (resp as any).gid ?? 0;
+        meta[6] = (resp as any).ino ?? 0; // st_ino — MUST be unique per file: ld.so dedups libs by it
       } else if (method === 'fs_readlink') {
         if ((resp as any).target) {
           rawData = new TextEncoder().encode((resp as any).target);

@@ -153,21 +153,28 @@ let bootStarted = false;
     if (btn) btn.style.display = 'none';
     statusBar.textContent = 'Booting...';
 
-    // Load busybox binary — via bridge in native app, via fetch in browser
-    let elfBytes: Uint8Array;
+    // Load the init binary. in the native app, boot the ACTIVE root's login shell so `jitter switch`
+    // boots the chosen distro (the worker's exec path is dynamic-aware, so alpine's musl /bin/sh just
+    // works). fall back to the bundled static busybox if the root has no shell yet (fresh install).
+    const b64ToBytes = (s: string) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+    let elfBytes: Uint8Array | null = null;
     if (bridge.isNative) {
-      term('[jitter] boot: loading busybox...\r\n');
-      const resp = await bridge.call('load_bundle_file', { name: 'busybox-aarch64' });
-      if (resp.error) throw new Error(`Failed to load busybox via bridge: ${resp.error}`);
-      const binary = atob(resp.data as string);
-      elfBytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) elfBytes[i] = binary.charCodeAt(i);
+      term('[jitter] boot: loading init shell...\r\n');
+      for (const p of ['/bin/sh', '/bin/busybox']) {
+        const r = await bridge.call('load_root_file', { path: p });
+        if (!r.error && typeof r.data === 'string') { elfBytes = b64ToBytes(r.data); break; }
+      }
+      if (!elfBytes) {
+        const resp = await bridge.call('load_bundle_file', { name: 'busybox-aarch64' });
+        if (resp.error) throw new Error(`Failed to load init shell (no root shell, no bundle): ${resp.error}`);
+        elfBytes = b64ToBytes(resp.data as string);
+      }
     } else {
       const resp = await fetch('busybox-aarch64');
       if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
       elfBytes = new Uint8Array(await resp.arrayBuffer());
     }
-    term(`[jitter] boot: busybox loaded (${elfBytes.length} bytes)\r\n`);
+    term(`[jitter] boot: init loaded (${elfBytes!.length} bytes)\r\n`);
 
     // ── Multicore path: use Kernel + Web Workers when cross-origin isolated ──
     if (!self.crossOriginIsolated) {
@@ -189,7 +196,7 @@ let bootStarted = false;
 
     const out = writeOutput!;
     const kernel = new Kernel({
-      elfBytes,
+      elfBytes: elfBytes!,
       workerURL: 'worker.js',
       onOutput: (data: Uint8Array) => {
         out(appendScrollbackWipeAfterClear(translateNewlines(data)));
@@ -224,8 +231,8 @@ let bootStarted = false;
 
     term('[jitter] boot: starting sh (if no prompt follows, the emulator/worker stalled)\r\n');
     kernel.boot(
-      ['sh'],
-      ['HOME=/root', 'TERM=xterm-256color', 'PATH=/bin', 'PWD=/'],
+      ['/bin/sh'],
+      ['HOME=/root', 'TERM=xterm-256color', 'PATH=/bin:/usr/bin:/sbin:/usr/sbin', 'PWD=/'],
     );
 
     statusBar.textContent = 'Running';

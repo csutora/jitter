@@ -153,24 +153,33 @@ final class NetworkBridge {
         guard !pendingReceives.contains(socketId) else { return }
         guard let buf = recvBuffers[socketId], buf.isEmpty else { return }
         guard !recvEOF.contains(socketId) else { return }
-        guard let conn = connections[socketId] else { return }
+        guard connections[socketId] != nil else { return }
 
         pendingReceives.insert(socketId)
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self = self else { return }
-            self.pendingReceives.remove(socketId)
-
-            if let data = data, !data.isEmpty {
-                if self.recvBuffers[socketId] != nil {
-                    self.recvBuffers[socketId]!.append(data)
-                } else {
-                    self.recvBuffers[socketId] = data
-                }
+        // flush any buffered request first — non-blocking clients (apk/openssl) write the request and
+        // then poll for the reply without ever issuing a blocking read, so this is the only place the
+        // send gets pushed out. without it we wait forever for a response the peer never asked for.
+        flushSendBuffer(socketId: socketId) { [weak self] in
+            guard let self = self, let conn = self.connections[socketId] else {
+                self?.pendingReceives.remove(socketId)
+                return
             }
-            // For TCP, isComplete means connection closed (EOF).
-            // For UDP, isComplete just means "datagram fully received" — NOT EOF.
-            if isComplete && self.socketTypes[socketId] != 2 {
-                self.recvEOF.insert(socketId)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+                guard let self = self else { return }
+                self.pendingReceives.remove(socketId)
+
+                if let data = data, !data.isEmpty {
+                    if self.recvBuffers[socketId] != nil {
+                        self.recvBuffers[socketId]!.append(data)
+                    } else {
+                        self.recvBuffers[socketId] = data
+                    }
+                }
+                // For TCP, isComplete means connection closed (EOF).
+                // For UDP, isComplete just means "datagram fully received" — NOT EOF.
+                if isComplete && self.socketTypes[socketId] != 2 {
+                    self.recvEOF.insert(socketId)
+                }
             }
         }
     }
@@ -178,6 +187,10 @@ final class NetworkBridge {
     // MARK: - Poll (check buffer, optionally wait with timeout)
 
     func poll(socketId: Int, timeoutMs: Int, completion: @escaping ([String: Any]) -> Void) {
+        // always push any buffered request out first. non-blocking clients (apk/openssl over TLS) write
+        // the request then poll for the reply without a blocking read, and startBackgroundReceive skips
+        // the flush when a receive is already pending — so this is the only point the send is guaranteed.
+        flushSendBuffer(socketId: socketId) { }
         // Check if data is already buffered
         if let buf = recvBuffers[socketId], !buf.isEmpty {
             completion(["ret": 1])

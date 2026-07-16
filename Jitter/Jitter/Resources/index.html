@@ -947,6 +947,7 @@ var Kernel = class {
         meta[3] = resp.mtime ?? 0;
         meta[4] = resp.uid ?? 0;
         meta[5] = resp.gid ?? 0;
+        meta[6] = resp.ino ?? 0;
       } else if (method === "fs_readlink") {
         if (resp.target) {
           rawData = new TextEncoder().encode(resp.target);
@@ -1126,20 +1127,33 @@ window.bootShell = async () => {
     statusBar.classList.add("active");
     if (btn) btn.style.display = "none";
     statusBar.textContent = "Booting...";
-    let elfBytes;
+    const b64ToBytes = (s) => {
+      const bin = atob(s);
+      const u = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      return u;
+    };
+    let elfBytes = null;
     if (bridge.isNative) {
-      term("[jitter] boot: loading busybox...\r\n");
-      const resp = await bridge.call("load_bundle_file", { name: "busybox-aarch64" });
-      if (resp.error) throw new Error(`Failed to load busybox via bridge: ${resp.error}`);
-      const binary = atob(resp.data);
-      elfBytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) elfBytes[i] = binary.charCodeAt(i);
+      term("[jitter] boot: loading init shell...\r\n");
+      for (const p of ["/bin/sh", "/bin/busybox"]) {
+        const r = await bridge.call("load_root_file", { path: p });
+        if (!r.error && typeof r.data === "string") {
+          elfBytes = b64ToBytes(r.data);
+          break;
+        }
+      }
+      if (!elfBytes) {
+        const resp = await bridge.call("load_bundle_file", { name: "busybox-aarch64" });
+        if (resp.error) throw new Error(`Failed to load init shell (no root shell, no bundle): ${resp.error}`);
+        elfBytes = b64ToBytes(resp.data);
+      }
     } else {
       const resp = await fetch("busybox-aarch64");
       if (!resp.ok) throw new Error(`Failed to fetch busybox: ${resp.status}`);
       elfBytes = new Uint8Array(await resp.arrayBuffer());
     }
-    term(`[jitter] boot: busybox loaded (${elfBytes.length} bytes)\r
+    term(`[jitter] boot: init loaded (${elfBytes.length} bytes)\r
 `);
     if (!self.crossOriginIsolated) {
       throw new Error(
@@ -1186,8 +1200,8 @@ window.bootShell = async () => {
     }
     term("[jitter] boot: starting sh (if no prompt follows, the emulator/worker stalled)\r\n");
     kernel.boot(
-      ["sh"],
-      ["HOME=/root", "TERM=xterm-256color", "PATH=/bin", "PWD=/"]
+      ["/bin/sh"],
+      ["HOME=/root", "TERM=xterm-256color", "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "PWD=/"]
     );
     statusBar.textContent = "Running";
   } catch (err) {

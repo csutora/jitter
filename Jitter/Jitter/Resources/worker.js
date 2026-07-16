@@ -1191,6 +1191,229 @@
     };
   }
 
+  // src/crypto-ext.ts
+  var SBOX = new Uint8Array(256);
+  var INV_SBOX = new Uint8Array(256);
+  var GF_EXP = new Uint8Array(256);
+  var GF_LOG = new Uint8Array(256);
+  (function buildAesTables() {
+    let x = 1;
+    for (let i = 0; i < 255; i++) {
+      GF_EXP[i] = x;
+      GF_LOG[x] = i;
+      let hi = x & 128;
+      x = x << 1 & 255 ^ (hi ? 27 : 0) ^ x;
+    }
+    GF_EXP[255] = GF_EXP[0];
+    const rotl8 = (b, n) => (b << n | b >>> 8 - n) & 255;
+    for (let a = 0; a < 256; a++) {
+      const inv = a === 0 ? 0 : GF_EXP[255 - GF_LOG[a]];
+      const s = inv ^ rotl8(inv, 1) ^ rotl8(inv, 2) ^ rotl8(inv, 3) ^ rotl8(inv, 4) ^ 99;
+      SBOX[a] = s & 255;
+      INV_SBOX[s & 255] = a;
+    }
+    if (SBOX[0] !== 99 || SBOX[1] !== 124 || SBOX[83] !== 237 || SBOX[255] !== 22) {
+      throw new Error("AES S-box generation failed self-check");
+    }
+  })();
+  var SHIFT_ROWS = [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11];
+  var INV_SHIFT_ROWS = new Array(16);
+  for (let i = 0; i < 16; i++) INV_SHIFT_ROWS[SHIFT_ROWS[i]] = i;
+  function gmul(a, b) {
+    if (a === 0 || b === 0) return 0;
+    return GF_EXP[(GF_LOG[a] + GF_LOG[b]) % 255];
+  }
+  function mixColumn(s02, s12, s2, s3, out, off, m) {
+    out[off + 0] = gmul(s02, m[0]) ^ gmul(s12, m[1]) ^ gmul(s2, m[2]) ^ gmul(s3, m[3]);
+    out[off + 1] = gmul(s02, m[3]) ^ gmul(s12, m[0]) ^ gmul(s2, m[1]) ^ gmul(s3, m[2]);
+    out[off + 2] = gmul(s02, m[2]) ^ gmul(s12, m[3]) ^ gmul(s2, m[0]) ^ gmul(s3, m[1]);
+    out[off + 3] = gmul(s02, m[1]) ^ gmul(s12, m[2]) ^ gmul(s2, m[3]) ^ gmul(s3, m[0]);
+  }
+  var MIX = [2, 3, 1, 1];
+  var INV_MIX = [14, 11, 13, 9];
+  function aese(buf, vdA, vnA) {
+    const t = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) t[i] = SBOX[buf[vdA + i] ^ buf[vnA + i]];
+    for (let i = 0; i < 16; i++) buf[vdA + i] = t[SHIFT_ROWS[i]];
+  }
+  function aesd(buf, vdA, vnA) {
+    const t = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) t[i] = INV_SBOX[buf[vdA + i] ^ buf[vnA + i]];
+    for (let i = 0; i < 16; i++) buf[vdA + i] = t[INV_SHIFT_ROWS[i]];
+  }
+  function aesmc(buf, vdA, vnA) {
+    const out = new Uint8Array(16);
+    for (let c = 0; c < 4; c++) mixColumn(buf[vnA + c * 4], buf[vnA + c * 4 + 1], buf[vnA + c * 4 + 2], buf[vnA + c * 4 + 3], out, c * 4, MIX);
+    buf.set(out, vdA);
+  }
+  function aesimc(buf, vdA, vnA) {
+    const out = new Uint8Array(16);
+    for (let c = 0; c < 4; c++) mixColumn(buf[vnA + c * 4], buf[vnA + c * 4 + 1], buf[vnA + c * 4 + 2], buf[vnA + c * 4 + 3], out, c * 4, INV_MIX);
+    buf.set(out, vdA);
+  }
+  function readU64(buf, base) {
+    let v = 0n;
+    for (let k = 0; k < 8; k++) v |= BigInt(buf[base + k]) << BigInt(k * 8);
+    return v;
+  }
+  function pmull(buf, vdA, vnA, vmA, part) {
+    const a = readU64(buf, vnA + (part ? 8 : 0));
+    const b = readU64(buf, vmA + (part ? 8 : 0));
+    let res = 0n;
+    for (let i = 0n; i < 64n; i++) {
+      if (a >> i & 1n) res ^= b << i;
+    }
+    for (let k = 0; k < 16; k++) buf[vdA + k] = Number(res >> BigInt(k * 8) & 0xffn);
+  }
+  function writeU64(buf, base, v) {
+    for (let k = 0; k < 8; k++) buf[base + k] = Number(v >> BigInt(k * 8) & 0xffn);
+  }
+  function w32(buf, base, i) {
+    const o = base + 4 * i;
+    return (buf[o] | buf[o + 1] << 8 | buf[o + 2] << 16 | buf[o + 3] << 24) >>> 0;
+  }
+  function setW32(buf, base, i, v) {
+    const o = base + 4 * i;
+    buf[o] = v & 255;
+    buf[o + 1] = v >>> 8 & 255;
+    buf[o + 2] = v >>> 16 & 255;
+    buf[o + 3] = v >>> 24 & 255;
+  }
+  var ror32 = (x, n) => (x >>> n | x << 32 - n) >>> 0;
+  var rol32 = (x, n) => ror32(x, 32 - n);
+  var cho1 = (x, y, z) => (x & (y ^ z) ^ z) >>> 0;
+  var par1 = (x, y, z) => (x ^ y ^ z) >>> 0;
+  var maj1 = (x, y, z) => (x & y | (x | y) & z) >>> 0;
+  function sha1_3reg(buf, vdA, vnA, vmA, variant) {
+    const d = [w32(buf, vdA, 0), w32(buf, vdA, 1), w32(buf, vdA, 2), w32(buf, vdA, 3)];
+    let n0 = w32(buf, vnA, 0);
+    const m = [w32(buf, vmA, 0), w32(buf, vmA, 1), w32(buf, vmA, 2), w32(buf, vmA, 3)];
+    for (let i = 0; i < 4; i++) {
+      const fn = variant === 0 ? cho1(d[1], d[2], d[3]) : variant === 1 ? par1(d[1], d[2], d[3]) : maj1(d[1], d[2], d[3]);
+      const t = fn + rol32(d[0], 5) + n0 + m[i] >>> 0;
+      n0 = d[3];
+      d[3] = d[2];
+      d[2] = ror32(d[1], 2);
+      d[1] = d[0];
+      d[0] = t;
+    }
+    for (let i = 0; i < 4; i++) setW32(buf, vdA, i, d[i]);
+  }
+  function sha1h(buf, vdA, vnA) {
+    const v = ror32(w32(buf, vnA, 0), 2);
+    setW32(buf, vdA, 0, v);
+    setW32(buf, vdA, 1, 0);
+    setW32(buf, vdA, 2, 0);
+    setW32(buf, vdA, 3, 0);
+  }
+  function sha1su0(buf, vdA, vnA, vmA) {
+    const d0 = readU64(buf, vdA + 8) ^ readU64(buf, vdA) ^ readU64(buf, vmA);
+    const d1 = readU64(buf, vnA) ^ readU64(buf, vdA + 8) ^ readU64(buf, vmA + 8);
+    writeU64(buf, vdA, d0);
+    writeU64(buf, vdA + 8, d1);
+  }
+  function sha1su1(buf, vdA, vnA) {
+    const d = [w32(buf, vdA, 0), w32(buf, vdA, 1), w32(buf, vdA, 2), w32(buf, vdA, 3)];
+    const m = [w32(buf, vnA, 0), w32(buf, vnA, 1), w32(buf, vnA, 2), w32(buf, vnA, 3)];
+    d[0] = rol32((d[0] ^ m[1]) >>> 0, 1);
+    d[1] = rol32((d[1] ^ m[2]) >>> 0, 1);
+    d[2] = rol32((d[2] ^ m[3]) >>> 0, 1);
+    d[3] = rol32((d[3] ^ d[0]) >>> 0, 1);
+    for (let i = 0; i < 4; i++) setW32(buf, vdA, i, d[i]);
+  }
+  var S0 = (x) => (ror32(x, 2) ^ ror32(x, 13) ^ ror32(x, 22)) >>> 0;
+  var S1 = (x) => (ror32(x, 6) ^ ror32(x, 11) ^ ror32(x, 25)) >>> 0;
+  var s0 = (x) => (ror32(x, 7) ^ ror32(x, 18) ^ x >>> 3) >>> 0;
+  var s1 = (x) => (ror32(x, 17) ^ ror32(x, 19) ^ x >>> 10) >>> 0;
+  function sha256h(buf, vdA, vnA, vmA, part2) {
+    const d = [w32(buf, vdA, 0), w32(buf, vdA, 1), w32(buf, vdA, 2), w32(buf, vdA, 3)];
+    const n = [w32(buf, vnA, 0), w32(buf, vnA, 1), w32(buf, vnA, 2), w32(buf, vnA, 3)];
+    const m = [w32(buf, vmA, 0), w32(buf, vmA, 1), w32(buf, vmA, 2), w32(buf, vmA, 3)];
+    if (!part2) {
+      for (let i = 0; i < 4; i++) {
+        let t = cho1(n[0], n[1], n[2]) + n[3] + S1(n[0]) + m[i] >>> 0;
+        n[3] = n[2];
+        n[2] = n[1];
+        n[1] = n[0];
+        n[0] = d[3] + t >>> 0;
+        t = t + maj1(d[0], d[1], d[2]) + S0(d[0]) >>> 0;
+        d[3] = d[2];
+        d[2] = d[1];
+        d[1] = d[0];
+        d[0] = t;
+      }
+    } else {
+      for (let i = 0; i < 4; i++) {
+        const t = cho1(d[0], d[1], d[2]) + d[3] + S1(d[0]) + m[i] >>> 0;
+        d[3] = d[2];
+        d[2] = d[1];
+        d[1] = d[0];
+        d[0] = n[3 - i] + t >>> 0;
+      }
+    }
+    for (let i = 0; i < 4; i++) setW32(buf, vdA, i, d[i]);
+  }
+  function sha256su0(buf, vdA, vnA) {
+    const d = [w32(buf, vdA, 0), w32(buf, vdA, 1), w32(buf, vdA, 2), w32(buf, vdA, 3)];
+    const m0 = w32(buf, vnA, 0);
+    setW32(buf, vdA, 0, d[0] + s0(d[1]) >>> 0);
+    setW32(buf, vdA, 1, d[1] + s0(d[2]) >>> 0);
+    setW32(buf, vdA, 2, d[2] + s0(d[3]) >>> 0);
+    setW32(buf, vdA, 3, d[3] + s0(m0) >>> 0);
+  }
+  function sha256su1(buf, vdA, vnA, vmA) {
+    const d = [w32(buf, vdA, 0), w32(buf, vdA, 1), w32(buf, vdA, 2), w32(buf, vdA, 3)];
+    const n = [w32(buf, vnA, 0), w32(buf, vnA, 1), w32(buf, vnA, 2), w32(buf, vnA, 3)];
+    const m = [w32(buf, vmA, 0), w32(buf, vmA, 1), w32(buf, vmA, 2), w32(buf, vmA, 3)];
+    d[0] = d[0] + s1(m[2]) + n[1] >>> 0;
+    d[1] = d[1] + s1(m[3]) + n[2] >>> 0;
+    d[2] = d[2] + s1(d[0]) + n[3] >>> 0;
+    d[3] = d[3] + s1(d[1]) + m[0] >>> 0;
+    for (let i = 0; i < 4; i++) setW32(buf, vdA, i, d[i]);
+  }
+  var M64 = 0xffffffffffffffffn;
+  var ror64 = (x, n) => (x >> n | x << 64n - n) & M64;
+  var cho512 = (x, y, z) => (x & (y ^ z) ^ z) & M64;
+  var maj512 = (x, y, z) => (x & y | (x | y) & z) & M64;
+  var S0_512 = (x) => (ror64(x, 28n) ^ ror64(x, 34n) ^ ror64(x, 39n)) & M64;
+  var S1_512 = (x) => (ror64(x, 14n) ^ ror64(x, 18n) ^ ror64(x, 41n)) & M64;
+  var s0_512 = (x) => (ror64(x, 1n) ^ ror64(x, 8n) ^ x >> 7n) & M64;
+  var s1_512 = (x) => (ror64(x, 19n) ^ ror64(x, 61n) ^ x >> 6n) & M64;
+  function sha512h(buf, vdA, vnA, vmA) {
+    let d0 = readU64(buf, vdA);
+    let d1 = readU64(buf, vdA + 8);
+    const n0 = readU64(buf, vnA), n1 = readU64(buf, vnA + 8);
+    const m0 = readU64(buf, vmA), m1 = readU64(buf, vmA + 8);
+    d1 = d1 + S1_512(m1) + cho512(m1, n0, n1) & M64;
+    const t = d1 + m0 & M64;
+    d0 = d0 + S1_512(t) + cho512(t, m1, n0) & M64;
+    writeU64(buf, vdA, d0);
+    writeU64(buf, vdA + 8, d1);
+  }
+  function sha512h2(buf, vdA, vnA, vmA) {
+    let d0 = readU64(buf, vdA);
+    let d1 = readU64(buf, vdA + 8);
+    const n0 = readU64(buf, vnA);
+    const m0 = readU64(buf, vmA), m1 = readU64(buf, vmA + 8);
+    d1 = d1 + S0_512(m0) + maj512(n0, m1, m0) & M64;
+    d0 = d0 + S0_512(d1) + maj512(d1, m0, m1) & M64;
+    writeU64(buf, vdA, d0);
+    writeU64(buf, vdA + 8, d1);
+  }
+  function sha512su0(buf, vdA, vnA) {
+    const d0 = readU64(buf, vdA), d1 = readU64(buf, vdA + 8);
+    const n0 = readU64(buf, vnA);
+    writeU64(buf, vdA, d0 + s0_512(d1) & M64);
+    writeU64(buf, vdA + 8, d1 + s0_512(n0) & M64);
+  }
+  function sha512su1(buf, vdA, vnA, vmA) {
+    const d0 = readU64(buf, vdA), d1 = readU64(buf, vdA + 8);
+    const n0 = readU64(buf, vnA), n1 = readU64(buf, vnA + 8);
+    const m0 = readU64(buf, vmA), m1 = readU64(buf, vmA + 8);
+    writeU64(buf, vdA, d0 + s1_512(n0) + m0 & M64);
+    writeU64(buf, vdA + 8, d1 + s1_512(n1) + m1 & M64);
+  }
+
   // src/helpers.ts
   var _fpBuf = new ArrayBuffer(8);
   var _f64View = new Float64Array(_fpBuf);
@@ -1339,6 +1562,30 @@
   var SIMD_ADDHN = 73;
   var SIMD_UMINP = 22;
   var SIMD_EXT = 74;
+  var SIMD_REV = 76;
+  var SIMD_RBIT = 77;
+  var SIMD_IDX_MUL = 78;
+  var SIMD_XTN = 79;
+  var SIMD_AESE = 80;
+  var SIMD_AESD = 81;
+  var SIMD_AESMC = 82;
+  var SIMD_AESIMC = 83;
+  var SIMD_PMULL = 84;
+  var SIMD_SHA1C = 85;
+  var SIMD_SHA1P = 86;
+  var SIMD_SHA1M = 87;
+  var SIMD_SHA1H = 88;
+  var SIMD_SHA1SU0 = 89;
+  var SIMD_SHA1SU1 = 90;
+  var SIMD_SHA256H = 91;
+  var SIMD_SHA256H2 = 92;
+  var SIMD_SHA256SU0 = 93;
+  var SIMD_SHA256SU1 = 94;
+  var SIMD_SHA512H = 95;
+  var SIMD_SHA512H2 = 96;
+  var SIMD_SHA512SU0 = 97;
+  var SIMD_SHA512SU1 = 98;
+  var SIMD_LDST1_SINGLE = 99;
   function createSimdOp(memory2) {
     return function simd_op(packed, _extra) {
       const op = Number(packed >> 56n & 0xFFn);
@@ -1436,6 +1683,194 @@
         const out = new Uint8Array(16);
         for (let i = 0; i < w; i++) out[i] = concat[index + i];
         for (let k = 0; k < 16; k++) buf[vdA + k] = out[k];
+        return 0n;
+      }
+      if (op === SIMD_REV) {
+        const w = Q ? 16 : 8;
+        const container = extra;
+        const es = 1 << size;
+        const nElems = container / es;
+        const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+        const src = new Uint8Array(16);
+        src.set(buf.subarray(vnA, vnA + 16));
+        for (let i = 0; i < 16; i++) {
+          if (i >= w) {
+            buf[vdA + i] = 0;
+            continue;
+          }
+          const base = Math.floor(i / container) * container;
+          const pos = i % container;
+          const srcPos = base + (nElems - 1 - Math.floor(pos / es)) * es + pos % es;
+          buf[vdA + i] = src[srcPos];
+        }
+        return 0n;
+      }
+      if (op === SIMD_RBIT) {
+        const w = Q ? 16 : 8;
+        const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+        const src = new Uint8Array(16);
+        src.set(buf.subarray(vnA, vnA + 16));
+        for (let i = 0; i < 16; i++) {
+          if (i >= w) {
+            buf[vdA + i] = 0;
+            continue;
+          }
+          let b = src[i], r = 0;
+          for (let k = 0; k < 8; k++) {
+            r = r << 1 | b & 1;
+            b >>= 1;
+          }
+          buf[vdA + i] = r;
+        }
+        return 0n;
+      }
+      if (op === SIMD_XTN) {
+        const destEs = 1 << size;
+        const srcEs = destEs * 2;
+        const n = 8 / destEs;
+        const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+        const src = new Uint8Array(16);
+        src.set(buf.subarray(vnA, vnA + 16));
+        const half = new Uint8Array(8);
+        for (let j = 0; j < n; j++) {
+          for (let k = 0; k < destEs; k++) half[j * destEs + k] = src[j * srcEs + k];
+        }
+        if (Q) {
+          for (let k = 0; k < 8; k++) buf[vdA + 8 + k] = half[k];
+        } else {
+          for (let k = 0; k < 8; k++) buf[vdA + k] = half[k];
+          for (let k = 8; k < 16; k++) buf[vdA + k] = 0;
+        }
+        return 0n;
+      }
+      if (op === SIMD_AESE) {
+        aese(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16);
+        return 0n;
+      }
+      if (op === SIMD_AESD) {
+        aesd(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16);
+        return 0n;
+      }
+      if (op === SIMD_AESMC) {
+        aesmc(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16);
+        return 0n;
+      }
+      if (op === SIMD_AESIMC) {
+        aesimc(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16);
+        return 0n;
+      }
+      if (op === SIMD_PMULL) {
+        pmull(buf, V_OFFSET + rd * 16, V_OFFSET + rn * 16, V_OFFSET + rm * 16, Q === 1);
+        return 0n;
+      }
+      const D = V_OFFSET + rd * 16, N = V_OFFSET + rn * 16, Mv = V_OFFSET + rm * 16;
+      if (op === SIMD_SHA1C) {
+        sha1_3reg(buf, D, N, Mv, 0);
+        return 0n;
+      }
+      if (op === SIMD_SHA1P) {
+        sha1_3reg(buf, D, N, Mv, 1);
+        return 0n;
+      }
+      if (op === SIMD_SHA1M) {
+        sha1_3reg(buf, D, N, Mv, 2);
+        return 0n;
+      }
+      if (op === SIMD_SHA1H) {
+        sha1h(buf, D, N);
+        return 0n;
+      }
+      if (op === SIMD_SHA1SU0) {
+        sha1su0(buf, D, N, Mv);
+        return 0n;
+      }
+      if (op === SIMD_SHA1SU1) {
+        sha1su1(buf, D, N);
+        return 0n;
+      }
+      if (op === SIMD_SHA256H) {
+        sha256h(buf, D, N, Mv, false);
+        return 0n;
+      }
+      if (op === SIMD_SHA256H2) {
+        sha256h(buf, D, N, Mv, true);
+        return 0n;
+      }
+      if (op === SIMD_SHA256SU0) {
+        sha256su0(buf, D, N);
+        return 0n;
+      }
+      if (op === SIMD_SHA256SU1) {
+        sha256su1(buf, D, N, Mv);
+        return 0n;
+      }
+      if (op === SIMD_SHA512H) {
+        sha512h(buf, D, N, Mv);
+        return 0n;
+      }
+      if (op === SIMD_SHA512H2) {
+        sha512h2(buf, D, N, Mv);
+        return 0n;
+      }
+      if (op === SIMD_SHA512SU0) {
+        sha512su0(buf, D, N);
+        return 0n;
+      }
+      if (op === SIMD_SHA512SU1) {
+        sha512su1(buf, D, N, Mv);
+        return 0n;
+      }
+      if (op === SIMD_LDST1_SINGLE) {
+        const esize2 = 1 << size;
+        const index = extra & 15;
+        const isLoad = extra >> 4 & 1;
+        const isPost = extra >> 5 & 1;
+        const gv = new DataView(memory2.buffer);
+        const addr = Number(gv.getBigUint64(rn * 8, true)) + GUEST_MEM_BASE;
+        const laneAddr = V_OFFSET + rd * 16 + index * esize2;
+        if (isLoad) for (let k = 0; k < esize2; k++) buf[laneAddr + k] = buf[addr + k];
+        else for (let k = 0; k < esize2; k++) buf[addr + k] = buf[laneAddr + k];
+        if (isPost) {
+          const inc = rm === 31 ? esize2 : Number(gv.getBigUint64(rm * 8, true));
+          gv.setBigUint64(rn * 8, gv.getBigUint64(rn * 8, true) + BigInt(inc), true);
+        }
+        return 0n;
+      }
+      if (op === SIMD_IDX_MUL) {
+        const srcEs = 1 << size;
+        const uns = (extra >> 6 & 1) === 1;
+        const variant = extra >> 3 & 7;
+        const idx = extra & 7;
+        const widening = variant >= 3;
+        const isSub = variant === 2 || variant === 5;
+        const isAcc = variant !== 0 && variant !== 3;
+        const destEs = widening ? srcEs * 2 : srcEs;
+        const vnA = V_OFFSET + rn * 16, vmA = V_OFFSET + rm * 16, vdA = V_OFFSET + rd * 16;
+        const oldVd = new Uint8Array(16);
+        oldVd.set(buf.subarray(vdA, vdA + 16));
+        const readEl = (b, base, es, i, signed) => {
+          let v = 0n;
+          for (let k = 0; k < es; k++) v |= BigInt(b[base + i * es + k]) << BigInt(k * 8);
+          if (signed) {
+            const bits3 = BigInt(es * 8);
+            if (v >= 1n << bits3 - 1n) v -= 1n << bits3;
+          }
+          return v;
+        };
+        const elem = readEl(buf, vmA, srcEs, idx, !uns);
+        const nDest = widening ? 16 / destEs : (Q ? 16 : 8) / srcEs;
+        const srcBase = widening && Q ? nDest : 0;
+        const out = new Uint8Array(16);
+        for (let j = 0; j < nDest; j++) {
+          let prod = BigInt.asUintN(destEs * 8, readEl(buf, vnA, srcEs, srcBase + j, !uns) * elem);
+          if (isAcc) {
+            let acc = 0n;
+            for (let k = 0; k < destEs; k++) acc |= BigInt(oldVd[j * destEs + k]) << BigInt(k * 8);
+            prod = BigInt.asUintN(destEs * 8, isSub ? acc - prod : acc + prod);
+          }
+          for (let k = 0; k < destEs; k++) out[j * destEs + k] = Number(prod >> BigInt(k * 8) & 0xffn);
+        }
+        buf.set(out, vdA);
         return 0n;
       }
       const vn = V_OFFSET + rn * 16;
@@ -1945,7 +2380,8 @@
   var SIGNAL_TRAMPOLINE = 4096;
   var SIG_IGNORE_DEFAULT = /* @__PURE__ */ new Set([SIGCHLD, 17, 20]);
   var SIG_STOP_DEFAULT = /* @__PURE__ */ new Set([19, 20, 21, 22]);
-  var SIGNAL_FRAME_SIZE = 288;
+  var SIGNAL_FRAME_V_OFFSET = 288;
+  var SIGNAL_FRAME_SIZE = SIGNAL_FRAME_V_OFFSET + 512;
   var TCGETS = 21505;
   var TCSETS = 21506;
   var TIOCGWINSZ = 21523;
@@ -1956,7 +2392,15 @@
   var F_GETFL = 3;
   var F_SETFL = 4;
   var F_DUPFD_CLOEXEC = 1030;
+  var NET_TRACE = false;
+  var FD_TRACE = false;
   var SyscallHandler = class {
+    nt(s) {
+      if (NET_TRACE) this.io.writeStderr(new TextEncoder().encode("[net] " + s + "\n"));
+    }
+    ft(s) {
+      if (FD_TRACE) this.io.writeStderr(new TextEncoder().encode("[fd] " + s + "\n"));
+    }
     brk;
     // the exclusive-monitor shadow lives at ZIG_SHADOW_BASE (32MB) and is tiny
     // (1 byte per 512 guest bytes, so <=256KB for a 128MB guest). reserve [32MB,33MB)
@@ -1972,6 +2416,10 @@
     // MAP_SHARED regions (guest offsets). shared across fork: a child's writes to these
     // must survive the parent-memory restore in the serialized fork model.
     sharedRegions = [];
+    // writable MAP_SHARED mappings of real (native) files. the guest writes into the mapping and
+    // expects those bytes flushed back to the file on msync/munmap (this is how apk extracts
+    // binaries). we track them and pwrite the dirty range through the bridge on flush.
+    fileMmaps = [];
     // guest ranges mapped PROT_NONE (inaccessible). a user pointer landing here faults with
     // EFAULT, which is how LTP's tst_get_bad_addr() probes are built.
     protNone = [];
@@ -2092,6 +2540,41 @@
      * JS VFS handles: /proc, /dev (virtual, per-process)
      * Native Swift handles: everything else (/bin, /etc, /tmp, /root, /home, /var, /usr, ...)
      */
+    // resolve an *at()-family path against its dirfd. absolute paths and AT_FDCWD (-100) pass through
+    // (bridgePath/vfs resolve them against cwd). otherwise the path is relative to the directory the
+    // fd refers to, so join it onto that fd's known path. apk loads trust keys via openat(keys_fd, name),
+    // so without this the keys never open and every index signature reads as UNTRUSTED.
+    resolveAt(dirfd, path) {
+      if (path.startsWith("/")) return path;
+      const d = Number(BigInt.asIntN(64, dirfd));
+      if (d === -100) return path;
+      const base = this.getFdEntry(d)?.path;
+      if (typeof base === "string" && base.length) return (base.endsWith("/") ? base : base + "/") + path;
+      return path;
+    }
+    // flush a writable MAP_SHARED native-file mapping back to disk on msync/munmap. finds the mapping
+    // overlapping [reqStart, reqStart+reqLen), pwrites its dirty (real-file) bytes through the bridge,
+    // and drops the record when unmapping. returns a bridge action, or null if nothing to flush.
+    buildMmapFlush(cpu2, memory2, reqStart, reqLen, removeAfter) {
+      for (let i = 0; i < this.fileMmaps.length; i++) {
+        const m = this.fileMmaps[i];
+        if (reqStart >= m.start + m.len || reqStart + reqLen <= m.start) continue;
+        if (removeAfter) this.fileMmaps.splice(i, 1);
+        const fStart = Math.max(reqStart, m.start);
+        const fEnd = Math.min(reqStart + reqLen, m.start + m.fileLen);
+        if (fEnd <= fStart) return null;
+        const data = new Uint8Array(memory2.buffer).slice(fStart + GUEST_MEM_BASE, fEnd + GUEST_MEM_BASE);
+        return {
+          status: "bridge",
+          method: "fs_pwrite",
+          args: { fd: m.nativeFd, offset: m.fileOffset + (fStart - m.start), data: bytesToBase64(data) },
+          apply: () => {
+            cpu2.setReg(0, 0n);
+          }
+        };
+      }
+      return null;
+    }
     bridgePath(path) {
       if (!this.bridge?.isNative && !this.bridgeAvailable) return null;
       let resolved = path;
@@ -2179,6 +2662,12 @@
       view.setBigUint64(frameBase + 264, cpu2.getNZCV(), true);
       view.setUint32(frameBase + 272, signum, true);
       view.setBigUint64(frameBase + 280, this.signalMask ?? 0n, true);
+      {
+        const vBase = cpu2.base + V_OFFSET;
+        for (let i = 0; i < 512; i += 8) {
+          view.setBigUint64(frameBase + SIGNAL_FRAME_V_OFFSET + i, view.getBigUint64(vBase + i, true), true);
+        }
+      }
       const flags = handler?.flags ?? 0n;
       let newMask = (this.signalMask ?? 0n) | (handler?.mask ?? 0n);
       if ((flags & 0x40000000n) === 0n) newMask |= 1n << BigInt(signum - 1);
@@ -2201,6 +2690,12 @@
       const savedPC = view.getBigUint64(frameBase + 256, true);
       const savedNZCV = view.getBigUint64(frameBase + 264, true);
       this.signalMask = view.getBigUint64(frameBase + 280, true);
+      {
+        const vBase = cpu2.base + V_OFFSET;
+        for (let i = 0; i < 512; i += 8) {
+          view.setBigUint64(vBase + i, view.getBigUint64(frameBase + SIGNAL_FRAME_V_OFFSET + i, true), true);
+        }
+      }
       cpu2.setSP(savedSP);
       cpu2.setNZCV(savedNZCV);
       return savedPC;
@@ -2388,7 +2883,7 @@
       return fd;
     }
     allocFd() {
-      return this.lowestFreeFd(3);
+      return this.lowestFreeFd(0);
     }
     /** true if a new fd (>= min) can be allocated within RLIMIT_NOFILE. */
     fdAvailable(min = 3) {
@@ -2460,7 +2955,8 @@
         case "native":
           return true;
         case "socket":
-          return false;
+          return true;
+        // connected TCP sockets accept writes (net_write queues via NWConnection)
         case "eventfd":
           return entry.counter < 0xFFFFFFFFFFFFFFFEn;
         case "inotify":
@@ -2509,6 +3005,7 @@
       const view = new DataView(memory2.buffer);
       const bytes = new Uint8Array(memory2.buffer);
       let ret;
+      if (NET_TRACE && this._netActive && nr !== 64 && nr !== 66 && nr !== 63) this.nt(`sys ${nr} a0=${Number(a0 & 0xffffn)}`);
       switch (nr) {
         // ── Process lifecycle ──
         case 93:
@@ -2666,10 +3163,11 @@
               break;
             }
             if (readEntry.type === "native") {
+              const rcount = Math.min(count, 12288);
               return {
                 status: "bridge",
                 method: "fs_read",
-                args: { fd: readEntry.nativeFd, count },
+                args: { fd: readEntry.nativeFd, count: rcount },
                 apply: (resp) => {
                   if (resp.ret < 0) {
                     cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
@@ -2684,18 +3182,21 @@
               };
             }
             if (readEntry.type === "socket") {
+              const scount = Math.min(count, 12288);
               return {
                 status: "bridge",
                 method: "net_read",
-                args: { socketId: readEntry.socketId, count },
+                args: { socketId: readEntry.socketId, count: scount },
                 apply: (resp) => {
                   if (resp.ret < 0) {
+                    this.nt(`read fd=${fd} req=${count} -> err ${resp.ret}`);
                     cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
                   } else if (resp.data) {
                     const decoded = Uint8Array.from(atob(resp.data), (c) => c.charCodeAt(0));
                     bytes.set(decoded, buf + GUEST_MEM_BASE);
                     cpu2.setReg(0, BigInt(decoded.length));
                   } else {
+                    this.nt(`read fd=${fd} req=${count} -> EOF/0 (ret=${resp.ret})`);
                     cpu2.setReg(0, BigInt(resp.ret));
                   }
                 }
@@ -2769,6 +3270,7 @@
             if (writeEntry.type === "socket") {
               const sockWriteData = bytes.slice(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
               const sockB64 = bytesToBase64(sockWriteData);
+              this.nt(`write fd=${fd} len=${count}`);
               return {
                 status: "bridge",
                 method: "net_write",
@@ -2832,6 +3334,7 @@
               off += len;
             }
             const b64 = bytesToBase64(combined);
+            this.nt(`writev fd=${fd} totalLen=${totalLen}`);
             return {
               status: "bridge",
               method: "net_write",
@@ -2931,7 +3434,8 @@
           const prBuf = Number(a1);
           const prCount = Number(a2);
           const prOffset = BigInt.asIntN(64, a3);
-          if (this.vfs) {
+          const prEntry = this.fdTable.get(prFd);
+          if (this.vfs && this.vfs.hasFd(prFd)) {
             const savedPos = this.vfs.lseek(prFd, 0n, 1);
             if (savedPos < 0n) {
               ret = savedPos;
@@ -2941,6 +3445,10 @@
             const n = this.vfs.read(prFd, prBuf, prCount, view);
             this.vfs.lseek(prFd, savedPos, 0);
             ret = BigInt(n);
+          } else if (prEntry?.type === "native" && this.io.readFileAt) {
+            const data = this.io.readFileAt(prEntry.nativeFd, Number(prOffset), prCount);
+            new Uint8Array(memory2.buffer).set(data, prBuf + GUEST_MEM_BASE);
+            ret = BigInt(data.length);
           } else {
             ret = -BigInt(EBADF);
           }
@@ -3014,12 +3522,14 @@
           } else {
             ret = -BigInt(EBADF);
           }
+          this.ft(`dup ${oldfd} -> ${BigInt.asIntN(64, ret)}`);
           break;
         }
         case 24: {
           const oldfd = Number(a0);
           const newfd = Number(BigInt.asIntN(32, a1));
           const dup3flags = Number(a2);
+          this.ft(`dup3 ${oldfd} -> ${newfd}`);
           if (oldfd === newfd) {
             ret = -BigInt(EINVAL);
             break;
@@ -3077,12 +3587,13 @@
         }
         // ── File operations ──
         case 56: {
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const flags56 = Number(a2);
           const mode56 = Number(a3);
           if (path === "/dev/tty") {
             const ttyFd = this.allocFd();
             this.fdTable.set(ttyFd, { type: "tty" });
+            this.ft(`open ${path} -> ${ttyFd}`);
             ret = BigInt(ttyFd);
             break;
           }
@@ -3099,6 +3610,7 @@
                 } else {
                   this.fdTable.set(guestFd, { type: "native", nativeFd: resp.ret, path: bp56 });
                   this.nativeRefs.set(resp.ret, 1);
+                  this.ft(`open ${bp56} -> ${guestFd} (native ${resp.ret})`);
                   cpu2.setReg(0, BigInt(guestFd));
                 }
               }
@@ -3111,6 +3623,7 @@
               this.fdFlags.set(openRet, flags56 & ~(64 | 128 | 512 | 524288));
               if (flags56 & 524288) this.fdCloexec.add(openRet);
             }
+            this.ft(`open ${path} -> ${openRet} (vfs)`);
             ret = BigInt(openRet);
           } else {
             ret = -BigInt(ENOENT);
@@ -3120,6 +3633,7 @@
         case 57: {
           const fd = Number(a0);
           const closeEntry = this.fdTable.get(fd);
+          this.ft(`close ${fd} (type=${closeEntry?.type ?? (this.vfs?.hasFd(fd) ? "vfs" : "none")})`);
           this.fdFlags.delete(fd);
           this.fdCloexec.delete(fd);
           if (closeEntry) {
@@ -3236,8 +3750,11 @@
             break;
           }
           const fstatEntry = this.getFdEntry(fd);
+          if (fd <= 4 || fstatEntry?.type === "tty" || fstatEntry?.type === "stdio") this.ft(`fstat ${fd} type=${fstatEntry?.type ?? (this.vfs?.hasFd(fd) ? "vfs" : "none")}`);
           if (fstatEntry) {
-            if (fstatEntry.type === "stdio" || fstatEntry.type === "tty" || fstatEntry.type === "pipe_read" || fstatEntry.type === "pipe_write" || fstatEntry.type === "inotify" || fstatEntry.type === "timerfd" || fstatEntry.type === "eventfd" || fstatEntry.type === "epoll") {
+            if (fstatEntry.type === "tty" && this.vfs) {
+              ret = BigInt(this.vfs.fstatat(-100, "/dev/tty", statBuf, 0, view));
+            } else if (fstatEntry.type === "stdio" || fstatEntry.type === "tty" || fstatEntry.type === "pipe_read" || fstatEntry.type === "pipe_write" || fstatEntry.type === "inotify" || fstatEntry.type === "timerfd" || fstatEntry.type === "eventfd" || fstatEntry.type === "epoll") {
               writeChardevStat(view, statBuf);
               ret = 0n;
             } else if (fstatEntry.type === "native") {
@@ -3267,7 +3784,7 @@
           break;
         }
         case 79: {
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const statBuf79 = Number(a2);
           if (this.ptrFaults(bytes, statBuf79, 128)) {
             ret = -BigInt(EFAULT);
@@ -3277,7 +3794,7 @@
           if (bp79 !== null) {
             const cached = this.statCache.get(bp79);
             if (cached && cached.expiresAt > Date.now()) {
-              writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime, cached.uid, cached.gid] });
+              writeBridgeStat(view, statBuf79, { _meta: [cached.mode, cached.size, cached.nlink, cached.mtime, cached.uid, cached.gid, cached.ino] });
               ret = 0n;
               break;
             }
@@ -3298,6 +3815,7 @@
                       mtime: resp._meta[3],
                       uid: resp._meta[4] ?? 0,
                       gid: resp._meta[5] ?? 0,
+                      ino: resp._meta[6] ?? 0,
                       expiresAt: Date.now() + this.STAT_CACHE_TTL_MS
                     });
                   }
@@ -3349,6 +3867,7 @@
                       mtime: entry.mtime ?? 0,
                       uid: entry.uid ?? 0,
                       gid: entry.gid ?? 0,
+                      ino: entry.ino ?? 0,
                       expiresAt: cacheExpiry
                     });
                   }
@@ -3379,7 +3898,7 @@
           break;
         }
         case 34: {
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const bp34 = this.bridgePath(path);
           if (bp34 !== null) {
             return {
@@ -3403,7 +3922,7 @@
             ret = -BigInt(EFAULT);
             break;
           }
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           if (path === "") {
             ret = -BigInt(ENOENT);
             break;
@@ -3428,7 +3947,7 @@
           break;
         }
         case 33: {
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const mode = Number(a2);
           if (this.vfs) {
             const fmt = mode & 61440;
@@ -3453,8 +3972,8 @@
             ret = -BigInt(EFAULT);
             break;
           }
-          const oldpath = readGuestString(bytes, Number(a1));
-          const newpath = readGuestString(bytes, Number(a3));
+          const oldpath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
+          const newpath = this.resolveAt(a2, readGuestString(bytes, Number(a3)));
           const bOld = this.bridgePath(oldpath);
           if (bOld) {
             const bNew = this.bridgePath(newpath) ?? newpath;
@@ -3482,7 +4001,7 @@
             break;
           }
           const target = readGuestString(bytes, Number(a0));
-          const linkpath = readGuestString(bytes, Number(a2));
+          const linkpath = this.resolveAt(a1, readGuestString(bytes, Number(a2)));
           const bLink = this.bridgePath(linkpath);
           if (bLink) {
             return {
@@ -3506,8 +4025,8 @@
             ret = -BigInt(EFAULT);
             break;
           }
-          const oldpath = readGuestString(bytes, Number(a1));
-          const newpath = readGuestString(bytes, Number(a3));
+          const oldpath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
+          const newpath = this.resolveAt(a2, readGuestString(bytes, Number(a3)));
           if (this.vfs) {
             ret = BigInt(this.vfs.linkat(oldpath, newpath));
           } else {
@@ -3520,9 +4039,28 @@
           break;
         }
         case 78: {
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const buf = Number(a2);
           const bufsiz = Number(a3);
+          this.ft(`readlinkat ${path}`);
+          const pfd = path.match(/^\/proc\/(?:self|\d+)\/fd\/(\d+)$/);
+          if (pfd) {
+            const tfd = Number(pfd[1]);
+            const te = this.getFdEntry(tfd);
+            const link = te?.type === "tty" || te?.type === "stdio" ? "/dev/tty" : te?.path ?? (this.vfs?.fdPath?.(tfd) ?? null);
+            this.ft(`readlink /proc/self/fd/${tfd} -> ${link ?? "NULL"} (type=${te?.type ?? "?"})`);
+            if (link) {
+              const enc = new TextEncoder().encode(link);
+              const len = Math.min(enc.length, bufsiz);
+              if (badGuestPtr(bytes, buf, len)) {
+                ret = -BigInt(14);
+                break;
+              }
+              bytes.set(enc.subarray(0, len), buf + GUEST_MEM_BASE);
+              ret = BigInt(len);
+              break;
+            }
+          }
           const bPath = this.bridgePath(path);
           if (bPath) {
             return {
@@ -3571,7 +4109,7 @@
             ret = -BigInt(EFAULT);
             break;
           }
-          const path = readGuestString(bytes, Number(a1));
+          const path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const bp48 = this.bridgePath(path);
           if (bp48 !== null) {
             return {
@@ -3611,7 +4149,7 @@
           break;
         }
         case 53: {
-          const fchmodatPath = readGuestString(bytes, Number(a1));
+          const fchmodatPath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const fchmodatMode = Number(a2);
           const bpChmod = this.bridgePath(fchmodatPath);
           if (bpChmod !== null) {
@@ -3639,7 +4177,7 @@
             else ret = -BigInt(EBADF);
             break;
           }
-          const fchownatPath = readGuestString(bytes, Number(a1));
+          const fchownatPath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const bpChown = this.bridgePath(fchownatPath);
           if (bpChown !== null) {
             return {
@@ -3701,6 +4239,7 @@
           const fd = Number(a0);
           const request = Number(a1);
           const ioctlEntry = this.getFdEntry(fd);
+          if (fd <= 4) this.ft(`ioctl ${fd} req=0x${request.toString(16)} type=${ioctlEntry?.type ?? (this.vfs?.hasFd(fd) ? "vfs" : "none")}`);
           const isStdio = ioctlEntry?.type === "stdio" || ioctlEntry?.type === "tty";
           const isPipe = ioctlEntry?.type === "pipe_read" || ioctlEntry?.type === "pipe_write";
           if (isPipe) {
@@ -3787,7 +4326,7 @@
             }
           }
           let addr;
-          if (a0 !== 0n) {
+          if (a0 !== 0n && flags & MAP_FIXED) {
             addr = a0;
             const end = a0 + BigInt(aligned);
             if (end > this.mmapBase) this.mmapBase = end;
@@ -3806,13 +4345,22 @@
             if (pagesNeeded > currentPages) memory2.grow(pagesNeeded - currentPages);
           }
           new Uint8Array(memory2.buffer).fill(0, Number(addr) + GUEST_MEM_BASE, Number(addr) + GUEST_MEM_BASE + aligned);
-          if (mmapFd >= 0 && !(flags & MAP_ANONYMOUS) && this.vfs) {
+          if (mmapFd >= 0 && !(flags & MAP_ANONYMOUS)) {
             const fileOffset = Number(a5);
-            const savedPos = this.vfs.lseek(mmapFd, 0n, 1);
-            if (savedPos >= 0n) {
-              this.vfs.lseek(mmapFd, BigInt(fileOffset), 0);
-              this.vfs.read(mmapFd, Number(addr), aligned, new DataView(memory2.buffer));
-              this.vfs.lseek(mmapFd, savedPos, 0);
+            const entry = this.fdTable.get(mmapFd);
+            if (this.vfs && this.vfs.hasFd(mmapFd)) {
+              const savedPos = this.vfs.lseek(mmapFd, 0n, 1);
+              if (savedPos >= 0n) {
+                this.vfs.lseek(mmapFd, BigInt(fileOffset), 0);
+                this.vfs.read(mmapFd, Number(addr), aligned, new DataView(memory2.buffer));
+                this.vfs.lseek(mmapFd, savedPos, 0);
+              }
+            } else if (entry?.type === "native" && this.io.readFileAt) {
+              const data = this.io.readFileAt(entry.nativeFd, fileOffset, aligned);
+              if (data.length > 0) new Uint8Array(memory2.buffer).set(data, Number(addr) + GUEST_MEM_BASE);
+              if (flags & MAP_SHARED && prot & 2) {
+                this.fileMmaps.push({ start: Number(addr), len: aligned, fileLen: length, nativeFd: entry.nativeFd, fileOffset });
+              }
             }
           }
           if (flags & MAP_SHARED) this.sharedRegions.push({ addr: Number(addr), len: aligned });
@@ -3838,6 +4386,8 @@
           }
           const umStart = Number(a0), umEnd = umStart + (unmapLen + 4095 & ~4095);
           this.protNone = this.protNone.filter((r) => r.end <= umStart || r.start >= umEnd);
+          const umFlush = this.buildMmapFlush(cpu2, memory2, umStart, unmapLen + 4095 & ~4095, true);
+          if (umFlush) return umFlush;
           ret = 0n;
           break;
         }
@@ -4029,6 +4579,7 @@
         case 25: {
           const fd = Number(a0);
           const cmd = Number(a1);
+          if (fd <= 4) this.ft(`fcntl ${fd} cmd=${cmd}`);
           switch (cmd) {
             case F_DUPFD:
             case F_DUPFD_CLOEXEC: {
@@ -4312,6 +4863,8 @@
               } else {
                 this.fdTable.set(socketFd, { type: "socket", socketId: resp.ret, domain, sockType });
                 if (Number(a1) & 524288) this.fdCloexec.add(socketFd);
+                this.nt(`socket dom=${domain} type=${sockType} -> fd=${socketFd}`);
+                this._netActive = true;
                 cpu2.setReg(0, BigInt(socketFd));
               }
             }
@@ -4382,6 +4935,7 @@
             method: "net_connect",
             args: { socketId: connEntry.socketId, ...connAddr },
             apply: (resp) => {
+              this.nt(`connect fd=${Number(a0)} ${connAddr.host}:${connAddr.port} -> ${resp.ret}`);
               cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
             }
           };
@@ -4453,7 +5007,7 @@
             break;
           }
           const recvBuf = Number(a1);
-          const recvLen = Number(a2);
+          const recvLen = Math.min(Number(a2), 12288);
           return {
             status: "bridge",
             method: "net_read",
@@ -4555,12 +5109,29 @@
           ret = 0n;
           break;
         }
-        case 233:
+        case 233: {
+          const advice = Number(a2);
+          if (advice === 4 || advice === 8) {
+            const start = Number(a0), len = Number(a1);
+            const end = start + len;
+            if (len > 0 && (start & 4095) === 0 && end + GUEST_MEM_BASE <= memory2.buffer.byteLength) {
+              new Uint8Array(memory2.buffer).fill(0, start + GUEST_MEM_BASE, end + GUEST_MEM_BASE);
+            }
+          }
           ret = 0n;
           break;
+        }
         // ── Missing syscalls (spec-compliant implementations) ──
         case 50: {
-          ret = -BigInt(EBADF);
+          const fchEntry = this.getFdEntry(Number(a0));
+          const fchPath = fchEntry?.path;
+          if (typeof fchPath === "string" && fchPath.length) {
+            this.cwd = fchPath;
+            if (this.vfs) this.vfs.setCwd(fchPath);
+            ret = 0n;
+          } else {
+            ret = -BigInt(EBADF);
+          }
           break;
         }
         case 101: {
@@ -4821,9 +5392,12 @@
         case 231:
           ret = 0n;
           break;
-        case 227:
+        case 227: {
+          const msFlush = this.buildMmapFlush(cpu2, memory2, Number(a0), Number(a1), false);
+          if (msFlush) return msFlush;
           ret = 0n;
           break;
+        }
         case 232: {
           const mcLen = Number(a1);
           const mcVec = Number(a2) + GUEST_MEM_BASE;
@@ -4834,7 +5408,50 @@
           break;
         }
         case 216: {
-          ret = a0;
+          const MREMAP_MAYMOVE = 1;
+          const oldAddr = Number(a0), oldSize = Number(a1), newSize = Number(a2);
+          const mrFlags = Number(a3);
+          const alignedOld = oldSize + 4095 & ~4095;
+          const alignedNew = newSize + 4095 & ~4095;
+          if (alignedNew <= alignedOld) {
+            ret = a0;
+            break;
+          }
+          if (BigInt(oldAddr + alignedOld) === this.mmapBase) {
+            const needed2 = oldAddr + alignedNew + GUEST_MEM_BASE;
+            if (needed2 > this.maxBytes) {
+              ret = -BigInt(ENOMEM);
+              break;
+            }
+            if (needed2 > memory2.buffer.byteLength) {
+              const pagesNeeded = Math.ceil(needed2 / 65536), currentPages = memory2.buffer.byteLength / 65536;
+              if (pagesNeeded > currentPages) memory2.grow(pagesNeeded - currentPages);
+            }
+            new Uint8Array(memory2.buffer).fill(0, oldAddr + alignedOld + GUEST_MEM_BASE, oldAddr + alignedNew + GUEST_MEM_BASE);
+            this.mmapBase = BigInt(oldAddr + alignedNew);
+            ret = a0;
+            break;
+          }
+          if (!(mrFlags & MREMAP_MAYMOVE)) {
+            ret = -BigInt(ENOMEM);
+            break;
+          }
+          const newAddr = this.mmapBase;
+          this.mmapBase += BigInt(alignedNew);
+          const needed = Number(newAddr) + alignedNew + GUEST_MEM_BASE;
+          if (needed > this.maxBytes) {
+            this.mmapBase -= BigInt(alignedNew);
+            ret = -BigInt(ENOMEM);
+            break;
+          }
+          if (needed > memory2.buffer.byteLength) {
+            const pagesNeeded = Math.ceil(needed / 65536), currentPages = memory2.buffer.byteLength / 65536;
+            if (pagesNeeded > currentPages) memory2.grow(pagesNeeded - currentPages);
+          }
+          const mrMem = new Uint8Array(memory2.buffer);
+          mrMem.copyWithin(Number(newAddr) + GUEST_MEM_BASE, oldAddr + GUEST_MEM_BASE, oldAddr + GUEST_MEM_BASE + oldSize);
+          mrMem.fill(0, Number(newAddr) + GUEST_MEM_BASE + oldSize, Number(newAddr) + GUEST_MEM_BASE + alignedNew);
+          ret = newAddr;
           break;
         }
         // ── Signal notification via fd ──
@@ -4863,7 +5480,7 @@
         }
         // ── Exec relative to dirfd ──
         case 281: {
-          const pathname281 = readGuestString(bytes, Number(a1));
+          const pathname281 = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const argvPtrs281 = [];
           let argvAddr281 = Number(a2);
           while (true) {
@@ -4907,15 +5524,24 @@
           break;
         }
         case 276: {
-          const oldpath276 = readGuestString(bytes, Number(a1));
-          const newpath276 = readGuestString(bytes, Number(a3));
-          const renameFlags = Number(a4);
+          const oldpath276 = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
+          const newpath276 = this.resolveAt(a2, readGuestString(bytes, Number(a3)));
+          const bOld276 = this.bridgePath(oldpath276);
+          if (bOld276) {
+            const bNew276 = this.bridgePath(newpath276) ?? newpath276;
+            this.statCache.delete(bOld276);
+            this.statCache.delete(bNew276);
+            return {
+              status: "bridge",
+              method: "fs_rename",
+              args: { oldPath: bOld276, newPath: bNew276 },
+              apply: (resp) => {
+                cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
+              }
+            };
+          }
           if (this.vfs) {
-            if (renameFlags & 1) {
-              ret = BigInt(this.vfs.rename(oldpath276, newpath276));
-            } else {
-              ret = BigInt(this.vfs.rename(oldpath276, newpath276));
-            }
+            ret = BigInt(this.vfs.rename(oldpath276, newpath276));
           } else {
             ret = -BigInt(ENOSYS);
           }
@@ -4933,7 +5559,7 @@
           break;
         }
         case 291: {
-          const sxPath = readGuestString(bytes, Number(a1));
+          const sxPath = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const sxFlags = Number(a2);
           const sxBufAddr = Number(a4);
           if (this.vfs) {
@@ -5067,6 +5693,36 @@
           }
           const wantRead = this.readFdSet(view, readPtr, nfds);
           const wantWrite = this.readFdSet(view, writePtr, nfds);
+          const sockReadFd = [...wantRead].find((fd) => this.getFdEntry(fd)?.type === "socket");
+          if (sockReadFd !== void 0 && tmoMs !== 0) {
+            let preReady = 0;
+            for (const fd of wantRead) if (this.getFdEntry(fd)?.type !== "socket" && this.isFdReadable(fd)) preReady++;
+            for (const fd of wantWrite) if (this.isFdWritable(fd)) preReady++;
+            if (preReady === 0) {
+              const sockEntry = this.getFdEntry(sockReadFd);
+              const pollTmo = tmoMs < 0 ? 3e4 : tmoMs;
+              return {
+                status: "bridge",
+                method: "net_poll",
+                args: { socketId: sockEntry.socketId, timeoutMs: pollTmo },
+                apply: (resp) => {
+                  const outR = /* @__PURE__ */ new Set(), outW = /* @__PURE__ */ new Set();
+                  for (const fd of wantWrite) if (this.isFdWritable(fd)) outW.add(fd);
+                  for (const fd of wantRead) {
+                    const t = this.getFdEntry(fd)?.type;
+                    if (t === "socket") {
+                      if (resp.ret > 0) outR.add(fd);
+                    } else if (this.isFdReadable(fd)) outR.add(fd);
+                  }
+                  this.writeFdSet(view, readPtr, nfds, outR);
+                  this.writeFdSet(view, writePtr, nfds, outW);
+                  if (exceptPtr !== 0) this.writeFdSet(view, exceptPtr, nfds, /* @__PURE__ */ new Set());
+                  this.nt(`pselect.sock -> ret=${resp.ret} r=${outR.size} w=${outW.size}`);
+                  cpu2.setReg(0, BigInt(outR.size + outW.size));
+                }
+              };
+            }
+          }
           const readyRead = /* @__PURE__ */ new Set();
           const readyWrite = /* @__PURE__ */ new Set();
           let deadline = tmoMs < 0 ? -1 : Date.now() + tmoMs;
@@ -5163,6 +5819,7 @@
           const watchingLocal = pfds.some((p) => p.fd >= 0 && this.getFdEntry(p.fd)?.type !== "socket");
           if (!watchingLocal && socketEntry) {
             const pollTmo = tmoMs < 0 ? 3e4 : tmoMs;
+            this.nt(`ppoll.enter sock=${socketEntry.fd} events=${socketEntry.entry ? pfds.find((p) => p.fd === socketEntry.fd)?.events : "?"} tmo=${tmoMs}`);
             return {
               status: "bridge",
               method: "net_poll",
@@ -5177,6 +5834,7 @@
                 }
                 writeBack();
                 const c = pfds.filter((p) => p.revents !== 0).length;
+                this.nt(`ppoll.sock -> ret=${resp.ret} ready=${c}`);
                 cpu2.setReg(0, BigInt(c));
               }
             };
@@ -5268,6 +5926,7 @@
             off += len;
           }
           const smB64 = bytesToBase64(combined);
+          this.nt(`sendmsg fd=${Number(a0)} len=${totalLen}`);
           const namePtr = Number(view.getBigUint64(mhdr, true));
           const nameLen = view.getUint32(mhdr + 8, true);
           if (namePtr !== 0 && nameLen > 0) {
@@ -5306,8 +5965,9 @@
           return {
             status: "bridge",
             method: "net_read",
-            args: { socketId: rmEntry.socketId, count: rmCapacity },
+            args: { socketId: rmEntry.socketId, count: Math.min(rmCapacity, 12288) },
             apply: (resp) => {
+              this.nt(`recvmsg fd=${Number(a0)} cap=${rmCapacity} -> ret=${resp.ret} dlen=${resp.data ? Math.floor(resp.data.length * 3 / 4) : 0}`);
               if (resp.ret < 0) {
                 cpu2.setReg(0, BigInt.asUintN(64, BigInt(resp.ret)));
                 return;
@@ -5829,7 +6489,7 @@
           ret = 0n;
           break;
         case 437: {
-          const path437 = readGuestString(bytes, Number(a1));
+          const path437 = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           const howPtr = Number(a2) + GUEST_MEM_BASE;
           const flags437 = Number(view.getBigUint64(howPtr, true));
           const mode437 = Number(view.getBigUint64(howPtr + 8, true));
@@ -5854,7 +6514,7 @@
             ret = -BigInt(EFAULT);
             break;
           }
-          const fa2Path = readGuestString(bytes, Number(a1));
+          const fa2Path = this.resolveAt(a0, readGuestString(bytes, Number(a1)));
           if (this.vfs) {
             ret = BigInt(this.vfs.faccessat(Number(BigInt.asIntN(32, a0)), fa2Path, Number(a2), Number(a3)));
           } else {
@@ -6003,6 +6663,9 @@
     const mtime = meta ? meta[3] : resp.mtime ?? 0;
     const uid = meta ? meta[4] ?? 0 : resp.uid ?? 0;
     const gid = meta ? meta[5] ?? 0 : resp.gid ?? 0;
+    const ino = meta ? meta[6] ?? 0 : resp.ino ?? 0;
+    view.setBigUint64(base + 0, 1n, true);
+    view.setBigUint64(base + 8, BigInt.asUintN(64, BigInt(Math.trunc(ino))), true);
     view.setUint32(base + 16, mode, true);
     view.setUint32(base + 20, nlink, true);
     view.setUint32(base + 24, uid, true);
@@ -7222,6 +7885,11 @@
   var AT_EXECFN = 31;
   var HWCAP_FP = 1 << 0;
   var HWCAP_ASIMD = 1 << 1;
+  var HWCAP_AES = 1 << 3;
+  var HWCAP_PMULL = 1 << 4;
+  var HWCAP_SHA1 = 1 << 5;
+  var HWCAP_SHA2 = 1 << 6;
+  var HWCAP_SHA512 = 1 << 21;
   function setupStack(memory2, elfInfo, argv, envp) {
     const mem = new DataView(memory2.buffer);
     const bytes = new Uint8Array(memory2.buffer);
@@ -7258,7 +7926,7 @@
       [AT_PAGESZ, 4096n],
       [AT_ENTRY, elfInfo.entry],
       [AT_FLAGS, 0n],
-      [AT_HWCAP, BigInt(HWCAP_FP | HWCAP_ASIMD)],
+      [AT_HWCAP, BigInt(HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL | HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_SHA512)],
       [AT_CLKTCK, 100n],
       [AT_SECURE, 0n],
       [AT_UID, 0n],
@@ -7627,7 +8295,8 @@
         writeStderr: (d) => postWrite(2, d),
         readStdin: (count) => readStdin(count),
         stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
-        waitStdin: (timeoutMs) => waitStdin(timeoutMs)
+        waitStdin: (timeoutMs) => waitStdin(timeoutMs),
+        readFileAt: (fd, offset, count) => readNativeFileAt(fd, offset, count)
       }, vfs);
       syscalls.bridgeAvailable = true;
       syscalls.setThreadIds(ts.tid, ts.tgid);
@@ -7645,7 +8314,8 @@
         writeStderr: (d) => postWrite(2, d),
         readStdin: (count) => readStdin(count),
         stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
-        waitStdin: (timeoutMs) => waitStdin(timeoutMs)
+        waitStdin: (timeoutMs) => waitStdin(timeoutMs),
+        readFileAt: (fd, offset, count) => readNativeFileAt(fd, offset, count)
       }, vfs);
       syscalls.bridgeAvailable = true;
       if (config.syscallState) {
@@ -7678,7 +8348,8 @@
         writeStderr: (d) => postWrite(2, d),
         readStdin: (count) => readStdin(count),
         stdinHasData: () => stdinRing != null && (!stdinRing.empty || stdinRing.writerClosed),
-        waitStdin: (timeoutMs) => waitStdin(timeoutMs)
+        waitStdin: (timeoutMs) => waitStdin(timeoutMs),
+        readFileAt: (fd, offset, count) => readNativeFileAt(fd, offset, count)
       }, vfs);
       syscalls.bridgeAvailable = true;
       pc = prog.entry;
@@ -7780,6 +8451,19 @@
       blockCount++;
       const region = getRegion(pc);
       pc = region.run();
+      if (region.lastExitReason === 3) {
+        {
+          const _i = new DataView(memory.buffer).getUint32(Number(pc) + GUEST_MEM_BASE, true);
+          postWrite(2, new TextEncoder().encode(`[SIGILL pc=0x${pc.toString(16)} insn=0x${_i.toString(16).padStart(8, "0")}]\r
+`));
+        }
+        cpu.setPC(pc);
+        syscalls.raiseSignal(4);
+        const next = deliverQueuedSignals(pc);
+        if (next === null) return;
+        pc = next;
+        continue;
+      }
       view = new DataView(memory.buffer);
       const insns = Number(view.getBigUint64(stateBase + ITER_OFFSET, true));
       totalInsns += insns;
@@ -8556,6 +9240,28 @@
       off += c.length;
     }
     return out;
+  }
+  function readNativeFileAt(fd, offset, count) {
+    const CHUNK = 12288;
+    const out = new Uint8Array(count);
+    let got = 0;
+    while (got < count) {
+      const want = Math.min(CHUNK, count - got);
+      const h = { data: new Uint8Array(0) };
+      handleBridgeCall("fs_pread", { fd, offset: offset + got, count: want }, (r) => {
+        if (r && typeof r.data === "string" && r.data.length) {
+          const bin = atob(r.data);
+          const u = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+          h.data = u;
+        }
+      });
+      if (h.data.length === 0) break;
+      out.set(h.data, got);
+      got += h.data.length;
+      if (h.data.length < want) break;
+    }
+    return got === count ? out : out.subarray(0, got);
   }
   function handleBridgeCall(method, args, apply) {
     self.postMessage({ type: "bridge_call", id: 0, method, args });

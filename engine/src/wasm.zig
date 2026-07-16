@@ -400,6 +400,14 @@ pub const Body = struct {
     /// (base 0), which emits a plain constant — byte-identical to the pre-threads translator.
     reg_base_global: ?u32 = null,
 
+    /// software page-protection guard. when prot_active_global is set, guest loads/stores emit a
+    /// guard that (only while the imported prot_active global is non-zero) checks a per-page
+    /// permission byte at prot_base + (guest_page) and calls mem_fault_fn on a violation. null =>
+    /// no guard emitted (byte-identical to the unprotected translator).
+    prot_active_global: ?u32 = null,
+    mem_fault_fn: u32 = 0,
+    prot_base: u32 = 0,
+
     /// push the linear-memory address of a register-file slot at byte offset `off`. threaded
     /// modules resolve it against the per-thread reg_base global; single-threaded ones use the
     /// absolute offset (base 0). ALL register/SP/PC/NZCV/TPIDR/monitor/vreg accesses go through
@@ -498,6 +506,13 @@ pub const Body = struct {
     pub fn storeV128(self: *Body, addr: u32) !void {
         try self.emitSimd(Simd.v128_store);
         try self.emitMemArg(4, addr);
+    }
+
+    /// push a 128-bit immediate onto the stack (v128.const, 16 little-endian bytes).
+    pub fn emitV128Const(self: *Body, value: u128) !void {
+        try self.emitSimd(Simd.v128_const);
+        var i: u5 = 0;
+        while (i < 16) : (i += 1) try self.bytes.append(self.arena, @truncate(value >> @intCast(@as(u8, i) * 8)));
     }
 
     pub fn slice(self: *const Body) []const u8 {

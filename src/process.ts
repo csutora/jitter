@@ -63,6 +63,14 @@ export class ProcessManager {
     return this.nextPid - 1;
   }
 
+  /** true if `pid` is a suspended process on the fork stack (a live ancestor of the runner). */
+  isLivePid(pid: number): boolean {
+    for (const p of this.processStack) {
+      if ((p.syscallState as any).currentPid === pid) return true;
+    }
+    return false;
+  }
+
   /**
    * Fork: save parent state, continue as child.
    * Returns the child PID (which will be set as parent's X0 on restore).

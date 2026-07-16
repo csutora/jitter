@@ -14,6 +14,14 @@ export interface RunResult {
   exitPC: bigint;
 }
 
+// thrown by the page-protection guard's mem_fault callback to unwind out of a translated region.
+const MEM_FAULT = { memFault: true } as const;
+/** true if `e` is the sentinel thrown by a page-protection guard (a guest access to a restricted
+ *  page). callers should deliver SIGSEGV to the faulting process. */
+export function isMemFault(e: unknown): boolean { return e === MEM_FAULT; }
+const MAX_PROCESS_BYTES = 1610612736; // 1.5 GiB — must match syscall.ts (per-process address ceiling)
+const SIGSEGV = 11;
+
 export type SyscallHandlerFn = (cpu: CpuState, memory: WebAssembly.Memory) => SyscallResult;
 
 export class Emulator {
@@ -36,6 +44,45 @@ export class Emulator {
   readonly stateBase: number;
   private regBase: WebAssembly.Global | null = null;
 
+  // software page-protection: an on/off flag global the translated guard reads, the per-page
+  // permission table's linear-memory offset, and the raised-but-undelivered fault. see setPageProt.
+  private protActive: WebAssembly.Global | null = null;
+  // permission table's linear-memory offset: placed just above the per-process address ceiling so no
+  // guest mapping can ever collide with (and corrupt) it. lazily grown/committed on first use.
+  private readonly protBase = MAX_PROCESS_BYTES + GUEST_MEM_BASE; // 1.5 GiB + 64 KiB
+  private protReady = false;
+  private readonly protTableSize = MAX_PROCESS_BYTES >>> 12; // 1 byte per 4 KiB guest page
+  private pendingFault: { addr: number; isWrite: number } | null = null;
+
+  // called by the translated guard (env.mem_fault) when a guest access hits a restricted page.
+  // records the fault and throws to unwind out of run() to the dispatch loop's fault handler.
+  private memFault = (addr: number, isWrite: number): void => {
+    this.pendingFault = { addr, isWrite };
+    throw MEM_FAULT;
+  };
+
+  /** set the permission (PROT_* bits) of the guest pages covering [addr, addr+len) and turn the
+   *  guard on. lazily materializes the permission table (all pages start fully accessible). */
+  setPageProt(addr: number, len: number, prot: number): void {
+    if (this.threaded) return; // protection is wired for the non-threaded (fork) path only, for now
+    const b = prot & 7; // bit0=read bit1=write bit2=exec
+    // a fully read+write mapping enforces nothing; if protection was never activated, stay on the
+    // fast path (pages default to accessible). once active, we still record it to clear stale bytes.
+    if ((b & 3) === 3 && !this.protReady) return;
+    if (!this.protReady) {
+      const need = this.protBase + this.protTableSize;
+      const cur = this.memory.buffer.byteLength;
+      if (need > cur) this.memory.grow(Math.ceil((need - cur) / 65536));
+      new Uint8Array(this.memory.buffer).fill(7, this.protBase, this.protBase + this.protTableSize);
+      this.protReady = true;
+    }
+    const bytes = new Uint8Array(this.memory.buffer);
+    const first = addr >>> 12;
+    const last = (addr + len + 4095) >>> 12;
+    for (let p = first; p < last; p++) bytes[this.protBase + p] = b;
+    if (this.protActive) this.protActive.value = 1;
+  }
+
   constructor(memoryPages = 256, threaded = false, regBaseAddr = 0) {
     this.threaded = threaded;
     this.stateBase = threaded ? regBaseAddr : 0;
@@ -53,6 +100,9 @@ export class Emulator {
       // so a 4 GiB ceiling costs nothing until the guest actually uses it. NOTE: grow()
       // detaches memory.buffer, so never cache a view across a potential grow.
       this.memory = new WebAssembly.Memory({ initial: memoryPages, maximum: 65536 });
+      // the guard reads this mutable global; it stays 0 (fast path — guard skipped) until the first
+      // restricted page is created via setPageProt.
+      this.protActive = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
     }
     this.cpu = new CpuState(this.memory, this.stateBase);
   }
@@ -78,7 +128,10 @@ export class Emulator {
 
     const view = new DataView(this.memory.buffer);
 
-    const zigRegion = translateRegionZig(view, pc, this.memory, this.zigShadowBase, this.zigSingleBlock, this.threaded, this.regBase);
+    const protection = this.protActive
+      ? { protBase: this.protBase, protActive: this.protActive, memFault: this.memFault }
+      : null;
+    const zigRegion = translateRegionZig(view, pc, this.memory, this.zigShadowBase, this.zigSingleBlock, this.threaded, this.regBase, protection);
     if (!zigRegion) {
       const insn = view.getUint32(Number(pc) + GUEST_MEM_BASE, true);
       throw new Error(`translator failed to build a region at pc=0x${pc.toString(16)} (entry insn 0x${insn.toString(16).padStart(8, '0')})`);
@@ -91,6 +144,8 @@ export class Emulator {
     // Install signal trampoline if not already done
     if (this.syscallHandlerInstance && !this._trampolineInstalled) {
       this.syscallHandlerInstance.installSignalTrampoline(this.memory);
+      this.syscallHandlerInstance.isLivePidFn = (pid: number) => this.processManager.isLivePid(pid);
+      if (this.protActive) this.syscallHandlerInstance.protHook = (addr, len, prot) => this.setPageProt(addr, len, prot);
       this._trampolineInstalled = true;
     }
     this.cpu.setPC(startPC);
@@ -99,11 +154,21 @@ export class Emulator {
 
     const t0 = performance.now();
 
-    const view = new DataView(this.memory.buffer);
+    let view = new DataView(this.memory.buffer);
 
     while (pc !== HALT_PC) {
       const region = this.getRegion(pc);
-      pc = region.run();
+      try {
+        pc = region.run();
+      } catch (e) {
+        if (e !== MEM_FAULT) throw e;
+        // guest access to a restricted page: raise SIGSEGV and deliver it. with no handler the
+        // default action terminates the process (WIFSIGNALED / WTERMSIG == SIGSEGV for the parent).
+        if (this.syscallHandlerInstance) this.syscallHandlerInstance.raiseSignal(SIGSEGV);
+        pc = this.deliverPending(this.cpu.getPC());
+        view = new DataView(this.memory.buffer); // deliverPending/exit may have restored a parent
+        continue;
+      }
 
       // All regions write instruction count to ITER_OFFSET
       const insns = Number(view.getBigUint64(this.stateBase + ITER_OFFSET, true));

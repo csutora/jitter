@@ -426,3 +426,251 @@ describe('scalar SIMD + fixed-point converts', () => {
     expect(v.getBigUint64(0, true)).toBe(10n); // result in x0
   });
 });
+
+describe('NEON new ops: shift-imm / rev / ins-elem / dup-scalar / rbit', () => {
+  const ub = (v: DataView, reg: number, i: number) => v.getUint8(V_OFFSET + reg * 16 + i);
+  const i16 = (v: DataView, reg: number, i: number) => v.getInt16(V_OFFSET + reg * 16 + i * 2, true);
+
+  it('USHR v0.16b, v1.16b, #3', () => {
+    if (!emu) return;
+    const v = run(0x6f0d0420, { 1: [64, 32, 16, 8] }, 'i8');
+    expect(i8lanes(v, 0, 8)).toEqual([8, 4, 2, 1, 0, 0, 0, 0]);
+  });
+
+  it('SSHR v0.8h, v1.8h, #2 (signed)', () => {
+    if (!emu) return;
+    const v = run(0x4f1e0420, { 1: [-16, 16, -4, 100] }, 'i16');
+    expect([i16(v, 0, 0), i16(v, 0, 1), i16(v, 0, 2), i16(v, 0, 3)]).toEqual([-4, 4, -1, 25]);
+  });
+
+  it('SHL v0.4s, v1.4s, #4', () => {
+    if (!emu) return;
+    const v = run(0x4f245420, { 1: [1, 2, 3, -1] }, 'i32');
+    expect(i32lanes(v, 0, 4)).toEqual([16, 32, 48, -16]);
+  });
+
+  it('SLI v0.16b, v1.16b, #3', () => {
+    if (!emu) return;
+    // result[i] = (Vn[i] << 3) | (Vd[i] & 0b111)
+    const v = run(0x6f0b5420, { 1: [0x0a, 0x01], 0: [0x05, 0x02] }, 'i8');
+    expect([ub(v, 0, 0), ub(v, 0, 1)]).toEqual([0x55, 0x0a]);
+  });
+
+  it('SRI v0.16b, v1.16b, #4', () => {
+    if (!emu) return;
+    // result[i] = (Vn[i] >> 4) | (Vd[i] & 0xf0)
+    const v = run(0x6f0c4420, { 1: [0x70, 0x20], 0: [0x30, 0x10] }, 'i8');
+    expect([ub(v, 0, 0), ub(v, 0, 1)]).toEqual([0x37, 0x12]);
+  });
+
+  it('REV16 v0.16b, v1.16b', () => {
+    if (!emu) return;
+    const v = run(0x4e201820, { 1: [10, 11, 20, 21, 30, 31, 40, 41] }, 'i8');
+    expect(i8lanes(v, 0, 8)).toEqual([11, 10, 21, 20, 31, 30, 41, 40]);
+  });
+
+  it('REV32 v0.16b, v1.16b', () => {
+    if (!emu) return;
+    const v = run(0x6e200820, { 1: [1, 2, 3, 4, 5, 6, 7, 8] }, 'i8');
+    expect(i8lanes(v, 0, 8)).toEqual([4, 3, 2, 1, 8, 7, 6, 5]);
+  });
+
+  it('REV64 v0.16b, v1.16b', () => {
+    if (!emu) return;
+    const v = run(0x4e200820, { 1: [1, 2, 3, 4, 5, 6, 7, 8] }, 'i8');
+    expect(i8lanes(v, 0, 8)).toEqual([8, 7, 6, 5, 4, 3, 2, 1]);
+  });
+
+  it('REV64 v0.4s, v1.4s (32-bit elems)', () => {
+    if (!emu) return;
+    const v = run(0x4ea00820, { 1: [1, 2, 3, 4] }, 'i32');
+    expect(i32lanes(v, 0, 4)).toEqual([2, 1, 4, 3]);
+  });
+
+  it('RBIT v0.16b, v1.16b', () => {
+    if (!emu) return;
+    const v = run(0x6e605820, { 1: [0x01, 0x02, 0x03, 0x80] }, 'i8');
+    expect([ub(v, 0, 0), ub(v, 0, 1), ub(v, 0, 2), ub(v, 0, 3)]).toEqual([0x80, 0x40, 0xc0, 0x01]);
+  });
+
+  it('INS v0.b[3], v1.b[5] (element move preserves rest)', () => {
+    if (!emu) return;
+    const v = run(0x6e072c20, { 1: [0, 0, 0, 0, 0, 99], 0: [1, 0, 0, 7] }, 'i8');
+    expect(ub(v, 0, 3)).toBe(99);
+    expect(ub(v, 0, 0)).toBe(1);
+  });
+
+  it('INS v0.s[1], v1.s[3] (32-bit element move)', () => {
+    if (!emu) return;
+    const v = run(0x6e0c6420, { 1: [0, 0, 0, 287454020], 0: [5, 0] }, 'i32');
+    expect(i32lanes(v, 0, 2)).toEqual([5, 287454020]);
+  });
+
+  it('DUP d0, v1.d[1] (scalar dup 64-bit)', () => {
+    if (!emu) return;
+    const v = run(0x5e180420, { 1: [0n, 0xdeadbeefn] } as any, 'i64');
+    expect(v.getBigUint64(V_OFFSET + 0, true)).toBe(0xdeadbeefn);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n);
+  });
+
+  it('DUP s0, v1.s[2] (scalar dup 32-bit, zero-extended)', () => {
+    if (!emu) return;
+    const v = run(0x5e140420, { 1: [0, 0, 0x1234, 0] }, 'i32');
+    expect(v.getBigUint64(V_OFFSET + 0, true)).toBe(0x1234n);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n);
+  });
+});
+
+describe('NEON multiply by indexed element (poly1305 path)', () => {
+  const dl = (v: DataView, reg: number, i: number) => v.getBigUint64(V_OFFSET + reg * 16 + i * 8, true);
+
+  it('UMULL v0.2d, v1.2s, v2.s[0]', () => {
+    if (!emu) return;
+    const v = run(0x2f82a020, { 1: [10, 20], 2: [3] }, 'i32');
+    expect([dl(v, 0, 0), dl(v, 0, 1)]).toEqual([30n, 60n]);
+  });
+
+  it('UMULL v0.2d, v1.2s, v2.s[2] (index 2)', () => {
+    if (!emu) return;
+    const v = run(0x2f82a820, { 1: [10, 20], 2: [0, 0, 5, 0] }, 'i32');
+    expect([dl(v, 0, 0), dl(v, 0, 1)]).toEqual([50n, 100n]);
+  });
+
+  it('UMLAL v0.2d, v1.2s, v2.s[1] (accumulate)', () => {
+    if (!emu) return;
+    const v = run(0x2fa22020, { 1: [10, 20], 2: [0, 3], 0: [100, 0, 200, 0] }, 'i32');
+    // preset v0.2d = [100, 200] via i32 lanes [100,0,200,0]
+    expect([dl(v, 0, 0), dl(v, 0, 1)]).toEqual([130n, 260n]);
+  });
+
+  it('SMULL v0.4s, v1.4h, v2.h[3] (signed widening)', () => {
+    if (!emu) return;
+    const v = run(0x0f72a020, { 1: [-2, 3, -4, 5], 2: [0, 0, 0, 7] }, 'i16');
+    expect(i32lanes(v, 0, 4)).toEqual([-14, 21, -28, 35]);
+  });
+
+  it('MUL v0.4s, v1.4s, v2.s[1] (same-width)', () => {
+    if (!emu) return;
+    const v = run(0x4fa28020, { 1: [1, 2, 3, 4], 2: [0, 5] }, 'i32');
+    expect(i32lanes(v, 0, 4)).toEqual([5, 10, 15, 20]);
+  });
+
+  it('MLA v0.4s, v1.4s, v2.s[0] (accumulate same-width)', () => {
+    if (!emu) return;
+    const v = run(0x6f820020, { 1: [2, 3, 4, 5], 2: [10], 0: [1, 1, 1, 1] }, 'i32');
+    expect(i32lanes(v, 0, 4)).toEqual([21, 31, 41, 51]);
+  });
+
+  it('UMULL2 v0.2d, v1.4s, v2.s[3] (high half)', () => {
+    if (!emu) return;
+    const v = run(0x6fa2a820, { 1: [0, 0, 10, 20], 2: [0, 0, 0, 4] }, 'i32');
+    expect([dl(v, 0, 0), dl(v, 0, 1)]).toEqual([40n, 80n]);
+  });
+});
+
+describe('NEON XTN (narrow, poly1305 reduce)', () => {
+  const dset = (v: DataView, reg: number, lanes: bigint[]) => lanes.forEach((x, i) => v.setBigUint64(V_OFFSET + reg * 16 + i * 8, x, true));
+  it('XTN v0.2s, v1.2d', () => {
+    if (!emu) return;
+    const v = run(0x0ea12820, {}, 'i64');
+    dset(v, 1, [0x1122334455667788n, 0x99aabbccddeeff00n]);
+    v.setBigUint64(0x100, BigInt(0x600000), true);
+    (emu as any).regionCache.clear();
+    (emu as any).getRegion(BigInt(0x600000)).run();
+    expect(i32lanes(v, 0, 4)).toEqual([0x55667788 | 0, 0xddeeff00 | 0, 0, 0]);
+  });
+  it('XTN v0.4h, v1.4s', () => {
+    if (!emu) return;
+    const v = run(0x0e612820, { 1: [0x11112222, 0x33334444, 0x55556666, 0x77778888] }, 'i32');
+    // low 16 bits of each: 0x2222,0x4444,0x6666,0x8888
+    expect([v.getUint16(V_OFFSET, true), v.getUint16(V_OFFSET + 2, true), v.getUint16(V_OFFSET + 4, true), v.getUint16(V_OFFSET + 6, true)]).toEqual([0x2222, 0x4444, 0x6666, 0x8888]);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n);
+  });
+});
+
+describe('crypto-ext AES + PMULL', () => {
+  it('AESE v0.16b, v1.16b with zero state+key -> all 0x63', () => {
+    if (!emu) return;
+    // AESE: SubBytes(state^key); state=key=0 -> SubBytes(0)=0x63 for every byte, ShiftRows keeps it.
+    const v = run(0x4e284820, {}, 'i8');
+    expect(i8lanes(v, 0, 16).map((x) => x & 0xff)).toEqual(new Array(16).fill(0x63));
+  });
+  it('AESD v0.16b, v1.16b with zero -> all InvSbox[0]=0x52', () => {
+    if (!emu) return;
+    const v = run(0x4e285820, {}, 'i8');
+    expect((v.getUint8(V_OFFSET) )).toBe(0x52);
+  });
+  it('PMULL v0.1q, v1.1d, v2.1d (2 x 3 carryless = 6)', () => {
+    if (!emu) return;
+    const v = run(0x0ee2e020, { 1: [2], 2: [3] }, 'i64');
+    expect(v.getBigUint64(V_OFFSET, true)).toBe(6n);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n);
+  });
+  it('PMULL carry into high word ((1<<62) x 2 = 1<<63)', () => {
+    if (!emu) return;
+    const v = run(0x0ee2e020, { 1: [0x4000000000000000], 2: [2] }, 'i64');
+    expect(v.getBigUint64(V_OFFSET, true)).toBe(0x8000000000000000n);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n);
+  });
+  it('PMULL2 uses the high 64-bit lanes', () => {
+    if (!emu) return;
+    // v1.d[1]=2, v2.d[1]=3 -> pmull2 -> v0.d[0]=6
+    const v = run(0x4ee2e020, { 1: [0, 2], 2: [0, 3] }, 'i64');
+    expect(v.getBigUint64(V_OFFSET, true)).toBe(6n);
+  });
+});
+
+import { sha1_3reg, sha1h as _sha1h, sha1su0 as _sha1su0, sha1su1 as _sha1su1,
+         sha256h as _sha256h, sha256su0 as _sha256su0, sha256su1 as _sha256su1,
+         sha512h as _sha512h, sha512h2 as _sha512h2, sha512su0 as _sha512su0, sha512su1 as _sha512su1 }
+  from '../src/crypto-ext.js';
+
+describe('crypto-ext SHA1 / SHA256 / SHA512', () => {
+  // fill v0..v2 with distinct non-trivial bytes, run the encoded insn, and compare v0 against the
+  // (independently NIST-validated) helper applied to the same inputs. this checks decode + dispatch.
+  const seed = (n: number, base: number) => Array.from({ length: 16 }, (_, i) => ((n * 37 + i * 53 + base) & 0xff));
+  function check(word: number, apply: (buf: Uint8Array, d: number, n: number, m: number) => void) {
+    if (!emu) return;
+    const V0 = seed(1, 3), V1 = seed(2, 7), V2 = seed(3, 11);
+    const v = run(word, { 0: V0, 1: V1, 2: V2 }, 'i8');
+    const scratch = new Uint8Array(48);
+    scratch.set(V0, 0); scratch.set(V1, 16); scratch.set(V2, 32);
+    apply(scratch, 0, 16, 32);
+    const got = Array.from({ length: 16 }, (_, i) => v.getUint8(V_OFFSET + i));
+    expect(got).toEqual(Array.from(scratch.subarray(0, 16)));
+  }
+  it('SHA1C', () => check(0x5e020020, (b, d, n, m) => sha1_3reg(b, d, n, m, 0)));
+  it('SHA1P', () => check(0x5e021020, (b, d, n, m) => sha1_3reg(b, d, n, m, 1)));
+  it('SHA1M', () => check(0x5e022020, (b, d, n, m) => sha1_3reg(b, d, n, m, 2)));
+  it('SHA1H', () => check(0x5e280820, (b, d, n) => _sha1h(b, d, n)));
+  it('SHA1SU0', () => check(0x5e023020, (b, d, n, m) => _sha1su0(b, d, n, m)));
+  it('SHA1SU1', () => check(0x5e281820, (b, d, n) => _sha1su1(b, d, n)));
+  it('SHA256H', () => check(0x5e024020, (b, d, n, m) => _sha256h(b, d, n, m, false)));
+  it('SHA256H2', () => check(0x5e025020, (b, d, n, m) => _sha256h(b, d, n, m, true)));
+  it('SHA256SU0', () => check(0x5e282820, (b, d, n) => _sha256su0(b, d, n)));
+  it('SHA256SU1', () => check(0x5e026020, (b, d, n, m) => _sha256su1(b, d, n, m)));
+  it('SHA512H', () => check(0xce628020, (b, d, n, m) => _sha512h(b, d, n, m)));
+  it('SHA512H2', () => check(0xce628420, (b, d, n, m) => _sha512h2(b, d, n, m)));
+  it('SHA512SU0', () => check(0xcec08020, (b, d, n) => _sha512su0(b, d, n)));
+  it('SHA512SU1', () => check(0xce628820, (b, d, n, m) => _sha512su1(b, d, n, m)));
+});
+
+describe('NEON single-lane LD1/ST1', () => {
+  it('LD1 {v1.s}[0], [x0]', () => {
+    if (!emu) return;
+    const v = runMem(0x0d408001, [0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0]);
+    expect(v.getUint32(V_OFFSET + 16, true)).toBe(0x44332211);
+    expect(v.getUint32(V_OFFSET + 16 + 4, true)).toBe(0);
+  });
+  it('LD1 {v0.d}[1], [x0]', () => {
+    if (!emu) return;
+    const v = runMem(0x4d408400, [1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0x0807060504030201n);
+    expect(v.getBigUint64(V_OFFSET, true)).toBe(0n);
+  });
+  it('LD1 {v0.b}[3], [x0]', () => {
+    if (!emu) return;
+    const v = runMem(0x0d400c00, [0xab]);
+    expect(v.getUint8(V_OFFSET + 3)).toBe(0xab);
+  });
+});
