@@ -54,8 +54,8 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
   const moduleBytes = new Uint8Array(outLen);
   for (let i = 0; i < outLen; i++) moduleBytes[i] = buf[outOff + i];
 
-  const guestMem = new WebAssembly.Memory({ initial: Math.max(2, 3), maximum: 65536, shared: true });
-  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem } }).then(({ instance: inst2 }) => {
+  const guestMem = new WebAssembly.Memory({ initial: 40, maximum: 40 });
+  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem, reg_base: 0, simd_op: () => { throw new Error('simd_op'); }, mem_fault: () => { throw new Error('mem_fault: guest access out of bounds'); } } }).then(({ instance: inst2 }) => {
     inst2.exports.run();
     const gb = new BigUint64Array(guestMem.buffer);
     // x0=0, x1=8, x2=16, x3=24, x4=32, sp=0xf8/8 = index 31
@@ -67,7 +67,7 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
     out('SP=0x' + gb[31].toString(16) + ' (want 0x1100)');
 
     // also peek at the bytes that should have been stored
-    const stackBytes = new BigUint64Array(guestMem.buffer, 0x10000 + 0x10f0, 2);
+    const stackBytes = new BigUint64Array(guestMem.buffer, 0x80000 + 0x10f0, 2);
     out('mem[0x10f0]=0x' + stackBytes[0].toString(16) + ' (want 0x1234)');
     out('mem[0x10f8]=0x' + stackBytes[1].toString(16) + ' (want 0x5678)');
 

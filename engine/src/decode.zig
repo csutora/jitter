@@ -103,6 +103,9 @@ pub const Kind = enum(u32) {
     stp,
     ldxr,
     stxr,
+    ldxp,
+    stxp,
+    casp,
 
     // system
     mrs,
@@ -122,6 +125,8 @@ pub const Kind = enum(u32) {
     fabs,
     fneg,
     fsqrt,
+    frint,
+    fccmp,
     fadd,
     fsub,
     fmul,
@@ -131,6 +136,9 @@ pub const Kind = enum(u32) {
     fnmadd,
     fnmsub,
     fminnm,
+    fmax,
+    fmin,
+    fnmul,
     fmaxnm,
     scvtf_int,
     ucvtf_int,
@@ -139,6 +147,7 @@ pub const Kind = enum(u32) {
     fp_fixed_cvt,
     simd_scalar_cvt,
     simd_scalar_shift,
+    simd_scalar_fixcvt,
     simd_movi,
     simd_dup_gpr,
     simd_dup_elem,
@@ -162,6 +171,8 @@ pub const Kind = enum(u32) {
     simd_addhn,
     simd_ext,
     simd_addp,
+    simd_pair_scalar,
+    simd_fmul_elem,
     simd_orr_reg,
     simd_and_reg,
     simd_bic_reg,
@@ -307,6 +318,10 @@ pub const Op = union(Kind) {
     stp: LoadStorePair,
     ldxr: LoadStoreEx,
     stxr: LoadStoreEx,
+    // the pair forms. `size` is the ELEMENT size (4 or 8); the reservation covers twice that.
+    ldxp: LoadStoreEx,
+    stxp: LoadStoreEx,
+    casp: LoadStoreEx,
 
     mrs: SysReg,
     msr: SysReg,
@@ -324,6 +339,8 @@ pub const Op = union(Kind) {
     fabs: FpArith1,
     fneg: FpArith1,
     fsqrt: FpArith1,
+    frint: FpRound,
+    fccmp: FpCondCmp,
     fadd: FpArith2,
     fsub: FpArith2,
     fmul: FpArith2,
@@ -333,6 +350,9 @@ pub const Op = union(Kind) {
     fnmadd: FpArith3,
     fnmsub: FpArith3,
     fminnm: FpArith2,
+    fmax: FpArith2,
+    fmin: FpArith2,
+    fnmul: FpArith2,
     fmaxnm: FpArith2,
     scvtf_int: FpIntCvt,
     ucvtf_int: FpIntCvt,
@@ -341,6 +361,7 @@ pub const Op = union(Kind) {
     fp_fixed_cvt: FpFixedCvt,
     simd_scalar_cvt: SimdScalarCvt,
     simd_scalar_shift: SimdScalarShift,
+    simd_scalar_fixcvt: SimdScalarFixCvt,
     simd_movi: SimdMovi,
     simd_dup_gpr: SimdDupGpr,
     simd_dup_elem: SimdDupElem,
@@ -364,6 +385,8 @@ pub const Op = union(Kind) {
     simd_addhn: SimdThreeSame,
     simd_ext: SimdExt,
     simd_addp: SimdThreeSame,
+    simd_pair_scalar: SimdPairScalar,
+    simd_fmul_elem: SimdFmulElem,
     simd_orr_reg: SimdThreeSame,
     simd_and_reg: SimdThreeSame,
     simd_bic_reg: SimdThreeSame,
@@ -427,24 +450,32 @@ pub const VecWiden = struct { q: bool, size: u2, rd: u5, rn: u5, rm: u5, op: Vec
 pub const VecFpOp = enum {
     add, sub, mul, div, max, min, maxnm, minnm, mla, mls,
     cmeq, cmge, cmgt, fabd, addp, maxp, minp, maxnmp, minnmp,
+    mulx, recps, rsqrts, facge, facgt,
 };
 // sz: 0 = f32 lanes (.2s/.4s), 1 = f64 lanes (.2d)
-pub const VecFp3 = struct { q: bool, sz: u1, rd: u5, rn: u5, rm: u5, op: VecFpOp };
+pub const VecFp3 = struct { q: bool, sz: u1, rd: u5, rn: u5, rm: u5, op: VecFpOp, scalar: bool = false };
 
 pub const VecFpMiscOp = enum {
     neg, abs, sqrt, frintn, frintm, frintp, frintz, frinta, frinti, frintx,
     fcvtzs, fcvtzu, scvtf, ucvtf, fcmeq0, fcmge0, fcmgt0, fcmle0, fcmlt0,
+    fcvtps, fcvtpu, fcvtns, fcvtnu, fcvtms, fcvtmu, fcvtas, fcvtau,
+    frecpe, frsqrte,
 };
-pub const VecFp2 = struct { q: bool, sz: u1, rd: u5, rn: u5, op: VecFpMiscOp };
+// `scalar` marks the advanced-simd SCALAR two-reg-misc form (`fcmge s0, s0, #0`), which
+// differs from the q=0 vector form only in that everything above the single element is
+// zeroed rather than just everything above 64 bits.
+pub const VecFp2 = struct { q: bool, sz: u1, rd: u5, rn: u5, op: VecFpMiscOp, scalar: bool = false };
 
 pub const VecIntOp = enum {
-    add, sub, mul, cmeq, cmgt, cmge, cmhi, cmhs, cmtst,
+    add, sub, mul, mla, mls, cmeq, cmgt, cmge, cmhi, cmhs, cmtst,
     smax, smin, umax, umin, sqadd, uqadd, sqsub, uqsub,
     sshl, ushl, add_pairwise, smax_pairwise, umax_pairwise, smin_pairwise, umin_pairwise,
     @"and", @"or", xor, bic, orn,
 };
 // size: 0=8b,1=16b,2=32b,3=64b lanes
-pub const VecInt3 = struct { q: bool, size: u2, rd: u5, rn: u5, rm: u5, op: VecIntOp };
+// `scalar` marks the advanced-simd SCALAR three-same form (`add d0, d8, d10`): the same lane
+// operation, but everything above the single element is zeroed rather than just the high 64 bits.
+pub const VecInt3 = struct { q: bool, size: u2, rd: u5, rn: u5, rm: u5, op: VecIntOp, scalar: bool = false };
 
 pub const VecIntMiscOp = enum { neg, abs, cmeq0, cmgt0, cmge0, cmlt0, cmle0 };
 pub const VecInt2 = struct { q: bool, size: u2, rd: u5, rn: u5, op: VecIntMiscOp };
@@ -538,6 +569,10 @@ pub const LoadStorePair = struct {
     rn: u5,
     offset: i32,
     mode: AddrMode,
+    // LDPSW: two 32-bit words, each sign-extended into a 64-bit register. it shares the pair
+    // encoding with the plain 32-bit form and differs only in opc, so reading opc as nothing but
+    // a width gave a zero-extended answer for every negative value.
+    signed: bool = false,
 };
 pub const LoadStoreEx = struct { size: u8, rt: u5, rt2: u5, rn: u5, rs: u5 };
 
@@ -553,7 +588,16 @@ pub const FmovTop = struct { rd: u5, rn: u5 };
 pub const FpArith2 = struct { ftype: u2, rd: u5, rn: u5, rm: u5 };
 pub const FpArith1 = struct { ftype: u2, rd: u5, rn: u5 };
 pub const FpArith3 = struct { ftype: u2, rd: u5, rn: u5, rm: u5, ra: u5 };
-pub const FpIntCvt = struct { sf: bool, rd: u5, rn: u5, ftype: u2 };
+pub const FpIntCvt = struct { sf: bool, rd: u5, rn: u5, ftype: u2, round: RoundMode = .zero };
+// which way FRINT<x> and the rounding half of FCVT<x> take a value to an integer. `nearest` is
+// ties-to-even (the reset FPCR mode, and therefore also what FRINTX/FRINTI do here); `away` is
+// ties-away-from-zero, which no wasm op provides and the helper has to build.
+pub const RoundMode = enum(u3) { nearest = 0, up = 1, down = 2, zero = 3, away = 4 };
+pub const FpRound = struct { ftype: u2, rd: u5, rn: u5, mode: RoundMode };
+// FCCMP/FCCMPE: compare when the condition holds, otherwise write the immediate flags. the E
+// form differs only in which NaNs raise invalid-operation, which is not modelled, so both decode
+// the same way.
+pub const FpCondCmp = struct { ftype: u2, rn: u5, rm: u5, cond: u4, nzcv: u4 };
 // fp <-> fixed-point convert (scvtf d0,w0,#2 etc): like the integer convert but the
 // value is scaled by 2^fbits. reduces to an int<->fp convert plus a multiply by a
 // power-of-two constant. musl float formatting uses scvtf with fbits.
@@ -561,14 +605,23 @@ pub const FpFixedCvt = struct { sf: bool, rd: u5, rn: u5, ftype: u2, fbits: u8, 
 // scalar advanced-simd int<->fp convert (e.g. ucvtf d0,d0 / fcvtzs s0,s0). operates on
 // the low lane only; the integer source/dest lives in the fp register, not a gpr.
 pub const SimdScalarCvt = struct { rd: u5, rn: u5, dbl: bool, signed: bool, to_int: bool };
+// scalar advanced-simd fixed-point convert on the low D lane: the integer there is scaled by
+// 2^-fbits on the way to a double, or the double is scaled up on the way back.
+pub const SimdScalarFixCvt = struct { rd: u5, rn: u5, fbits: u8, signed: bool, to_int: bool, dbl: bool };
 // scalar advanced-simd shift by immediate (only the 64-bit D-reg forms exist, e.g.
 // shl d1,d1,#52 in musl scalbn). all reduce to a single i64 op on lane 0.
 pub const ScalarShiftOp = enum { shl, sshr, ushr, ssra, usra, sli, sri };
 pub const SimdScalarShift = struct { rd: u5, rn: u5, shift: u8, op: ScalarShiftOp };
-pub const SimdMovi = struct { rd: u5, imm8: u8, cmode: u4, op: u1, q: bool };
+// how the advanced-simd modified-immediate group combines its expanded pattern with Vd. only
+// `set` and `mvni` overwrite; ORR and BIC are read-modify-write, and treating them as a plain
+// move (which is what happened before) silently discards whatever was already in the register.
+pub const SimdImmKind = enum { set, mvni, orr, bic, fmov32, fmov64, movi64 };
+pub const SimdMovi = struct { rd: u5, imm8: u8, cmode: u4, kind: SimdImmKind, q: bool };
 pub const SimdDupGpr = struct { rd: u5, rn: u5, esize: u8, q: bool };
 pub const SimdDupElem = struct { rd: u5, rn: u5, esize: u8, index: u5, q: bool };
-pub const SimdElem = struct { rd: u5, rn: u5, esize: u8, index: u5, q: bool };
+// SMOV and UMOV share this shape and differ only in `signed`: SMOV sign-extends the element
+// into the destination register, UMOV zero-extends it.
+pub const SimdElem = struct { rd: u5, rn: u5, esize: u8, index: u5, q: bool, signed: bool = false };
 pub const SimdThreeSame = struct { q: bool, rd: u5, rn: u5, rm: u5, size: u2 };
 pub const SimdTwoReg = struct { q: bool, rd: u5, rn: u5, size: u2 };
 pub const SimdTwoRegNoSize = struct { q: bool, rd: u5, rn: u5 };
@@ -581,7 +634,13 @@ pub const CryptoShaOp = enum { sha1c, sha1p, sha1m, sha1h, sha1su0, sha1su1, sha
 pub const CryptoSha = struct { op: CryptoShaOp, rd: u5, rn: u5, rm: u5 };
 pub const SimdShiftLong = struct { q: bool, rd: u5, rn: u5, esize: u8, shift: u8 };
 // same-width vector shift by immediate (USHR/SSHR/SHL over .8b/.16b/.4h/.8h/.2s/.4s/.2d).
-pub const ShiftImmOp = enum { ushr, sshr, shl, sli, sri };
+pub const ShiftImmOp = enum { ushr, sshr, shl, sli, sri, ssra, usra };
+// scalar pairwise reduction of the two halves of the source register
+pub const PairScalarOp = enum { add, fadd, fmax, fmin, fmaxnm, fminnm };
+pub const SimdPairScalar = struct { rd: u5, rn: u5, dbl: bool, op: PairScalarOp };
+// fp multiply/multiply-accumulate by an indexed lane of Vm
+pub const FmulElemOp = enum { mul, mla, mls };
+pub const SimdFmulElem = struct { q: bool, rd: u5, rn: u5, rm: u5, dbl: bool, index: u8, op: FmulElemOp, scalar: bool };
 pub const SimdShiftImm = struct { q: bool, rd: u5, rn: u5, esize: u8, shift: u8, op: ShiftImmOp };
 // REV16/REV32/REV64 (vector): reverse the `size`-encoded elements within each `container`-byte group.
 pub const SimdRev = struct { q: bool, rd: u5, rn: u5, size: u2, container: u8 };
@@ -1134,7 +1193,20 @@ fn decodeLoadStoreEx(insn: u32) Op {
         // cas/casa/casl/casal — l/o0 are ordering-only
         return Op{ .cas = .{ .size = byte_size, .rs = rs, .rt = rt, .rn = rn } };
     }
-    // ldxp/stxp (pair-exclusive) not implemented
+    if (o2 == 0 and o1 == 1) {
+        // the pair forms. bit 31 tells them apart, which is why they cannot be read off
+        // `size_bits` the way the single-register forms are:
+        //   1 sz 001000 0 L 1 Rs o0 Rt2 Rn Rt   ldxp / stxp   (sz: 0 = 32-bit, 1 = 64-bit)
+        //   0 sz 001000 0 L 1 Rs o0 11111 Rn Rt casp          (sz: 0 = 32-bit, 1 = 64-bit)
+        const is_pair_ex = (size_bits >> 1) == 1;
+        const elem: u8 = if ((size_bits & 1) == 1) 8 else 4;
+        const data = LoadStoreEx{ .size = elem, .rt = rt, .rt2 = rt2, .rn = rn, .rs = rs };
+        if (is_pair_ex) return if (l == 1) Op{ .ldxp = data } else Op{ .stxp = data };
+        // casp names a pair by its FIRST register, so both must be even; an odd one is
+        // architecturally undefined rather than something to guess at.
+        if (rt2 != 0b11111 or (rs & 1) != 0 or (rt & 1) != 0) return Op{ .unknown = insn };
+        return Op{ .casp = data };
+    }
     return Op{ .unknown = insn };
 }
 
@@ -1186,7 +1258,10 @@ fn decodeLoadStorePair(insn: u32) Op {
         else => .offset_unsigned,
     };
 
-    const data = LoadStorePair{ .sf = sf, .rt = rt, .rt2 = rt2, .rn = rn, .offset = offset, .mode = mode };
+    const data = LoadStorePair{
+        .sf = sf, .rt = rt, .rt2 = rt2, .rn = rn, .offset = offset, .mode = mode,
+        .signed = opc == 0b01 and l == 1,
+    };
     return if (l == 1) Op{ .ldp = data } else Op{ .stp = data };
 }
 
@@ -1694,7 +1769,42 @@ fn decodeFpSimd(insn: u32) Op {
     // integer mul/mla/mls (same-width) and smull/umull/smlal/umlal/smlsl/umlsl (widening) by element.
     // openssl's NEON poly1305 uses umull/umlal-by-element, so this is on the TLS path.
     if (bit_31 == 0 and bits_28_24 == 0b01111 and bit_10 == 0) {
-        return decodeSimdIndexedElem(insn);
+        return decodeSimdIndexedElem(insn, false);
+    }
+
+    // scalar advanced-simd PAIRWISE: 01|U|11110|size|11000|opcode|10|Rn|Rd. these reduce the two
+    // halves of a 64- or 128-bit source to one value: `addp d0, v0.2d` sums a pair of doublewords,
+    // `faddp s3, v3.2s` a pair of singles. musl's strtod path uses them, so they are in every
+    // binary in the corpus that parses a number.
+    if (bit_31 == 0 and bit_30 == 1 and bits_28_24 == 0b11110 and bit_21 == 1 and
+        ((insn >> 17) & 0x1f) == 0b11000 and ((insn >> 10) & 0x3) == 0b10)
+    {
+        const u_p: u1 = @truncate(insn >> 29);
+        const op_p: u5 = @truncate((insn >> 12) & 0x1f);
+        const size_p: u2 = @truncate((insn >> 22) & 0x3);
+        const rd_p: u5 = @truncate(insn & 0x1f);
+        const rn_p: u5 = @truncate((insn >> 5) & 0x1f);
+        // U=0 opcode 11011 is the integer ADDP, defined only for size=11 (a pair of doublewords).
+        if (u_p == 0 and op_p == 0b11011 and size_p == 0b11) {
+            return Op{ .simd_pair_scalar = .{ .rd = rd_p, .rn = rn_p, .dbl = true, .op = .add } };
+        }
+        // U=1 is the fp group: bit23 picks max/min-number vs the rest, bit22 is single/double.
+        if (u_p == 1) {
+            const dbl_p = ((insn >> 22) & 1) == 1;
+            const pop: ?PairScalarOp = switch (op_p) {
+                0b01101 => if (bit_23 == 0) @as(PairScalarOp, .fadd) else null,
+                0b01111 => if (bit_23 == 0) @as(PairScalarOp, .fmax) else .fmin,
+                0b01100 => if (bit_23 == 0) @as(PairScalarOp, .fmaxnm) else .fminnm,
+                else => null,
+            };
+            if (pop) |o| return Op{ .simd_pair_scalar = .{ .rd = rd_p, .rn = rn_p, .dbl = dbl_p, .op = o } };
+        }
+    }
+
+    // scalar advanced-simd by-element: 01|U|11111|size|L|M|Rm|opcode|H|0|Rn|Rd. same operations as
+    // the vector by-element group above, on a single lane. `fmul d4, d2, v3.d[1]` lives here.
+    if (bit_31 == 0 and bit_30 == 1 and bits_28_24 == 0b11111 and bit_10 == 0) {
+        return decodeSimdIndexedElem(insn, true);
     }
 
     // scalar advanced-simd copy: 01|0|11110000|imm5|0|0000|1|Rn|Rd = DUP (element -> scalar), e.g.
@@ -1730,6 +1840,92 @@ fn decodeFpSimd(insn: u32) Op {
                 .to_int = is_fcvtz,
             } };
         }
+        // compare-against-zero and abs/neg share their opcodes with the vector two-reg-misc
+        // group and mean the same thing on one lane, so they reuse those ops with q=0.
+        // luajit's number->integer path emits `cmge d,d,#0`.
+        if (b21_17 == 0b10000 and b11 == 1) {
+            const rd: u5 = @truncate(insn & 0x1f);
+            const rn: u5 = @truncate((insn >> 5) & 0x1f);
+            const size: u2 = @truncate((insn >> 22) & 0x3);
+            if (bit_23 == 1) {
+                const fop: ?VecFpMiscOp = switch (b16_12) {
+                    0b01100 => if (u_bit == 0) @as(VecFpMiscOp, .fcmgt0) else .fcmge0,
+                    0b01101 => if (u_bit == 0) @as(VecFpMiscOp, .fcmeq0) else .fcmle0,
+                    0b01110 => if (u_bit == 0) @as(VecFpMiscOp, .fcmlt0) else null,
+                    0b11101 => if (u_bit == 0) @as(VecFpMiscOp, .frecpe) else .frsqrte,
+                    else => null,
+                };
+                if (fop) |o| return Op{ .vec_fp2 = .{
+                    .q = false,
+                    .sz = @truncate((insn >> 22) & 1),
+                    .rd = rd,
+                    .rn = rn,
+                    .op = o,
+                    .scalar = true,
+                } };
+            }
+            // the integer scalar forms are architecturally defined only for size=11 (D).
+            if (size == 0b11) {
+                const iop: ?VecIntMiscOp = switch (b16_12) {
+                    0b01000 => if (u_bit == 0) @as(VecIntMiscOp, .cmgt0) else .cmge0,
+                    0b01001 => if (u_bit == 0) @as(VecIntMiscOp, .cmeq0) else .cmle0,
+                    0b01010 => if (u_bit == 0) @as(VecIntMiscOp, .cmlt0) else null,
+                    0b01011 => if (u_bit == 1) @as(VecIntMiscOp, .neg) else .abs,
+                    else => null,
+                };
+                if (iop) |o| return Op{ .vec_int2 = .{ .q = false, .size = 0b11, .rd = rd, .rn = rn, .op = o } };
+            }
+        }
+    }
+
+    // scalar advanced-simd three-same: 01|U|11110|size|1|Rm|opcode|1|Rn|Rd. one lane of the
+    // vector operation of the same name. bit10 is what separates it from the two-reg-misc group
+    // above. the compares, add/sub and cmtst exist only for D; the saturating ops for every size.
+    if (bit_31 == 0 and bit_30 == 1 and bits_28_24 == 0b11110 and bit_21 == 1 and bit_10 == 1) {
+        const u_bit: u1 = @truncate(insn >> 29);
+        const size: u2 = @truncate((insn >> 22) & 0x3);
+        const opcode: u5 = @truncate((insn >> 11) & 0x1f);
+        // the floating-point scalar forms share the encoding and split on the same opcodes as the
+        // vector three-same group, with size reread as a:sz. one lane, everything above cleared.
+        if (opcode >= 0b11000) {
+            const a: u1 = @truncate(size >> 1);
+            const fop: ?VecFpOp = switch (opcode) {
+                0b11010 => if (u_bit == 1 and a == 1) @as(VecFpOp, .fabd) else null,
+                0b11011 => if (u_bit == 0 and a == 0) @as(VecFpOp, .mulx) else null,
+                0b11100 => if (u_bit == 0 and a == 0) @as(VecFpOp, .cmeq) else if (u_bit == 1) (if (a == 0) @as(VecFpOp, .cmge) else .cmgt) else null,
+                0b11101 => if (u_bit == 1) (if (a == 0) @as(VecFpOp, .facge) else .facgt) else null,
+                0b11111 => if (u_bit == 0) (if (a == 0) @as(VecFpOp, .recps) else .rsqrts) else null,
+                else => null,
+            };
+            if (fop) |o| return Op{ .vec_fp3 = .{
+                .q = false,
+                .sz = @truncate(size),
+                .rd = @truncate(insn & 0x1f),
+                .rn = @truncate((insn >> 5) & 0x1f),
+                .rm = @truncate((insn >> 16) & 0x1f),
+                .op = o,
+                .scalar = true,
+            } };
+        }
+        const d_only = size == 0b11;
+        const sop: ?VecIntOp = switch (opcode) {
+            0b00001 => if (u_bit == 0) @as(VecIntOp, .sqadd) else .uqadd,
+            0b00101 => if (u_bit == 0) @as(VecIntOp, .sqsub) else .uqsub,
+            0b00110 => if (!d_only) null else if (u_bit == 0) @as(VecIntOp, .cmgt) else .cmhi,
+            0b00111 => if (!d_only) null else if (u_bit == 0) @as(VecIntOp, .cmge) else .cmhs,
+            0b10000 => if (!d_only) null else if (u_bit == 0) @as(VecIntOp, .add) else .sub,
+            0b10001 => if (!d_only) null else if (u_bit == 0) @as(VecIntOp, .cmtst) else .cmeq,
+            else => null,
+        };
+        if (sop) |o| return Op{ .vec_int3 = .{
+            .q = false,
+            .size = size,
+            .rd = @truncate(insn & 0x1f),
+            .rn = @truncate((insn >> 5) & 0x1f),
+            .rm = @truncate((insn >> 16) & 0x1f),
+            .op = o,
+            .scalar = true,
+        } };
     }
 
     // scalar advanced-simd shift by immediate: 01|U|111110|immh|immb|opcode|1|Rn|Rd.
@@ -1740,6 +1936,19 @@ fn decodeFpSimd(insn: u32) Op {
         const immh: u4 = @truncate((insn >> 19) & 0xf);
         const immb: u3 = @truncate((insn >> 16) & 0x7);
         const opc: u5 = @truncate((insn >> 11) & 0x1f);
+        // the S form of the fixed-point converts sits at immh=01xx, where the shift ops have
+        // no scalar encoding at all, so it is handled ahead of the D gate below
+        if ((immh & 0b1100) == 0b0100 and (opc == 0b11100 or opc == 0b11111)) {
+            const imm: u8 = (@as(u8, immh) << 3) | @as(u8, immb);
+            return Op{ .simd_scalar_fixcvt = .{
+                .rd = @truncate(insn & 0x1f),
+                .rn = @truncate((insn >> 5) & 0x1f),
+                .fbits = 64 - imm,
+                .signed = u_bit == 0,
+                .to_int = opc == 0b11111,
+                .dbl = false,
+            } };
+        }
         if ((immh & 0b1000) != 0) {
             const imm: u8 = (@as(u8, immh) << 3) | @as(u8, immb);
             const left: u8 = imm - 64; // 0..63 for shl/sli
@@ -1751,6 +1960,18 @@ fn decodeFpSimd(insn: u32) Op {
                 0b01000 => if (u_bit == 1) @as(ScalarShiftOp, .sri) else null,
                 else => null,
             };
+            // fixed-point convert on the low lane: `ucvtf d0, d0, #10` is one D-lane integer
+            // scaled by 2^-fbits. luajit's number formatting uses it.
+            if (opc == 0b11100 or opc == 0b11111) {
+                return Op{ .simd_scalar_fixcvt = .{
+                    .rd = @truncate(insn & 0x1f),
+                    .rn = @truncate((insn >> 5) & 0x1f),
+                    .fbits = 128 - imm,
+                    .signed = u_bit == 0,
+                    .to_int = opc == 0b11111,
+                    .dbl = true,
+                } };
+            }
             if (so) |o| {
                 const is_left = o == .shl or o == .sli;
                 return Op{ .simd_scalar_shift = .{
@@ -1802,6 +2023,14 @@ fn decodeFpSimd(insn: u32) Op {
         if (lo2 == 0b10) return decodeFpDataProc2(insn);
         // fp conditional select: bits 11-10 == 11
         if (lo2 == 0b11) return decodeFpCsel(insn);
+        // fp conditional compare: bits 11-10 == 01
+        if (lo2 == 0b01) return Op{ .fccmp = .{
+            .ftype = @truncate((insn >> 22) & 0x3),
+            .rn = @truncate((insn >> 5) & 0x1f),
+            .rm = @truncate((insn >> 16) & 0x1f),
+            .cond = @truncate((insn >> 12) & 0xf),
+            .nzcv = @truncate(insn & 0xf),
+        } };
         // fp immediate: bits 12-10 == 100, bits 9-5 == 0
         const lo3: u3 = @truncate((insn >> 10) & 0x7);
         const rn_field: u5 = @truncate((insn >> 5) & 0x1f);
@@ -1837,8 +2066,20 @@ fn decodeFpIntConv(insn: u32) Op {
     const conv = FpIntCvt{ .sf = sf, .rd = rd, .rn = rn, .ftype = ftype };
     if (rmode == 0 and opcode == 0b010) return Op{ .scvtf_int = conv };
     if (rmode == 0 and opcode == 0b011) return Op{ .ucvtf_int = conv };
-    if (rmode == 0b11 and opcode == 0b000) return Op{ .fcvtzs_int = conv };
-    if (rmode == 0b11 and opcode == 0b001) return Op{ .fcvtzu_int = conv };
+    // FCVT<N|P|M|Z><S|U>: rmode picks the rounding, opcode the signedness. only the toward-zero
+    // pair used to decode, so `lround`/`llround` and anything else that rounds on the way to an
+    // integer was an illegal instruction.
+    if (opcode == 0b000 or opcode == 0b001) {
+        const rounded = FpIntCvt{ .sf = sf, .rd = rd, .rn = rn, .ftype = ftype, .round = switch (rmode) {
+            0b00 => .nearest, 0b01 => .up, 0b10 => .down, 0b11 => .zero,
+        } };
+        return if (opcode == 0b000) Op{ .fcvtzs_int = rounded } else Op{ .fcvtzu_int = rounded };
+    }
+    // FCVTAS/FCVTAU: nearest, ties away from zero. only defined with rmode 00.
+    if (rmode == 0b00 and (opcode == 0b100 or opcode == 0b101)) {
+        const away = FpIntCvt{ .sf = sf, .rd = rd, .rn = rn, .ftype = ftype, .round = .away };
+        return if (opcode == 0b100) Op{ .fcvtzs_int = away } else Op{ .fcvtzu_int = away };
+    }
     return Op{ .unknown = insn };
 }
 
@@ -1854,8 +2095,11 @@ fn decodeFpDataProc2(insn: u32) Op {
         0b0001 => Op{ .fdiv = arith },
         0b0010 => Op{ .fadd = arith },
         0b0011 => Op{ .fsub = arith },
+        0b0100 => Op{ .fmax = arith },
+        0b0101 => Op{ .fmin = arith },
         0b0110 => Op{ .fmaxnm = arith },
         0b0111 => Op{ .fminnm = arith },
+        0b1000 => Op{ .fnmul = arith },
         else => Op{ .unknown = insn },
     };
 }
@@ -1883,11 +2127,25 @@ fn decodeFpDataProc1(insn: u32) Op {
         0b000001 => Op{ .fabs = arith },
         0b000010 => Op{ .fneg = arith },
         0b000011 => Op{ .fsqrt = arith },
-        0b000100, 0b000101 => blk: {
-            // FCVT between precisions. opcode low 2 bits = dest ftype. we support single<->double
-            // only; half needs real f16 conversion so leave it to SIGILL rather than mis-emit.
+        0b001000, 0b001001, 0b001010, 0b001011, 0b001100, 0b001110, 0b001111 => Op{ .frint = .{
+            .ftype = ftype, .rd = rd, .rn = rn,
+            .mode = switch (@as(u3, @truncate(opcode))) {
+                0b000 => .nearest, // FRINTN
+                0b001 => .up,      // FRINTP
+                0b010 => .down,    // FRINTM
+                0b011 => .zero,    // FRINTZ
+                0b100 => .away,    // FRINTA
+                // FRINTX and FRINTI round by the current FPCR mode, which is nearest-ties-even
+                // unless a program changed it; nothing here writes FPCR, so it always is.
+                else => .nearest,
+            },
+        } },
+        0b000100, 0b000101, 0b000111 => blk: {
+            // FCVT between precisions. opcode low 2 bits = dest ftype. ftype 3 is HALF, which
+            // wasm has no native type for -- it goes through the helper, which does the IEEE
+            // binary16 encode/decode by hand. converting to the same precision does not exist.
             const dst: u2 = @truncate((insn >> 15) & 0x3);
-            if (ftype > 1 or dst > 1) break :blk Op{ .unknown = insn };
+            if (ftype == 2 or dst == 2 or ftype == dst) break :blk Op{ .unknown = insn };
             break :blk Op{ .fcvt = .{ .rd = rd, .rn = rn, .ftype = ftype, .dest_ftype = dst } };
         },
         else => Op{ .unknown = insn },
@@ -1961,10 +2219,11 @@ fn decodeVecFp3(insn: u32) ?Op {
         0b11000 => if (u == 0) (if (a == 0) .maxnm else .minnm) else (if (a == 0) .maxnmp else .minnmp),
         0b11001 => if (u == 0) (if (a == 0) @as(VecFpOp, .mla) else .mls) else null,
         0b11010 => if (u == 0) (if (a == 0) @as(VecFpOp, .add) else .sub) else (if (a == 0) @as(VecFpOp, .addp) else .fabd),
-        0b11011 => if (u == 1 and a == 0) @as(VecFpOp, .mul) else null, // fmulx (u=0) not yet
+        0b11011 => if (u == 0) (if (a == 0) @as(VecFpOp, .mulx) else null) else (if (a == 0) @as(VecFpOp, .mul) else null),
         0b11100 => if (u == 0 and a == 0) @as(VecFpOp, .cmeq) else if (u == 1) (if (a == 0) @as(VecFpOp, .cmge) else .cmgt) else null,
+        0b11101 => if (u == 1) (if (a == 0) @as(VecFpOp, .facge) else .facgt) else null,
         0b11110 => if (u == 0) (if (a == 0) @as(VecFpOp, .max) else .min) else (if (a == 0) @as(VecFpOp, .maxp) else .minp),
-        0b11111 => if (u == 1 and a == 0) @as(VecFpOp, .div) else null, // frecps/frsqrts not yet
+        0b11111 => if (u == 0) (if (a == 0) @as(VecFpOp, .recps) else .rsqrts) else (if (a == 0) @as(VecFpOp, .div) else null),
         else => null,
     };
     if (op) |o| return Op{ .vec_fp3 = .{ .q = q, .sz = sz, .rd = rd, .rn = rn, .rm = rm, .op = o } };
@@ -2058,6 +2317,7 @@ fn decodeSimdThreeSame(insn: u32) ?Op {
     const vop: ?VecIntOp = switch (opcode) {
         0b10000 => if (u == 0) @as(VecIntOp, .add) else .sub,
         0b10001 => if (u == 1) @as(VecIntOp, .cmeq) else .cmtst,
+        0b10010 => if (u == 0) @as(VecIntOp, .mla) else .mls,
         0b10011 => if (u == 0) @as(VecIntOp, .mul) else null, // mul (u=0); pmul (u=1) via helper
         0b00110 => if (u == 0) @as(VecIntOp, .cmgt) else .cmhi,
         0b00111 => if (u == 0) @as(VecIntOp, .cmge) else .cmhs,
@@ -2068,6 +2328,15 @@ fn decodeSimdThreeSame(insn: u32) ?Op {
         else => null,
     };
     if (vop) |o| return Op{ .vec_int3 = .{ .q = q, .size = size, .rd = rd, .rn = rn, .rm = rm, .op = o } };
+
+    // SSHL/USHL: shift each lane by the (signed) amount in the corresponding lane of Vm -- left
+    // when positive, right when negative. wasm SIMD only has shift-by-scalar, so these go through
+    // the helper. musl's float formatting uses them, which puts them in every binary that prints
+    // a number.
+    if (opcode == 0b01000) {
+        return Op{ .vec_int3 = .{ .q = q, .size = size, .rd = rd, .rn = rn, .rm = rm,
+                                  .op = if (u == 0) @as(VecIntOp, .sshl) else .ushl } };
+    }
 
     // remaining ops still go through the js simd_op helper (pairwise etc.)
     if (u == 1 and opcode == 0b10100) return Op{ .simd_umaxp = three };
@@ -2091,15 +2360,34 @@ fn decodeSimdTwoRegMisc(insn: u32) ?Op {
         const fop: ?VecFpMiscOp = switch (opcode) {
             0b01111 => if (u == 0) @as(VecFpMiscOp, .abs) else .neg, // fabs / fneg
             0b11111 => if (u == 1) @as(VecFpMiscOp, .sqrt) else null, // fsqrt
-            0b11010 => if (u == 0) @as(VecFpMiscOp, .fcvtzs) else .fcvtzu,
-            0b11101 => if (u == 0) @as(VecFpMiscOp, .scvtf) else .ucvtf,
+            0b11011 => if (u == 0) @as(VecFpMiscOp, .fcvtzs) else .fcvtzu,
+            // 11101 here is FRECPE/FRSQRTE, NOT scvtf/ucvtf -- those are the same opcode in the
+            // other half of the group.
+            0b11101 => if (u == 0) @as(VecFpMiscOp, .frecpe) else .frsqrte,
             0b01100 => if (u == 0) @as(VecFpMiscOp, .fcmgt0) else .fcmge0,
             0b01101 => if (u == 0) @as(VecFpMiscOp, .fcmeq0) else .fcmle0,
-            0b11000 => if (u == 0) @as(VecFpMiscOp, .frintn) else .frinta,
-            0b11001 => if (u == 0) @as(VecFpMiscOp, .frintm) else .frintx,
+            0b01110 => if (u == 0) @as(VecFpMiscOp, .fcmlt0) else null,
+            // FCVTPS/FCVTPU: round toward +inf on the way to an integer
+            0b11010 => if (u == 0) @as(VecFpMiscOp, .fcvtps) else .fcvtpu,
+            0b11000 => if (u == 0) @as(VecFpMiscOp, .frintp) else .frinti,
+            0b11001 => if (u == 0) @as(VecFpMiscOp, .frintz) else null,
             else => null,
         };
         if (fop) |o| return Op{ .vec_fp2 = .{ .q = q, .sz = sz, .rd = rd, .rn = rn, .op = o } };
+    } else {
+        // bit 23 selects between two DIFFERENT opcode tables in this group, not just a width.
+        // conflating them made FRINTZ decode as FRINTM, which is a wrong answer rather than a
+        // missing one: -0.5 came back as -1.0.
+        const fop0: ?VecFpMiscOp = switch (opcode) {
+            0b11000 => if (u == 0) @as(VecFpMiscOp, .frintn) else .frinta,
+            0b11001 => if (u == 0) @as(VecFpMiscOp, .frintm) else .frintx,
+            0b11010 => if (u == 0) @as(VecFpMiscOp, .fcvtns) else .fcvtnu,
+            0b11011 => if (u == 0) @as(VecFpMiscOp, .fcvtms) else .fcvtmu,
+            0b11100 => if (u == 0) @as(VecFpMiscOp, .fcvtas) else .fcvtau,
+            0b11101 => if (u == 0) @as(VecFpMiscOp, .scvtf) else .ucvtf,
+            else => null,
+        };
+        if (fop0) |o| return Op{ .vec_fp2 = .{ .q = q, .sz = sz, .rd = rd, .rn = rn, .op = o } };
     }
 
     const no_sz = SimdTwoRegNoSize{ .q = q, .rd = rd, .rn = rn };
@@ -2130,7 +2418,10 @@ fn decodeSimdTwoRegMisc(insn: u32) ?Op {
     return null;
 }
 
-fn decodeSimdIndexedElem(insn: u32) Op {
+/// SIMD by-element ops. `scalar_form` marks the advanced-simd SCALAR encoding
+/// (`fmul d4, d2, v3.d[1]`), which is the same operation on one lane with everything above it
+/// zeroed. it is a different top-level encoding, so the caller tells us which one it saw.
+fn decodeSimdIndexedElem(insn: u32, scalar_form: bool) Op {
     const q: bool = ((insn >> 30) & 1) == 1;
     const u: bool = ((insn >> 29) & 1) == 1;
     const size: u2 = @truncate((insn >> 22) & 0x3);
@@ -2148,7 +2439,22 @@ fn decodeSimdIndexedElem(insn: u32) Op {
         rm = @truncate((insn >> 16) & 0x7);
     } else if (size == 0b10) {
         index = (@as(u8, h) << 1) | @as(u8, l);
+    } else if (size == 0b11) {
+        // double-precision by-element: index is H alone, and L must be 0 (there are only two lanes)
+        index = @as(u8, h);
     } else return Op{ .unknown = insn };
+
+    // the FP by-element ops share this group: FMUL is opcode 1001, FMLA 0001, FMLS 0101, all with
+    // U=0 and the size field naming the FP width (10 = single, 11 = double). the integer decode
+    // below reads the same opcodes differently, so these have to be taken first.
+    if (!u and (size == 0b10 or size == 0b11) and (opcode == 0b1001 or opcode == 0b0001 or opcode == 0b0101)) {
+        const fidx: u8 = if (size == 0b11) @as(u8, h) else ((@as(u8, h) << 1) | @as(u8, l));
+        return Op{ .simd_fmul_elem = .{ .q = q, .rd = rd, .rn = rn, .rm = @truncate((insn >> 16) & 0x1f),
+                                        .dbl = size == 0b11, .index = fidx,
+                                        .op = switch (opcode) { 0b1001 => .mul, 0b0001 => .mla, else => .mls },
+                                        .scalar = scalar_form } };
+    }
+    if (size == 0b11) return Op{ .unknown = insn };
     // mul is U=0; mla/mls are U=0 in the encoding table? no — MLA/MLS use U=1, MUL uses U=0. the
     // widening s/u variants use U as the signedness flag. same-width mul/mla/mls are modular so
     // signedness is irrelevant to the low bits.
@@ -2196,6 +2502,12 @@ fn decodeSimdShiftImm(insn: u32) ?Op {
         const size2: u2 = switch (esize) { 1 => 0, 2 => 1, 4 => 2, else => return null };
         const shift: u8 = @intCast(@as(u16, esize) * 16 - imm);
         return Op{ .simd_shrn = .{ .q = q, .rd = rd, .rn = rn, .size = size2, .shift = shift } };
+    }
+    if (opcode == 0b00010) {
+        // SSRA (u=0) / USRA (u=1): shift right and ACCUMULATE into Vd. same shift encoding as
+        // SSHR/USHR; the difference is that the result is added to what Vd already held.
+        const shift: u8 = @intCast(@as(u16, esize) * 16 - imm);
+        return Op{ .simd_shift_imm = .{ .q = q, .rd = rd, .rn = rn, .esize = esize, .shift = shift, .op = if (u == 0) .ssra else .usra } };
     }
     if (opcode == 0b00000) {
         // SSHR (u=0) / USHR (u=1): same-width right shift. shift = 2*esize_bits - imm.
@@ -2265,7 +2577,7 @@ fn decodeSimdCopy(insn: u32) Op {
             0b0000 => return Op{ .simd_dup_elem = .{ .rd = rd, .rn = rn, .esize = idx.esize, .index = idx.index, .q = q } },
             0b0001 => return Op{ .simd_dup_gpr = .{ .rd = rd, .rn = rn, .esize = idx.esize, .q = q } },
             0b0011 => return Op{ .simd_ins_gpr = .{ .rd = rd, .rn = rn, .esize = idx.esize, .index = idx.index, .q = q } },
-            0b0101 => return Op{ .simd_umov = .{ .rd = rd, .rn = rn, .esize = idx.esize, .index = idx.index, .q = q } },
+            0b0101 => return Op{ .simd_umov = .{ .rd = rd, .rn = rn, .esize = idx.esize, .index = idx.index, .q = q, .signed = true } },
             0b0111 => return Op{ .simd_umov = .{ .rd = rd, .rn = rn, .esize = idx.esize, .index = idx.index, .q = q } },
             else => return Op{ .unknown = insn },
         }
@@ -2290,6 +2602,10 @@ fn decodeSimdElemIndex(imm5: u5) SimdIdx {
 }
 
 fn decodeSimdModifiedImm(insn: u32) Op {
+    // bit 11 is o2, which with cmode=1111 selects the half-precision FMOV. we do not implement
+    // fp16, and decoding it as the single-precision form would fill the register with a
+    // different number rather than say so.
+    if ((insn >> 11) & 1 != 0) return Op{ .unknown = insn };
     const q: bool = (insn >> 30) & 1 == 1;
     const op: u1 = @truncate(insn >> 29);
     const a: u1 = @truncate(insn >> 18);
@@ -2306,5 +2622,57 @@ fn decodeSimdModifiedImm(insn: u32) Op {
     const imm8: u8 = (@as(u8, a) << 7) | (@as(u8, b) << 6) | (@as(u8, c) << 5) |
         (@as(u8, d) << 4) | (@as(u8, e) << 3) | (@as(u8, f) << 2) |
         (@as(u8, g) << 1) | @as(u8, h);
-    return Op{ .simd_movi = .{ .rd = rd, .imm8 = imm8, .cmode = cmode, .op = op, .q = q } };
+    // op and cmode together name the operation. cmode<0> selects move-vs-combine for the shifted
+    // forms; cmode 1110/1111 are the byte-mask and floating-point immediates.
+    const cmode_h: u3 = @truncate(cmode >> 1);
+    const kind: SimdImmKind = if (cmode_h == 0b111) blk: {
+        if ((cmode & 1) == 0) break :blk if (op == 0) SimdImmKind.set else .movi64;
+        break :blk if (op == 0) SimdImmKind.fmov32 else .fmov64;
+    } else if (cmode_h == 0b110)
+        (if (op == 0) SimdImmKind.set else .mvni)
+    else if ((cmode & 1) == 0)
+        (if (op == 0) SimdImmKind.set else .mvni)
+    else
+        (if (op == 0) SimdImmKind.orr else .bic);
+
+    return Op{ .simd_movi = .{ .rd = rd, .imm8 = imm8, .cmode = cmode, .kind = kind, .q = q } };
+}
+
+/// the 64-bit byte mask of MOVI Dd/Vd.2D, #imm8: each bit of imm8 becomes a whole byte.
+pub fn simdByteMask(imm8: u8) u64 {
+    var out: u64 = 0;
+    var i: u6 = 0;
+    while (i < 8) : (i += 1) {
+        if ((imm8 >> @intCast(i)) & 1 != 0) out |= @as(u64, 0xff) << (i * 8);
+    }
+    return out;
+}
+
+/// AdvSIMDExpandImm for the move/logical forms (the op=0 expansion; MVNI and BIC invert it).
+pub fn simdExpandImm(imm8: u8, cmode: u4) u64 {
+    const v8: u64 = @as(u64, imm8);
+    const rep32 = struct {
+        fn f(x: u64) u64 { return (x & 0xffff_ffff) | ((x & 0xffff_ffff) << 32); }
+    }.f;
+    return switch (@as(u3, @truncate(cmode >> 1))) {
+        0 => rep32(v8),
+        1 => rep32(v8 << 8),
+        2 => rep32(v8 << 16),
+        3 => rep32(v8 << 24),
+        4 => v8 | (v8 << 16) | (v8 << 32) | (v8 << 48),
+        5 => (v8 << 8) | (v8 << 24) | (v8 << 40) | (v8 << 56),
+        // cmode 110x: the low bytes are ones, not zeros
+        6 => if ((cmode & 1) == 0) rep32((v8 << 8) | 0xff) else rep32((v8 << 16) | 0xffff),
+        7 => blk: {
+            var x: u64 = v8 & 0xff;
+            x |= x << 8; x |= x << 16; x |= x << 32;
+            break :blk x;
+        },
+    };
+}
+
+/// the vector FMOV immediates: a single-precision value replicated, or one double.
+pub fn simdFmovImm(imm8: u8, dbl: bool) u64 {
+    const bits = vfpExpandImm(imm8, if (dbl) @as(u2, 1) else 0);
+    return if (dbl) bits else (bits & 0xffff_ffff) | ((bits & 0xffff_ffff) << 32);
 }

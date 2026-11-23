@@ -35,7 +35,11 @@ export interface ElfInfo {
   interpPath?: string;  // PT_INTERP path (dynamic executables); undefined if static
   interpBase?: bigint;  // load base of the interpreter, once loaded (for AT_BASE)
   interpEntry?: bigint; // interpreter entry point — execution starts here when dynamic
+  segs: LoadedSeg[];    // where the PT_LOAD segments landed, for the caller's vma set
 }
+
+/** one loaded segment, so the caller can record it as a mapping. */
+export interface LoadedSeg { start: number; end: number; prot: number }
 
 // base address for the dynamic linker (ld.so). sits above the program (0x400000) and
 // stack (0x800000) but below the shadow reservation at 32MB.
@@ -88,7 +92,9 @@ export function loadElf(
   const entry = rawEntry + loadBase;
 
   let brkStart = 0n;
+  const segs: LoadedSeg[] = [];
   let phdrAddr = 0n;
+  let phoffAddr = 0n;   // where the program headers actually landed, derived from the covering PT_LOAD
   let dynOffset = 0;
   let dynSize = 0;
   let interpPath: string | undefined;
@@ -101,9 +107,20 @@ export function loadElf(
     const pVaddr = dv.getBigUint64(phBase + 16, true) + loadBase;
     const pFilesz = Number(dv.getBigUint64(phBase + 32, true));
     const pMemsz = Number(dv.getBigUint64(phBase + 40, true));
+    const pFlags = dv.getUint32(phBase + 4, true);
 
     if (pType === PT_PHDR) {
       phdrAddr = pVaddr;
+    }
+
+    // AT_PHDR has to be the address the program headers were MAPPED at, and the only way to know
+    // that without a PT_PHDR entry is to find the PT_LOAD whose file range covers them. adding
+    // phoff to loadBase (which is 0 for a non-PIE binary) gave 0x40 for every static executable
+    // linked at 0x400000, so musl walked "program headers" at address 0x40 and read zeros: no
+    // PT_TLS found, no PT_GNU_RELRO, and dl_iterate_phdr -- which is how a c++ runtime unwinds --
+    // describing nothing at all. it looked harmless only because the null page was readable.
+    if (pType === PT_LOAD && phoffAddr === 0n && phoff >= pOffset && phoff < pOffset + pFilesz) {
+      phoffAddr = pVaddr + BigInt(phoff - pOffset);
     }
 
     if (pType === PT_DYNAMIC) {
@@ -145,6 +162,12 @@ export function loadElf(
       freshBytes.fill(0, wasmAddr + pFilesz, wasmAddr + pMemsz);
     }
 
+    // record where the segment landed so the caller can register it as a mapping. without this
+    // the image is invisible to the vma set, which is what /proc/self/maps, fork's memory
+    // snapshot and the page guard all read.
+    segs.push({ start: guestAddr & ~0xFFF, end: (guestAddr + pMemsz + 0xFFF) & ~0xFFF,
+                prot: ((pFlags & 4) ? 1 : 0) | ((pFlags & 2) ? 2 : 0) | ((pFlags & 1) ? 4 : 0) });
+
     // Track end of loaded segments for brk
     const segEnd = pVaddr + BigInt(pMemsz);
     if (segEnd > brkStart) {
@@ -152,9 +175,10 @@ export function loadElf(
     }
   }
 
-  // If no PT_PHDR, compute phdr address from first PT_LOAD + phoff
+  // no PT_PHDR: use the address the covering PT_LOAD put them at, falling back to the old guess
+  // only if the headers are somehow outside every mapped segment.
   if (phdrAddr === 0n) {
-    phdrAddr = loadBase + BigInt(phoff);
+    phdrAddr = phoffAddr !== 0n ? phoffAddr : loadBase + BigInt(phoff);
   }
 
   // NOTE: Do NOT apply RELR/RELA relocations here for PIE binaries.
@@ -172,6 +196,7 @@ export function loadElf(
     brkStart,
     loadBase,
     interpPath,
+    segs,
   };
 }
 
@@ -182,7 +207,7 @@ export function loadInterp(
   interpBytes: Uint8Array,
   memory: WebAssembly.Memory,
   base: bigint = INTERP_LOAD_BASE,
-): { entry: bigint; base: bigint } {
+): { entry: bigint; base: bigint; segs: LoadedSeg[] } {
   const dv = new DataView(interpBytes.buffer, interpBytes.byteOffset, interpBytes.byteLength);
   for (let i = 0; i < 4; i++) if (interpBytes[i] !== ELF_MAGIC[i]) throw new Error('interp not an ELF');
 
@@ -191,6 +216,7 @@ export function loadInterp(
   const phentSize = dv.getUint16(54, true);
   const phnum = dv.getUint16(56, true);
 
+  const segs: LoadedSeg[] = [];
   let lowestVaddr = 0xFFFFFFFFFFFFFFFFn;
   for (let i = 0; i < phnum; i++) {
     const phBase = phoff + i * phentSize;
@@ -219,9 +245,12 @@ export function loadInterp(
     const freshBytes = new Uint8Array(memory.buffer);
     if (pFilesz > 0) freshBytes.set(interpBytes.subarray(pOffset, pOffset + pFilesz), wasmAddr);
     if (pMemsz > pFilesz) freshBytes.fill(0, wasmAddr + pFilesz, wasmAddr + pMemsz);
+    const pFlags = dv.getUint32(phBase + 4, true);
+    segs.push({ start: Number(pVaddr) & ~0xFFF, end: (Number(pVaddr) + pMemsz + 0xFFF) & ~0xFFF,
+                prot: ((pFlags & 4) ? 1 : 0) | ((pFlags & 2) ? 2 : 0) | ((pFlags & 1) ? 4 : 0) });
   }
 
-  return { entry: rawEntry + loadBase, base: loadBase };
+  return { entry: rawEntry + loadBase, base: loadBase, segs };
 }
 
 // ── Apply RELR relocations ─────────────────────────────────────────────────
@@ -325,18 +354,19 @@ export function loadProgram(
   argv: string[],
   envp: string[],
   readInterp: (path: string) => Uint8Array,
-): { entry: bigint; sp: bigint; brkStart: bigint; interp: boolean } {
+): { entry: bigint; sp: bigint; brkStart: bigint; interp: boolean; segs: LoadedSeg[] } {
   const elfInfo = loadElf(elfBytes, memory);
   let startPC = elfInfo.entry;
   if (elfInfo.interpPath) {
     const interpBytes = readInterp(elfInfo.interpPath);
-    const { entry: iEntry, base: iBase } = loadInterp(interpBytes, memory);
+    const { entry: iEntry, base: iBase, segs: iSegs } = loadInterp(interpBytes, memory);
+    elfInfo.segs.push(...iSegs);
     elfInfo.interpBase = iBase;
     elfInfo.interpEntry = iEntry;
     startPC = iEntry;
   }
   const sp = setupStack(memory, elfInfo, argv, envp);
-  return { entry: startPC, sp, brkStart: elfInfo.brkStart, interp: !!elfInfo.interpPath };
+  return { entry: startPC, sp, brkStart: elfInfo.brkStart, interp: !!elfInfo.interpPath, segs: elfInfo.segs };
 }
 
 // ── Stack setup (Linux ABI) ─────────────────────────────────────────────────

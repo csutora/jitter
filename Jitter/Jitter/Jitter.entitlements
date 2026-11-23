@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- measured on maxwell (ipadOS 26.5, 15387 MiB): raises THIS process's jetsam limit from
+	     5120 MiB to 16384 MiB. it does NOT reach WebKit's content process, which the system
+	     spawns with the default 5120 MiB, so it buys room for native-side storage rather than
+	     for the guest memory itself. extended-virtual-addressing is not available to a personal
+	     development team, and is not needed: 49 GiB of address space is reservable without it. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

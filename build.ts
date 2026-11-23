@@ -1,5 +1,19 @@
 import * as esbuild from 'esbuild';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+
+// esbuild strips types without checking them, so a ReferenceError-class mistake (a renamed field,
+// a handler missing a parameter) bundles cleanly and only shows up as a dead syscall on the
+// device, half an hour of build-deploy-reproduce later. typecheck first; it costs a few seconds.
+// JITTER_SKIP_TSC=1 escapes it when you knowingly want a bundle from a broken tree.
+if (!process.env.JITTER_SKIP_TSC) {
+  try {
+    execFileSync('npx', ['tsc', '--noEmit', '-p', 'tsconfig.json'], { stdio: 'inherit' });
+  } catch {
+    console.error('\ntypecheck failed -- not bundling. set JITTER_SKIP_TSC=1 to bundle anyway.');
+    process.exit(1);
+  }
+}
 
 mkdirSync('dist', { recursive: true });
 

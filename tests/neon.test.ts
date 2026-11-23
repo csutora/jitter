@@ -674,3 +674,388 @@ describe('NEON single-lane LD1/ST1', () => {
     expect(v.getUint8(V_OFFSET + 3)).toBe(0xab);
   });
 });
+
+// the scalar compare-against-zero group. luajit's number->integer path emits `cmge d,d,#0`,
+// and hitting it as an undefined instruction is what stopped neovim from starting.
+// every encoding below came out of llvm-mc rather than being assembled by hand.
+describe('scalar SIMD compare-against-zero', () => {
+  const lo = (v: DataView, reg: number) => v.getBigUint64(V_OFFSET + reg * 16, true);
+  const hi = (v: DataView, reg: number) => v.getBigUint64(V_OFFSET + reg * 16 + 8, true);
+  const ONES = 0xffffffffffffffffn;
+
+  // insn, word, rd, then the expected lane for inputs 7, 0 and -3
+  const intCases: Array<[string, number, number, [bigint, bigint, bigint]]> = [
+    ['CMGE d0, d1, #0', 0x7ee08820, 0, [ONES, ONES, 0n]],
+    ['CMGT d2, d1, #0', 0x5ee08822, 2, [ONES, 0n, 0n]],
+    ['CMEQ d3, d1, #0', 0x5ee09823, 3, [0n, ONES, 0n]],
+    ['CMLE d4, d1, #0', 0x7ee09824, 4, [0n, ONES, ONES]],
+    ['CMLT d5, d1, #0', 0x5ee0a825, 5, [0n, 0n, ONES]],
+  ];
+
+  for (const [name, word, rd, [pos, zero, neg]] of intCases) {
+    it(name, () => {
+      if (!emu) return;
+      expect(lo(run(word, { 1: [7] }, 'i64'), rd)).toBe(pos);
+      expect(lo(run(word, { 1: [0] }, 'i64'), rd)).toBe(zero);
+      expect(lo(run(word, { 1: [-3] }, 'i64'), rd)).toBe(neg);
+    });
+  }
+
+  it('only touches the low 64 bits', () => {
+    if (!emu) return;
+    expect(hi(run(0x7ee08820, { 1: [7] }, 'i64'), 0)).toBe(0n);
+  });
+
+  it('ABS d6, d1 / NEG d7, d1', () => {
+    if (!emu) return;
+    expect(lo(run(0x5ee0b826, { 1: [-9] }, 'i64'), 6)).toBe(9n);
+    expect(lo(run(0x7ee0b827, { 1: [-9] }, 'i64'), 7)).toBe(9n);
+    expect(lo(run(0x7ee0b827, { 1: [9] }, 'i64'), 7)).toBe(BigInt.asUintN(64, -9n));
+  });
+
+  const fpCases: Array<[string, number, number, [bigint, bigint, bigint, bigint]]> = [
+    // insn, word, rd, results for 2.5, 0.0, -2.5, NaN
+    ['FCMGE d8, d1, #0.0', 0x7ee0c828, 8, [ONES, ONES, 0n, 0n]],
+    ['FCMGT d9, d1, #0.0', 0x5ee0c829, 9, [ONES, 0n, 0n, 0n]],
+    ['FCMEQ d10, d1, #0.0', 0x5ee0d82a, 10, [0n, ONES, 0n, 0n]],
+    ['FCMLE d11, d1, #0.0', 0x7ee0d82b, 11, [0n, ONES, ONES, 0n]],
+    ['FCMLT d12, d1, #0.0', 0x5ee0e82c, 12, [0n, 0n, ONES, 0n]],
+  ];
+  for (const [name, word, rd, exp] of fpCases) {
+    it(name, () => {
+      if (!emu) return;
+      const inputs = [2.5, 0, -2.5, NaN];
+      inputs.forEach((x, i) => expect(lo(run(word, { 1: [x] }, 'f64'), rd)).toBe(exp[i]));
+    });
+  }
+
+  it('the single-precision scalar form clears everything above bit 31', () => {
+    if (!emu) return;
+    // FCMGE s13, s1, #0.0 = 0x7ea0c82d. lane 1 of v1 is deliberately made to compare true,
+    // so a q=0 vector emit would leave 0xffffffff sitting in bits 63:32.
+    const v = run(0x7ea0c82d, { 1: [2.5, 4.0, 0, 0] }, 'f32');
+    expect(lo(v, 13)).toBe(0xffffffffn);
+    expect(hi(v, 13)).toBe(0n);
+  });
+});
+
+describe('NEON vector compare-against-zero (FP)', () => {
+  it('FCMGE v15.4s, v1.4s, #0.0 — was silently emitting FABS', () => {
+    if (!emu) return;
+    const v = run(0x6ea0c82f, { 1: [1.5, -1.5, 0, -0.5] }, 'f32');
+    const base = V_OFFSET + 15 * 16;
+    expect([0, 1, 2, 3].map((i) => v.getUint32(base + i * 4, true)))
+      .toEqual([0xffffffff, 0, 0xffffffff, 0]);
+  });
+
+  it('FCMLT v16.4s, v1.4s, #0.0', () => {
+    if (!emu) return;
+    const v = run(0x4ea0e830, { 1: [1.5, -1.5, 0, 0] }, 'f32');
+    const base = V_OFFSET + 16 * 16;
+    expect([0, 1].map((i) => v.getUint32(base + i * 4, true))).toEqual([0, 0xffffffff]);
+    expect(v.getBigUint64(base + 8, true)).toBe(0n); // q=0
+  });
+
+  it('FCMLE v17.2d, v1.2d, #0.0', () => {
+    if (!emu) return;
+    const v = run(0x6ee0d831, { 1: [-1.5, 1.5] }, 'f64');
+    const base = V_OFFSET + 17 * 16;
+    expect(v.getBigUint64(base, true)).toBe(0xffffffffffffffffn);
+    expect(v.getBigUint64(base + 8, true)).toBe(0n);
+  });
+});
+
+describe('CMTST (was silently emitting ADD)', () => {
+  it('CMTST v0.16b, v1.16b, v2.16b', () => {
+    if (!emu) return;
+    const v = run(0x4e228c20, { 1: [0x0f, 0x00, 0x33, 0x01], 2: [0xf0, 0xff, 0x30, 0x02] }, 'i8');
+    const base = V_OFFSET;
+    // lane0: 0x0f & 0xf0 == 0 -> 0. lane1: 0 & anything == 0 -> 0.
+    // lane2: 0x33 & 0x30 != 0 -> 0xff. lane3: 1 & 2 == 0 -> 0.
+    expect([0, 1, 2, 3].map((i) => v.getUint8(base + i))).toEqual([0, 0, 0xff, 0]);
+  });
+
+  it('CMTST v3.2d, v1.2d, v2.2d', () => {
+    if (!emu) return;
+    const v = run(0x4ee28c23, { 1: [5, 8], 2: [1, 1] }, 'i64');
+    const base = V_OFFSET + 3 * 16;
+    expect(v.getBigUint64(base, true)).toBe(0xffffffffffffffffn); // 5 & 1 = 1
+    expect(v.getBigUint64(base + 8, true)).toBe(0n);              // 8 & 1 = 0
+  });
+});
+
+// MLA/MLS were not decoded at all, which is a SIGILL the moment any vectorised
+// multiply-accumulate runs (musl's malloc path hits it).
+describe('MLA / MLS (vector multiply-accumulate)', () => {
+  it('MLA .16b keeps the low byte of each product', () => {
+    if (!emu) return;
+    const v = run(0x4e229420, { 0: [100, 5, 0, 1], 1: [3, 7, 9, 0x40], 2: [4, 6, 0, 4] }, 'i8');
+    // 100+3*4=112, 5+7*6=47, 0, 1 + (0x40*4 = 0x100 -> low byte 0) = 1
+    expect(i8lanes(v, 0, 4)).toEqual([112, 47, 0, 1]);
+  });
+
+  it('MLS .16b subtracts', () => {
+    if (!emu) return;
+    const v = run(0x6e229423, { 3: [100, 50], 1: [3, 7], 2: [4, 6] }, 'i8');
+    expect(i8lanes(v, 3, 2)).toEqual([88, 8]);
+  });
+
+  it('MLA / MLS .8h', () => {
+    if (!emu) return;
+    let v = run(0x4e629424, { 4: [1000, 2000], 1: [3, 7], 2: [4, 6] }, 'i16');
+    expect(v.getInt16(V_OFFSET + 4 * 16, true)).toBe(1012);
+    expect(v.getInt16(V_OFFSET + 4 * 16 + 2, true)).toBe(2042);
+    v = run(0x6e629425, { 5: [1000, 2000], 1: [3, 7], 2: [4, 6] }, 'i16');
+    expect(v.getInt16(V_OFFSET + 5 * 16, true)).toBe(988);
+    expect(v.getInt16(V_OFFSET + 5 * 16 + 2, true)).toBe(1958);
+  });
+
+  it('MLA / MLS .4s', () => {
+    if (!emu) return;
+    let v = run(0x4ea29426, { 6: [10, 20, 30, 40], 1: [1, 2, 3, 4], 2: [5, 5, 5, 5] }, 'i32');
+    expect(i32lanes(v, 6, 4)).toEqual([15, 30, 45, 60]);
+    v = run(0x6ea29427, { 7: [10, 20, 30, 40], 1: [1, 2, 3, 4], 2: [5, 5, 5, 5] }, 'i32');
+    expect(i32lanes(v, 7, 4)).toEqual([5, 10, 15, 20]);
+  });
+
+  it('MLA .2s clears the upper half', () => {
+    if (!emu) return;
+    const v = run(0x0ea29428, { 8: [1, 2, 99, 99], 1: [1, 1, 1, 1], 2: [7, 7, 7, 7] }, 'i32');
+    expect(i32lanes(v, 8, 4)).toEqual([8, 9, 0, 0]);
+  });
+
+  it('MLA .16b with negative accumulator lanes', () => {
+    if (!emu) return;
+    const v = run(0x4e229420, { 0: [-5, -100], 1: [2, 3], 2: [3, 3] }, 'i8');
+    expect(i8lanes(v, 0, 2)).toEqual([1, -91]);
+  });
+});
+
+// scalar FRINT<mode> and the rounding FCVTs. only the round-toward-zero pair used to decode,
+// so math.floor (luajit) and lround (musl) were illegal instructions.
+describe('scalar FP rounding', () => {
+  const d0 = (v: DataView, reg: number) => v.getFloat64(V_OFFSET + reg * 16, true);
+  const x = (v: DataView, reg: number) => v.getBigInt64(reg * 8, true);
+
+  const cases: Array<[string, number, number, Record<string, number>]> = [
+    // insn name, word, dest reg, input -> expected
+    ['FRINTM (floor)', 0x1e654020, 0, { '2.7': 2, '-2.1': -3, '-0.3': -1, '0.7': 0, '2': 2 }],
+    ['FRINTP (ceil)', 0x1e64c022, 2, { '2.1': 3, '-2.7': -2, '-0.3': -0, '2': 2 }],
+    ['FRINTZ (trunc)', 0x1e65c023, 3, { '2.7': 2, '-2.7': -2, '-0.3': -0 }],
+    ['FRINTA (ties away)', 0x1e664024, 4, { '0.5': 1, '-0.5': -1, '2.5': 3, '1.5': 2, '-2.5': -3 }],
+    ['FRINTN (ties even)', 0x1e644025, 5, { '0.5': 0, '-0.5': -0, '2.5': 2, '1.5': 2, '3.5': 4 }],
+    ['FRINTX (current mode)', 0x1e674026, 6, { '2.5': 2, '0.5': 0 }],
+  ];
+  for (const [name, word, rd, table] of cases) {
+    it(name, () => {
+      if (!emu) return;
+      for (const [inp, want] of Object.entries(table)) {
+        const got = d0(run(word, { 1: [Number(inp)] }, 'f64'), rd);
+        expect(`${inp} -> ${Object.is(got, -0) ? '-0' : got}`).toBe(`${inp} -> ${Object.is(want, -0) ? '-0' : want}`);
+      }
+    });
+  }
+
+  it('FRINTM s7, s1 (single precision)', () => {
+    if (!emu) return;
+    const v = run(0x1e254027, { 1: [-2.5] }, 'f32');
+    expect(v.getFloat32(V_OFFSET + 7 * 16, true)).toBe(-3);
+  });
+
+  it('FRINT passes NaN and infinity through', () => {
+    if (!emu) return;
+    expect(d0(run(0x1e654020, { 1: [Infinity] }, 'f64'), 0)).toBe(Infinity);
+    expect(d0(run(0x1e664024, { 1: [-Infinity] }, 'f64'), 4)).toBe(-Infinity);
+    expect(Number.isNaN(d0(run(0x1e654020, { 1: [NaN] }, 'f64'), 0))).toBe(true);
+  });
+
+  it('FCVTAS / FCVTAU x, d (nearest, ties away)', () => {
+    if (!emu) return;
+    expect(x(run(0x9e640020, { 1: [2.5] }, 'f64'), 0)).toBe(3n);
+    expect(x(run(0x9e640020, { 1: [-2.5] }, 'f64'), 0)).toBe(-3n);
+    expect(x(run(0x9e650021, { 1: [2.5] }, 'f64'), 1)).toBe(3n);
+  });
+
+  it('FCVTMS / FCVTPS / FCVTNS x, d', () => {
+    if (!emu) return;
+    expect(x(run(0x9e700022, { 1: [2.7] }, 'f64'), 2)).toBe(2n);   // floor
+    expect(x(run(0x9e700022, { 1: [-2.1] }, 'f64'), 2)).toBe(-3n);
+    expect(x(run(0x9e680023, { 1: [2.1] }, 'f64'), 3)).toBe(3n);   // ceil
+    expect(x(run(0x9e600024, { 1: [2.5] }, 'f64'), 4)).toBe(2n);   // ties even
+    expect(x(run(0x9e600024, { 1: [3.5] }, 'f64'), 4)).toBe(4n);
+  });
+
+  it('FCVTMS w5, d1 (32-bit destination)', () => {
+    if (!emu) return;
+    expect(x(run(0x1e700025, { 1: [-2.1] }, 'f64'), 5) & 0xffffffffn).toBe(0xfffffffdn);
+  });
+});
+
+describe('scalar SIMD three-same (d-form)', () => {
+  const lo = (v: DataView, reg: number) => v.getBigUint64(V_OFFSET + reg * 16, true);
+  const hi = (v: DataView, reg: number) => v.getBigUint64(V_OFFSET + reg * 16 + 8, true);
+
+  it('ADD d9, d1, d2 / SUB d10, d1, d2', () => {
+    if (!emu) return;
+    let v = run(0x5ee28429, { 1: [7], 2: [5] }, 'i64');
+    expect(lo(v, 9)).toBe(12n);
+    expect(hi(v, 9)).toBe(0n);
+    v = run(0x7ee2842a, { 1: [7], 2: [5] }, 'i64');
+    expect(lo(v, 10)).toBe(2n);
+  });
+
+  it('CMGE d11, d1, d2', () => {
+    if (!emu) return;
+    expect(lo(run(0x5ee23c2b, { 1: [7], 2: [5] }, 'i64'), 11)).toBe(0xffffffffffffffffn);
+    expect(lo(run(0x5ee23c2b, { 1: [3], 2: [5] }, 'i64'), 11)).toBe(0n);
+  });
+
+  it('UQSUB h12, h1, h2 saturates and zeroes everything above the halfword', () => {
+    if (!emu) return;
+    const v = run(0x7e622c2c, { 1: [3, 0x7fff, 0x7fff, 0x7fff], 2: [10, 1, 1, 1] }, 'i16');
+    expect(v.getUint16(V_OFFSET + 12 * 16, true)).toBe(0); // 3 - 10 saturates to 0
+    expect(v.getUint16(V_OFFSET + 12 * 16 + 2, true)).toBe(0); // not a second lane
+    expect(hi(v, 12)).toBe(0n);
+  });
+});
+
+describe('FCCMP and scalar fixed-point converts', () => {
+  const nzcv = (v: DataView) => v.getUint32(0x108, true) >>> 28;
+
+  it('FCCMP compares when the condition holds', () => {
+    if (!emu) return;
+    // set NZCV to Z first via a compare of equals, then FCCMP d1,d2,#0,eq (0x1e620420):
+    // eq holds, so the real compare runs and 1 vs 2 gives N set (less than)
+    const v = new DataView(emu!.memory.buffer);
+    v.setUint32(0x108, 0x4 << 28, true); // Z
+    const r = run(0x1e620420, { 1: [1], 2: [2] }, 'f64');
+    expect(nzcv(r) & 0x8).toBe(0x8); // N: 1 < 2
+  });
+
+  it('FCCMP installs the immediate flags when the condition fails', () => {
+    if (!emu) return;
+    const v = new DataView(emu!.memory.buffer);
+    v.setUint32(0x108, 0x4 << 28, true); // Z set, so `ne` fails
+    // FCCMP d1, d2, #6, ne = 0x1e621426
+    const r = run(0x1e621426, { 1: [1], 2: [2] }, 'f64');
+    expect(nzcv(r)).toBe(6);
+  });
+
+  it('UCVTF d0, d1, #10 scales by 2^-10', () => {
+    if (!emu) return;
+    const v = run(0x7f76e420, { 1: [1024] }, 'i64');
+    expect(v.getFloat64(V_OFFSET, true)).toBe(1);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n);
+  });
+
+  it('SCVTF d2, d1, #4 handles negatives', () => {
+    if (!emu) return;
+    const v = run(0x5f7ce422, { 1: [-24] }, 'i64');
+    expect(v.getFloat64(V_OFFSET + 2 * 16, true)).toBe(-1.5);
+  });
+
+  it('FCVTZU d3, d1, #8 scales back up', () => {
+    if (!emu) return;
+    const v = run(0x7f78fc23, { 1: [2.5] }, 'f64');
+    expect(v.getBigUint64(V_OFFSET + 3 * 16, true)).toBe(640n); // 2.5 * 256
+  });
+});
+
+// the families that a scan of the whole upstream ltp corpus found undecodable
+// (tools/scan-decode.ts). every word here is one llvm-objdump printed from a real binary.
+describe('decode gaps found by scanning the corpus', () => {
+  it('ADDP d0, v0.2d sums the two doublewords', () => {
+    if (!emu) return;
+    const v = run(0x5ef1b800, { 0: [7, 35] }, 'i64');
+    expect(v.getBigInt64(V_OFFSET, true)).toBe(42n);
+    expect(v.getBigUint64(V_OFFSET + 8, true)).toBe(0n); // everything above the element is zeroed
+  });
+
+  it('FADDP d3, v3.2d adds the pair of doubles', () => {
+    if (!emu) return;
+    const v = run(0x7e70d863, { 3: [1.5, 2.25] }, 'f64');
+    expect(v.getFloat64(V_OFFSET + 3 * 16, true)).toBe(3.75);
+    expect(v.getBigUint64(V_OFFSET + 3 * 16 + 8, true)).toBe(0n);
+  });
+
+  it('FADDP s5, v5.2s adds the pair of singles', () => {
+    if (!emu) return;
+    const v = run(0x7e30d8a5, { 5: [1.5, 2.25] }, 'f32');
+    expect(v.getFloat32(V_OFFSET + 5 * 16, true)).toBe(3.75);
+    expect(v.getBigUint64(V_OFFSET + 5 * 16 + 8, true)).toBe(0n);
+  });
+
+  it('USHL v1.2s, v1.2s, v2.2s shifts left on a positive count', () => {
+    if (!emu) return;
+    // v2 lanes hold the SIGNED shift counts in their low bytes
+    const v = run(0x2ea24421, { 1: [1, 0x30], 2: [4, 2] }, 'i32');
+    expect(v.getUint32(V_OFFSET + 1 * 16, true)).toBe(16);
+    expect(v.getUint32(V_OFFSET + 1 * 16 + 4, true)).toBe(0xc0);
+  });
+
+  it('USHL shifts RIGHT on a negative count, and clears past the lane width', () => {
+    if (!emu) return;
+    const v = run(0x2ea24421, { 1: [0x100, 0x40], 2: [-4, -40] }, 'i32');
+    expect(v.getUint32(V_OFFSET + 1 * 16, true)).toBe(0x10);
+    expect(v.getUint32(V_OFFSET + 1 * 16 + 4, true)).toBe(0); // a count past 32 zeroes the lane
+  });
+
+  it('USRA v18.4s, v17.4s, #31 shifts right and ACCUMULATES', () => {
+    if (!emu) return;
+    const v = new DataView(emu!.memory.buffer);
+    // seed the destination: usra adds into what Vd already holds
+    const seed = () => { for (let i = 0; i < 4; i++) v.setUint32(V_OFFSET + 18 * 16 + i * 4, 5, true); };
+    v.setUint32(PC + GUEST_MEM_BASE, 0x6f211632, true);
+    v.setUint32(PC + 4 + GUEST_MEM_BASE, RET, true);
+    for (let i = 0; i < 32; i++) { v.setBigUint64(V_OFFSET + i * 16, 0n, true); v.setBigUint64(V_OFFSET + i * 16 + 8, 0n, true); }
+    for (let i = 0; i < 4; i++) v.setUint32(V_OFFSET + 17 * 16 + i * 4, 0x80000000, true);
+    seed();
+    v.setBigUint64(0x100, BigInt(PC), true);
+    v.setBigUint64(0xf8, 0x700000n, true);
+    v.setBigUint64(30 * 8, BigInt(PC + 0x800), true);
+    (emu as any).regionCache.clear();
+    (emu as any).getRegion(BigInt(PC)).run();
+    // 0x80000000 >>> 31 == 1, plus the 5 already in the lane
+    for (let i = 0; i < 4; i++) expect(v.getUint32(V_OFFSET + 18 * 16 + i * 4, true)).toBe(6);
+  });
+
+  it('FMUL v4.2d, v4.2d, v2.d[0] multiplies every lane by one element', () => {
+    if (!emu) return;
+    const v = run(0x4fc29084, { 4: [3, 5], 2: [7, 100] }, 'f64');
+    expect(v.getFloat64(V_OFFSET + 4 * 16, true)).toBe(21);
+    expect(v.getFloat64(V_OFFSET + 4 * 16 + 8, true)).toBe(35);
+  });
+
+  it('FMUL d4, d2, v3.d[1] takes the HIGH lane in the scalar form', () => {
+    if (!emu) return;
+    const v = run(0x5fc39844, { 2: [3], 3: [0, 11] }, 'f64');
+    expect(v.getFloat64(V_OFFSET + 4 * 16, true)).toBe(33);
+    expect(v.getBigUint64(V_OFFSET + 4 * 16 + 8, true)).toBe(0n);
+  });
+
+  it('FCVT h0, s1 rounds a single to binary16 and back', () => {
+    if (!emu) return;
+    // s -> h, then h -> s: 1.5 is exact in half precision
+    let v = run(0x1e23c020, { 1: [1.5] }, 'f32');
+    expect(v.getUint16(V_OFFSET, true)).toBe(0x3e00);
+    v = run(0x1ee24001, { 0: [] }, 'f32');
+    // rerun with h0 seeded by hand: the harness zeroes registers between runs
+    const dv = new DataView(emu!.memory.buffer);
+    dv.setUint32(PC + GUEST_MEM_BASE, 0x1ee24001, true); // fcvt s1, h0
+    dv.setUint32(PC + 4 + GUEST_MEM_BASE, RET, true);
+    for (let i = 0; i < 32; i++) { dv.setBigUint64(V_OFFSET + i * 16, 0n, true); dv.setBigUint64(V_OFFSET + i * 16 + 8, 0n, true); }
+    dv.setUint16(V_OFFSET, 0x3e00, true);
+    dv.setBigUint64(0x100, BigInt(PC), true);
+    dv.setBigUint64(0xf8, 0x700000n, true);
+    dv.setBigUint64(30 * 8, BigInt(PC + 0x800), true);
+    (emu as any).regionCache.clear();
+    (emu as any).getRegion(BigInt(PC)).run();
+    expect(dv.getFloat32(V_OFFSET + 1 * 16, true)).toBe(1.5);
+  });
+
+  it('FCVT h0, s1 saturates a too-large single to infinity', () => {
+    if (!emu) return;
+    const v = run(0x1e23c020, { 1: [1e30] }, 'f32');
+    expect(v.getUint16(V_OFFSET, true)).toBe(0x7c00); // +inf
+  });
+});

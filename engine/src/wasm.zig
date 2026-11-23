@@ -100,6 +100,7 @@ pub const Op = enum(u8) {
     i32_add = 0x6a,
     i32_sub = 0x6b,
     i32_mul = 0x6c,
+    i32_div_u = 0x6e,
     i32_and = 0x71,
     i32_or = 0x72,
     i32_xor = 0x73,
@@ -124,6 +125,76 @@ pub const Op = enum(u8) {
     i64_shr_u = 0x88,
     i64_rotl = 0x89,
     i64_rotr = 0x8a,
+
+    // ── floating point ──
+    // scalar fp used to be carried as i64 bit patterns and computed by calling out to javascript
+    // helpers. wasm has all of this natively, and the V registers are already bit patterns in
+    // linear memory, so an f64.load reads one with no reinterpret at all.
+    f32_load = 0x2a,
+    f64_load = 0x2b,
+    f32_store = 0x38,
+    f64_store = 0x39,
+    f32_const = 0x43,
+    f64_const = 0x44,
+
+    f32_eq = 0x5b,
+    f32_ne = 0x5c,
+    f32_lt = 0x5d,
+    f32_gt = 0x5e,
+    f32_le = 0x5f,
+    f32_ge = 0x60,
+    f64_eq = 0x61,
+    f64_ne = 0x62,
+    f64_lt = 0x63,
+    f64_gt = 0x64,
+    f64_le = 0x65,
+    f64_ge = 0x66,
+
+    f32_abs = 0x8b,
+    f32_neg = 0x8c,
+    f32_ceil = 0x8d,
+    f32_floor = 0x8e,
+    f32_trunc = 0x8f,
+    f32_nearest = 0x90,
+    f32_sqrt = 0x91,
+    f32_add = 0x92,
+    f32_sub = 0x93,
+    f32_mul = 0x94,
+    f32_div = 0x95,
+    f32_min = 0x96,
+    f32_max = 0x97,
+    f32_copysign = 0x98,
+
+    f64_abs = 0x99,
+    f64_neg = 0x9a,
+    f64_ceil = 0x9b,
+    f64_floor = 0x9c,
+    f64_trunc = 0x9d,
+    f64_nearest = 0x9e,
+    f64_sqrt = 0x9f,
+    f64_add = 0xa0,
+    f64_sub = 0xa1,
+    f64_mul = 0xa2,
+    f64_div = 0xa3,
+    f64_min = 0xa4,
+    f64_max = 0xa5,
+    f64_copysign = 0xa6,
+
+    f32_convert_i32_s = 0xb2,
+    f32_convert_i32_u = 0xb3,
+    f32_convert_i64_s = 0xb4,
+    f32_convert_i64_u = 0xb5,
+    f32_demote_f64 = 0xb6,
+    f64_convert_i32_s = 0xb7,
+    f64_convert_i32_u = 0xb8,
+    f64_convert_i64_s = 0xb9,
+    f64_convert_i64_u = 0xba,
+    f64_promote_f32 = 0xbb,
+
+    i32_reinterpret_f32 = 0xbc,
+    i64_reinterpret_f64 = 0xbd,
+    f32_reinterpret_i32 = 0xbe,
+    f64_reinterpret_i64 = 0xbf,
 
     i32_wrap_i64 = 0xa7,
     i64_extend_i32_s = 0xac,
@@ -402,11 +473,18 @@ pub const Body = struct {
 
     /// software page-protection guard. when prot_active_global is set, guest loads/stores emit a
     /// guard that (only while the imported prot_active global is non-zero) checks a per-page
-    /// permission byte at prot_base + (guest_page) and calls mem_fault_fn on a violation. null =>
-    /// no guard emitted (byte-identical to the unprotected translator).
+    /// permission byte at prot_base_global + (guest_page) and calls mem_fault_fn on a violation.
+    /// null => no guard emitted (byte-identical to the unprotected translator). the table's base is a
+    /// mutable global rather than a constant so the host can relocate the table without recompiling.
     prot_active_global: ?u32 = null,
+    prot_base_global: ?u32 = null,
     mem_fault_fn: u32 = 0,
-    prot_base: u32 = 0,
+
+    /// the guest pc of the instruction currently being emitted. the guard writes it to the state
+    /// block before trapping, so the host knows WHICH instruction faulted -- without it the host
+    /// only had the block's entry pc, and a fault that the host can recover from (growing a
+    /// MAP_GROWSDOWN stack) resumed at the top of the block and re-ran everything in between.
+    cur_pc: u64 = 0,
 
     /// push the linear-memory address of a register-file slot at byte offset `off`. threaded
     /// modules resolve it against the per-thread reg_base global; single-threaded ones use the
@@ -458,6 +536,11 @@ pub const Body = struct {
         try self.bytes.append(self.arena, @intFromEnum(bt));
     }
 
+    pub fn emitIf(self: *Body, bt: BlockType) !void {
+        try self.bytes.append(self.arena, @intFromEnum(Op.@"if"));
+        try self.bytes.append(self.arena, @intFromEnum(bt));
+    }
+
     pub fn emitConstI64(self: *Body, v: i64) !void {
         try self.emit(.i64_const);
         try self.emitI64(v);
@@ -474,6 +557,61 @@ pub const Body = struct {
     pub fn storeI64(self: *Body, addr: u32) !void {
         try self.emit(.i64_store);
         try self.emitMemArg(3, addr);
+    }
+
+    pub fn storeI32(self: *Body, addr: u32) !void {
+        try self.emit(.i32_store);
+        try self.emitMemArg(2, addr);
+    }
+
+    /// the saturating float-to-int converts, which live behind the 0xfc prefix. these are an
+    /// exact match for ARM's FCVT* semantics: out of range clamps to the destination's limit and
+    /// a NaN becomes zero, which is precisely what the hand-written saturation was reproducing.
+    pub const TruncSat = struct {
+        pub const i32_from_f32_s: u32 = 0;
+        pub const i32_from_f32_u: u32 = 1;
+        pub const i32_from_f64_s: u32 = 2;
+        pub const i32_from_f64_u: u32 = 3;
+        pub const i64_from_f32_s: u32 = 4;
+        pub const i64_from_f32_u: u32 = 5;
+        pub const i64_from_f64_s: u32 = 6;
+        pub const i64_from_f64_u: u32 = 7;
+    };
+
+    pub fn emitTruncSat(self: *Body, sub_op: u32) !void {
+        try self.bytes.append(self.arena, 0xfc);
+        try writeULEB128(&self.bytes, self.arena, sub_op);
+    }
+
+    /// load/store a native float at a fixed address. the V register block is 8-byte aligned, so
+    /// both widths are naturally aligned.
+    pub fn loadF64(self: *Body, addr: u32) !void { try self.emit(.f64_load); try self.emitMemArg(3, addr); }
+    pub fn loadF32(self: *Body, addr: u32) !void { try self.emit(.f32_load); try self.emitMemArg(2, addr); }
+    pub fn storeF64(self: *Body, addr: u32) !void { try self.emit(.f64_store); try self.emitMemArg(3, addr); }
+    pub fn storeF32(self: *Body, addr: u32) !void { try self.emit(.f32_store); try self.emitMemArg(2, addr); }
+
+    pub fn emitConstF32(self: *Body, v: f32) !void {
+        try self.emit(.f32_const);
+        const b: u32 = @bitCast(v);
+        var i: u5 = 0;
+        while (i < 4) : (i += 1) try self.bytes.append(self.arena, @truncate(b >> (i * 8)));
+    }
+
+    pub fn emitConstF64(self: *Body, v: f64) !void {
+        try self.emit(.f64_const);
+        const b: u64 = @bitCast(v);
+        var i: u6 = 0;
+        while (i < 8) : (i += 1) try self.bytes.append(self.arena, @truncate(b >> (i * 8)));
+    }
+
+    pub fn storeI16(self: *Body, addr: u32) !void {
+        try self.emit(.i32_store16);
+        try self.emitMemArg(1, addr);
+    }
+
+    pub fn storeI8(self: *Body, addr: u32) !void {
+        try self.emit(.i32_store8);
+        try self.emitMemArg(0, addr);
     }
 
     pub fn loadI64(self: *Body, addr: u32) !void {
@@ -493,6 +631,13 @@ pub const Body = struct {
     pub fn emitSimd(self: *Body, sub_op: u32) !void {
         try self.bytes.append(self.arena, 0xfd);
         try writeULEB128(&self.bytes, self.arena, sub_op);
+    }
+
+    /// i8x16.shuffle: picks 16 bytes out of the two v128 operands on the stack, where lane
+    /// indices 0..15 name the first and 16..31 the second. the selection is immediate.
+    pub fn emitShuffle(self: *Body, lanes: [16]u8) !void {
+        try self.emitSimd(Simd.i8x16_shuffle);
+        for (lanes) |l| try self.bytes.append(self.arena, l);
     }
 
     /// v128.load from linear memory (address already on stack). alignment is the

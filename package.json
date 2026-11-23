@@ -10,6 +10,7 @@
     "serve": "npx serve dist"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "esbuild": "^0.24.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",

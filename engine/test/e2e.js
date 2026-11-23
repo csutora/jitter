@@ -59,8 +59,8 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
   if (!magic) throw new Error('bad wasm magic');
 
   // instantiate the produced module with a shared memory
-  const guestMem = new WebAssembly.Memory({ initial: Math.max(1, 3), maximum: 65536, shared: true });
-  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem } }).then(({ instance: inst2 }) => {
+  const guestMem = new WebAssembly.Memory({ initial: 40, maximum: 40 });
+  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem, reg_base: 0, simd_op: () => { throw new Error('simd_op'); }, mem_fault: () => { throw new Error('mem_fault: guest access out of bounds'); } } }).then(({ instance: inst2 }) => {
     out('guest module exports: ' + Object.keys(inst2.exports).sort().join(', '));
     const result = inst2.exports.run();
     // result is i64; jsc returns it as bigint

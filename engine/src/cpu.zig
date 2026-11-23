@@ -11,10 +11,22 @@ pub const tpidr_offset: u32 = 0x118; // tpidr_el0 (tls base)
 // this granule's range clears the matching shadow bit; STXR verifies bit still set
 pub const monitor_addr_offset: u32 = 0x120;
 pub const monitor_value_offset: u32 = 0x128;
-pub const monitor_size_offset: u32 = 0x130; // bytes (1/2/4/8); 0 = invalid
+pub const monitor_size_offset: u32 = 0x130; // bytes (1/2/4/8/16); 0 = invalid
+// the second half of a PAIR reservation (ldxp/stxp). a pair is one reservation of 8 or 16 bytes,
+// and stxp has to compare BOTH halves against what ldxp saw, so the monitor needs both values.
+pub const monitor_value2_offset: u32 = 0x138;
 pub const v_offset: u32 = 0x200; // v0..v31 simd registers, 16 bytes each
 pub const state_size: u32 = 0x400;
-pub const guest_mem_base: u32 = 0x10000;
+// guest linear-memory base. the space BELOW it is host-reserved: the null-pointer trap page and the
+// page-protection permission table (see prot_table_base). must match GUEST_MEM_BASE in src/types.ts.
+pub const guest_mem_base: u32 = 0x80000;
+// a lock word for the 128-bit pair operations, in the host-reserved space below the guest (just
+// above the "protection table painted" flag at 0x8000 and below the table itself at 0x9000).
+// wasm has no 128-bit atomic, so stxp and casp on a THREADED process take this lock for the few
+// instructions the pair spans; a single-threaded process never touches it. it lives in guest
+// memory rather than in the cpu state block because the state block is per-THREAD, and the point
+// is to exclude the other threads of the same process. must stay below prot_table_base.
+pub const pair_lock_offset: u32 = 0x8008;
 
 // exclusive-reservation-granule. arm ARM permits 8..128, we pick 64 (arm cache line)
 pub const erg_log2: u5 = 6; // 1 << 6 == 64

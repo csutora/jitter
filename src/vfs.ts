@@ -10,6 +10,7 @@
  */
 
 import { GUEST_MEM_BASE } from './types.js';
+import { PIPE_PAGES_SOFT } from './kernel-ipc.js';
 import type { VFS } from './syscall.js';
 
 // ── Error constants (Linux errno values) ────────────────────────────────────
@@ -82,6 +83,16 @@ interface FileInode extends InodeBase {
   data: Uint8Array;
   // synthetic /proc files whose content depends on live kernel state: refreshed on every open.
   dynamic?: () => Uint8Array;
+  // a file whose content is computed per RANGE rather than materialised. /proc/self/pagemap is one
+  // 64-bit word per page of the address space -- megabytes of mostly-identical entries -- and a
+  // reader seeks straight to the page it cares about. building the whole thing on every open would
+  // be pure waste.
+  ranged?: { size: number; read: (offset: number, len: number) => Uint8Array };
+  /** a sysctl: writing it changes a system setting rather than a file's contents. returns 0 or a
+   *  negative errno. without this, `echo 4096 > /proc/sys/...` succeeds, changes the bytes, and
+   *  changes nothing about the system -- a setting that reads back the value you wrote and is
+   *  ignored by everything is worse than one that refuses. */
+  sysctlWrite?: (text: string) => number;
 }
 
 interface DirInode extends InodeBase {
@@ -92,7 +103,11 @@ interface DirInode extends InodeBase {
 
 interface CharDevInode extends InodeBase {
   type: 'chardev';
-  devno: number;     // device number (1=null, 2=zero, 3=tty, 4=urandom)
+  // the REAL linux device numbers. these are not decoration: st_rdev is how a program identifies
+  // a device (and how it tells /dev/null from /dev/zero without trusting the name), and a node
+  // copied out of here onto a real filesystem has to carry numbers that mean the same thing there.
+  major: number;
+  minor: number;
 }
 
 interface SymlinkInode extends InodeBase {
@@ -107,11 +122,29 @@ interface FifoInode extends InodeBase {
 
 type Inode = FileInode | DirInode | CharDevInode | SymlinkInode | FifoInode;
 
+/** one live process, as read out of the kernel's shared process table. */
+export interface ProcInfo {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  sid?: number;
+  tgid: number;
+  state: number;
+  blocked: boolean;
+  comm: string;
+  cmdline: string;
+  utimeMs?: number;
+  syscall?: number;
+  stimeMs?: number;
+  nice?: number;
+}
+
 // ── Open File Description (OFD) ────────────────────────────────────────────
 // Created by open(), shared between dup'd fds and across fork.
 
 interface FileOFD {
   type: 'file';
+  path: string;
   inode: FileInode;
   pos: number;       // shared seek position
   flags: number;     // O_ status flags (O_APPEND, O_NONBLOCK, etc.)
@@ -122,6 +155,7 @@ interface FileOFD {
 
 interface DirOFD {
   type: 'dir';
+  path: string;
   inode: DirInode;
   entries: string[]; // snapshot of children at open time, including . and ..
   pos: number;       // index for getdents64
@@ -130,12 +164,14 @@ interface DirOFD {
 
 interface CharDevOFD {
   type: 'chardev';
+  path: string;
   inode: CharDevInode;
   refcount: number;
 }
 
 interface FifoOFD {
   type: 'fifo';
+  path: string;
   inode: FifoInode;
   accessMode: number;
   refcount: number;
@@ -144,6 +180,56 @@ interface FifoOFD {
 type OFD = FileOFD | DirOFD | CharDevOFD | FifoOFD;
 
 // ── InMemoryVFS ─────────────────────────────────────────────────────────────
+
+/**
+ * how many cpus the guest has.
+ *
+ * a guest process is a worker and a guest thread is a worker, and the browser runs them on the
+ * machine's real cores -- so the honest number is the host's, bounded at 64 because that is what
+ * one word of an affinity mask holds.
+ */
+/**
+ * a gzip stream whose deflate blocks are STORED (uncompressed).
+ *
+ * /proc/config.gz is gzip because that is the name and format the kernel exposes it under, and
+ * programs open it with a gzip reader. stored blocks are a legal deflate encoding, so the file is
+ * a real gzip file that any reader accepts -- and it needs neither a compressor nor an async api
+ * to produce, which matters because this filesystem is built synchronously.
+ */
+function gzipStored(data: Uint8Array): Uint8Array {
+  const blocks = Math.max(1, Math.ceil(data.length / 65535));
+  const out = new Uint8Array(10 + blocks * 5 + data.length + 8);
+  out.set([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3], 0);
+  let o = 10;
+  for (let i = 0; i < blocks; i++) {
+    const start = i * 65535;
+    const len = Math.min(65535, data.length - start);
+    out[o++] = i === blocks - 1 ? 1 : 0;        // BFINAL on the last, BTYPE=00 (stored)
+    out[o++] = len & 0xff; out[o++] = (len >> 8) & 0xff;
+    out[o++] = ~len & 0xff; out[o++] = (~len >> 8) & 0xff;
+    out.set(data.subarray(start, start + len), o);
+    o += len;
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i++) {
+    crc ^= data[i];
+    for (let b = 0; b < 8; b++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  crc = (crc ^ 0xffffffff) >>> 0;
+  const dv = new DataView(out.buffer);
+  dv.setUint32(o, crc, true);
+  dv.setUint32(o + 4, data.length >>> 0, true);
+  return out;
+}
+
+export function guestCpus(): number {
+  const n = (globalThis as any).navigator?.hardwareConcurrency;
+  return Math.max(1, Math.min(64, typeof n === 'number' && n > 0 ? Math.floor(n) : 1));
+}
+
+// one pagemap entry per page of the largest address space a process can hold (1.5 GiB), which is
+// what bounds a seek into /proc/self/pagemap.
+const PAGEMAP_PAGES = 1610612736 / 4096;
 
 export class InMemoryVFS implements VFS {
   private root: DirInode;
@@ -155,6 +241,10 @@ export class InMemoryVFS implements VFS {
   // credentials of the calling process, injected by the syscall handler for permission
   // checks. null (standalone/tests) means "act as root" (all access granted).
   credsProvider: (() => { ruid: number; euid: number; rgid: number; egid: number }) | null = null;
+  // this process's own cpu accounting, live. the shared table is only refreshed periodically, and
+  // a program that spins on its own utime waiting for it to become nonzero needs the exact number
+  // rather than the last one published.
+  selfCpuProvider: (() => { utimeMs: number; stimeMs: number }) | null = null;
   // path-resolution search-permission state. resolve() enforces +x (search) on each directory
   // component; searchDenied records when a walk failed on a permission (EACCES) vs a missing
   // entry (ENOENT). searchEff selects effective vs real creds for the walk (access() uses real
@@ -167,39 +257,13 @@ export class InMemoryVFS implements VFS {
   // locked-memory accounting (kb) reported via /proc/self/status VmLck. updated by the syscall
   // handler on mmap(MAP_LOCKED)/mlock/munlock/munmap of locked regions.
   vmLckKb = 0;
+  // lazy /proc/self/smaps, alongside maps: the same walk with what each mapping costs.
+  procSmapsGen: (() => string) | null = null;
+
   // lazy /proc/self/maps: the syscall handler registers a renderer that walks its live vma set
   // only when the file is actually read, so mapping-heavy workloads don't pay per-mmap rendering.
   procMapsGen: (() => string) | null = null;
 
-  // mount table backing /proc/mounts, /proc/self/mounts and /proc/self/mountinfo.
-  // the emulator has a single flat in-memory tree, so a mount is a namespace record
-  // rather than a real filesystem graft: it makes the mount point observable to code
-  // that parses those files (ltp verifies its scratch mount actually appeared).
-  private mountTable: Array<{ source: string; target: string; fstype: string }> = [
-    { source: 'tmpfs', target: '/', fstype: 'tmpfs' },
-    { source: 'proc', target: '/proc', fstype: 'proc' },
-  ];
-
-  addMount(source: string, target: string, fstype: string): void {
-    this.mountTable = this.mountTable.filter((m) => m.target !== target);
-    this.mountTable.push({ source: source || fstype, target, fstype });
-  }
-
-  removeMount(target: string): boolean {
-    const before = this.mountTable.length;
-    this.mountTable = this.mountTable.filter((m) => m.target !== target || m.target === '/' || m.target === '/proc');
-    return this.mountTable.length < before;
-  }
-
-  private renderMounts(): string {
-    return this.mountTable.map((m) => `${m.source} ${m.target} ${m.fstype} rw,relatime 0 0`).join('\n') + '\n';
-  }
-
-  private renderMountinfo(): string {
-    // mount_id parent_id major:minor root mount_point options - fs_type source super_options
-    return this.mountTable.map((m, i) =>
-      `${36 + i} 35 0:${30 + i} / ${m.target} rw,relatime - ${m.fstype} ${m.source} rw`).join('\n') + '\n';
-  }
   private nextIno = 1;      // inode counter
   private cwd = '/';
   private cwdInode: DirInode;
@@ -220,7 +284,7 @@ export class InMemoryVFS implements VFS {
   // stamp a freshly created inode with its creator's ownership. new files take the
   // creating process's euid; the gid is inherited from a set-group-ID parent directory,
   // otherwise the creator's egid. a new directory under a sgid parent is itself sgid.
-  private applyCreatorOwnership(inode: InodeBase, parent: DirInode): void {
+  private applyCreatorOwnership(inode: Inode, parent: DirInode): void {
     const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
     inode.uid = c.euid;
     inode.gid = (parent.mode & 0o2000) ? parent.gid : c.egid;
@@ -239,9 +303,9 @@ export class InMemoryVFS implements VFS {
     return dir;
   }
 
-  private makeCharDev(devno: number, mode: number): CharDevInode {
+  private makeCharDev(major: number, minor: number, mode: number): CharDevInode {
     const t = this.now();
-    return { type: 'chardev', ino: this.nextIno++, mode: S_IFCHR | (mode & 0o7777), nlink: 1, uid: 0, gid: 0, atime: t, mtime: t, ctime: t, devno };
+    return { type: 'chardev', ino: this.nextIno++, mode: S_IFCHR | (mode & 0o7777), nlink: 1, uid: 0, gid: 0, atime: t, mtime: t, ctime: t, major, minor };
   }
 
   private makeSymlink(target: string): SymlinkInode {
@@ -274,39 +338,165 @@ export class InMemoryVFS implements VFS {
     this.mkdirp('/proc/self/fd');
     this.mkdirp('/proc/sys/kernel');
     this.mkdirp('/proc/sys/fs');
+    this.mkdirp('/proc/sys/vm');
 
-    this.addCharDev('/dev/null', 1, 0o666);
-    this.addCharDev('/dev/zero', 2, 0o666);
-    this.addCharDev('/dev/tty', 3, 0o666);
-    this.addCharDev('/dev/urandom', 4, 0o444);
-    this.addBlockDev('/dev/ltp-scratch', 0x0700, 0o660);
+    // linux's own assignments (Documentation/admin-guide/devices.txt), so a program that checks
+    // st_rdev, or a node copied to a real filesystem, means the same thing here as anywhere else.
+    this.addCharDev('/dev/null', 1, 3, 0o666);
+    this.addCharDev('/dev/zero', 1, 5, 0o666);
+    this.addCharDev('/dev/full', 1, 7, 0o666);
+    this.addCharDev('/dev/random', 1, 8, 0o444);
+    this.addCharDev('/dev/urandom', 1, 9, 0o444);
+    this.addCharDev('/dev/tty', 5, 0, 0o666);
+    // the jitter control device. reads/writes are special-cased in the syscall layer (the request is
+    // dispatched host-side); the node exists here so it shows up in /dev and can be stat'd like any
+    // other device.
+    // 240-254 are linux's local/experimental character majors, which is exactly what this is.
+    this.addCharDev('/dev/jitter', 240, 0, 0o600);
 
     this.addSymlinkNode('/proc/self/exe', '/bin/busybox');
 
     this.addFileContent('/proc/meminfo',
       'MemTotal:       1048576 kB\nMemFree:         524288 kB\nMemAvailable:    786432 kB\n' +
       'Buffers:          65536 kB\nCached:          131072 kB\nSwapTotal:            0 kB\nSwapFree:             0 kB\n');
+    // one block per cpu the guest can actually run on. processes are workers and threads are
+    // workers, and the browser spreads them over the machine's real cores, so the count is the
+    // host's -- claiming a single processor made every program that sizes a thread pool by it run
+    // single-threaded on hardware that is not.
     this.addFileContent('/proc/cpuinfo',
-      'processor\t: 0\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd aes sha1 sha2 crc32\n' +
-      'CPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0x000\n');
+      Array.from({ length: guestCpus() }, (_, i) =>
+        `processor\t: ${i}\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd aes sha1 sha2 crc32\n` +
+        'CPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x1\nCPU part\t: 0x000\n').join('\n'));
+    // the entropy the random pool holds. ours is the host csprng, which is never short of it, and
+    // RNDGETENTCNT on /dev/random has to report the same number this file does.
+    this.addFileContent('/proc/sys/kernel/random/entropy_avail', '4096\n');
+    this.addFileContent('/proc/sys/kernel/random/poolsize', '4096\n');
     this.addFileContent('/proc/sys/kernel/pid_max', '32768\n');
-    this.addFileContent('/proc/sys/fs/pipe-user-pages-soft', '16384\n');
-    this.addFileContent('/proc/sys/fs/pipe-max-size', '1048576\n');
+    this.addFileContent('/proc/sys/kernel/sched_rr_timeslice_ms', '100\n');
+    // the id the next sysv object of each kind must be given (-1 = no request). the worker binds
+    // these to the shared setting; seeding them is what gives the binding something to replace.
+    this.addFileContent('/proc/sys/kernel/msg_next_id', '-1\n');
+    this.addFileContent('/proc/sys/kernel/sem_next_id', '-1\n');
+    this.addFileContent('/proc/sys/kernel/shm_next_id', '-1\n');
+    // SEMMSL SEMMNS SEMOPM SEMMNI, in that order, exactly as linux prints them.
+    this.addFileContent('/proc/sys/kernel/sem', '32000\t1024000000\t500\t32000\n');
+    // the per-process timer slack, as /proc/<pid>/timerslack_ns reports it. the worker binds it
+    // to the live setting; this seeds the file so the binding has something to replace.
+    this.addFileContent('/proc/self/timerslack_ns', '50000\n');
+    // the sysv message queue limits, which msgget/msgsnd enforce: how many queues may exist, how
+    // large one message may be, and how many bytes a queue holds before a sender waits.
+    // how many threads may exist at once. this is the real ceiling -- the process table's -- not a
+    // number copied from a linux box: a program that sizes a thread pool by it should get an answer
+    // this system can keep.
+    this.addFileContent('/proc/sys/kernel/threads-max', '248\n');
+    // which mappings a core dump would include. no core file is ever written, but the value is
+    // read by programs deciding what to do about their own crashes.
+    this.addFileContent('/proc/self/coredump_filter', '00000033\n');
+    this.addFileContent('/proc/sys/kernel/msgmni', '32000\n');
+    this.addFileContent('/proc/sys/kernel/msgmax', '8192\n');
+    this.addFileContent('/proc/sys/kernel/msgmnb', '16384\n');
+    this.addFileContent('/proc/sys/kernel/shmmax', '18446744073692774399\n');
+    this.addFileContent('/proc/sys/kernel/shmall', '18446744073692774399\n');
+    this.addFileContent('/proc/sys/kernel/shmmni', '4096\n');
+    // no core file is ever written, but the pattern is how a program learns what WOULD be written
+    // and whether a handler pipe is in the way -- which decides whether a crash reports CLD_DUMPED.
+    this.addFileContent('/proc/sys/kernel/core_pattern', 'core\n');
+    // the kernel's own damage report. every ltp test reads it before and after itself to notice a
+    // kernel it broke, and without the file the library aborts the test rather than the check.
+    this.addFileContent('/proc/sys/kernel/tainted', '0\n');
+    // the posix message queue limits, which mq_open enforces.
+    this.mkdirp('/proc/sys/fs/mqueue');
+    this.addFileContent('/proc/sys/fs/mqueue/msg_max', '10\n');
+    this.addFileContent('/proc/sys/fs/mqueue/msgsize_max', '8192\n');
+    this.addFileContent('/proc/sys/fs/mqueue/queues_max', '256\n');
+    this.addFileContent('/proc/sys/fs/pipe-user-pages-soft', `${PIPE_PAGES_SOFT}\n`);
+    // inotify's limits. programs read these to size their own buffers, and ltp reads them to know
+    // what to expect -- a missing file there is not a missing feature, it is a test that cannot run.
+    this.mkdirp('/proc/sys/fs/inotify');
+    this.addFileContent('/proc/sys/fs/inotify/max_queued_events', '16384\n');
+    this.addFileContent('/proc/sys/fs/inotify/max_user_instances', '128\n');
+    this.addFileContent('/proc/sys/fs/inotify/max_user_watches', '65536\n');
+    // must agree with what F_GETPIPE_SZ actually reports; claiming a megabyte here while handing
+    // out 64 KiB pipes is the kind of inconsistency a program resolves by deadlocking.
+    // seeded here and immediately re-pointed at the live setting by the worker (setSysctl), so a
+    // read reports what the system will actually do and a write by root changes it.
+    this.addFileContent('/proc/sys/fs/pipe-max-size', '65536\n');
+    // console_loglevel, default_message_loglevel, minimum_console_loglevel, default_console_loglevel.
+    // ltp's library saves and restores this around any test that talks to the kernel log.
+    this.addFileContent('/proc/sys/kernel/printk', '7\t4\t1\t7\n');
+    this.addFileContent('/proc/sys/vm/max_map_count', '65530\n');
+    // /proc/self describes whoever is asking. it used to report Pid 1 and the name "jitter" to
+    // every process, which is wrong for all but the first one and is exactly what a reader uses
+    // this file to find out.
+    // /proc/self/pagemap. every page of guest memory is genuinely resident -- it is a wasm linear
+    // memory, nothing swaps underneath it -- so PRESENT is not a convenient fiction, it is the
+    // answer. the page frame number is the page's own index, which is as true as any other
+    // identity we could invent for it and keeps distinct pages distinct.
+    this.addFileContent('/proc/self/pagemap', '');
+    this.setRangedFile('/proc/self/pagemap', PAGEMAP_PAGES * 8, (offset, len) => {
+      const out = new Uint8Array(len);
+      const dv = new DataView(out.buffer);
+      const first = Math.floor(offset / 8);
+      const limit = this.memSizeProvider ? Math.floor(this.memSizeProvider() / 4096) : 0;
+      for (let i = 0; i * 8 < len; i++) {
+        const page = first + i;
+        if (page >= limit) continue; // outside the address space: no entry, all zero
+        dv.setBigUint64(i * 8, (1n << 63n) | BigInt(page), true); // PRESENT | pfn
+      }
+      return out;
+    });
+
     this.addFileContent('/proc/self/status', '');
-    this.setDynamicFile('/proc/self/status', () => new TextEncoder().encode(
-      'Name:\tjitter\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\n' +
-      'TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n' +
-      'FDSize:\t64\nGroups:\t0\nVmPeak:\t    65536 kB\nVmSize:\t    65536 kB\nVmRSS:\t    32768 kB\n' +
-      `VmLck:\t${String(this.vmLckKb).padStart(8)} kB\nThreads:\t1\n`));
+    this.setDynamicFile('/proc/self/status', () => new TextEncoder().encode(this.procStatus(this.selfPid)));
+    this.addFileContent('/proc/self/syscall', '');
+    this.setDynamicFile('/proc/self/syscall', () => new TextEncoder().encode(this.procSyscall(this.selfPid)));
+    this.addFileContent('/proc/self/stat', '');
+    this.setDynamicFile('/proc/self/stat', () => new TextEncoder().encode(this.procStat(this.selfPid)));
+    this.addFileContent('/proc/self/cmdline', '');
+    this.setDynamicFile('/proc/self/cmdline', () => new TextEncoder().encode(this.procOf(this.selfPid)?.cmdline ?? ''));
+    this.addFileContent('/proc/self/comm', '');
+    this.setDynamicFile('/proc/self/comm', () => new TextEncoder().encode((this.procOf(this.selfPid)?.comm ?? '') + '\n'));
     this.addFileContent('/proc/self/maps', '');
     this.setDynamicFile('/proc/self/maps', () => new TextEncoder().encode(this.procMapsGen ? this.procMapsGen() : ''));
-    this.addFileContent('/proc/mounts', '');
-    this.setDynamicFile('/proc/mounts', () => new TextEncoder().encode(this.renderMounts()));
-    this.addFileContent('/proc/self/mounts', '');
-    this.setDynamicFile('/proc/self/mounts', () => new TextEncoder().encode(this.renderMounts()));
-    this.addFileContent('/proc/self/mountinfo', '');
-    this.setDynamicFile('/proc/self/mountinfo', () => new TextEncoder().encode(this.renderMountinfo()));
+    this.addFileContent('/proc/self/smaps', '');
+    this.setDynamicFile('/proc/self/smaps', () => new TextEncoder().encode(this.procSmapsGen ? this.procSmapsGen() : ''));
+    const mountTable = 'tmpfs / tmpfs rw,relatime 0 0\nproc /proc proc rw,relatime 0 0\n';
+    this.addFileContent('/proc/mounts', mountTable);
+    // /proc/self/mounts is the per-process view of the same table, and it is the one software
+    // actually opens -- a process asks what IT can see, not what the system as a whole has. we
+    // have no mount namespaces, so the two are the same list, but the name has to exist.
+    this.addFileContent('/proc/self/mounts', mountTable);
+    this.addFileContent('/proc/self/mountinfo', '1 0 0:1 / / rw,relatime - tmpfs tmpfs rw\n');
     this.addFileContent('/proc/filesystems', 'nodev\ttmpfs\n');
+    // every linux has this, and enough software reads it that not having it is a bug of its own.
+    // it says the same thing uname does, because it is the same kernel being described.
+    this.addFileContent('/proc/version', 'Linux version 6.1.0 (jitter@localhost) #1 SMP aarch64\n');
+    this.addFileContent('/proc/cmdline', 'console=hvc0\n');
+    // seconds since boot, then idle seconds across all cpus. we do not account idle time
+    // separately, and a machine that has been busy the whole time reports zero there.
+    this.addFileContent('/proc/uptime', '0.00 0.00\n');
+    // /proc/sysvipc: the only way to ask what SysV ipc objects exist without owning them. ipcs(1)
+    // reads these, and so does anything that wants to know how close the system is to its limits.
+    // the registries are kernel-owned, so each read is a round trip rather than a cached copy.
+    this.mkdirp('/proc/sysvipc');
+    for (const which of ['sem', 'msg', 'shm'] as const) {
+      this.addFileContent(`/proc/sysvipc/${which}`, '');
+      this.setDynamicFile(`/proc/sysvipc/${which}`,
+        () => new TextEncoder().encode(this.sysvipcProvider ? this.sysvipcProvider(which) : ''));
+    }
+    // honest kernel config, so ltp's .needs_kconfigs checks skip (tconf) the features we do not
+    // provide instead of aborting during setup. only what the syscall layer actually implements is
+    // listed: claiming an option we lack turns a clean "not supported" into a mystery failure.
+    // written out here rather than pasted in as a base64 gzip blob, which nobody could edit.
+    this.setFileData('/proc/config.gz', gzipStored(new TextEncoder().encode(
+      '#\n# jitter emulated kernel (arm64) config\n#\n' +
+      ['CONFIG_ARM64', 'CONFIG_64BIT', 'CONFIG_MMU', 'CONFIG_FUTEX', 'CONFIG_EPOLL',
+       'CONFIG_EVENTFD', 'CONFIG_TIMERFD', 'CONFIG_INOTIFY_USER', 'CONFIG_SIGNALFD',
+       'CONFIG_POSIX_TIMERS', 'CONFIG_POSIX_MQUEUE', 'CONFIG_PROC_FS', 'CONFIG_TMPFS',
+       'CONFIG_DEVTMPFS', 'CONFIG_MULTIUSER', 'CONFIG_SYSVIPC', 'CONFIG_FILE_LOCKING',
+       'CONFIG_SHMEM', 'CONFIG_ADVISE_SYSCALLS', 'CONFIG_MEMBARRIER',
+       // msgrcv(MSG_COPY) is the part of checkpoint/restore this kernel has.
+       'CONFIG_CHECKPOINT_RESTORE'].map((k) => k + '=y\n').join(''))), 0o444);
   }
 
   /// in-memory backing for real paths, used by tests and non-bridged hosts.
@@ -374,6 +564,38 @@ export class InMemoryVFS implements VFS {
     this.setFileData(path, new TextEncoder().encode(content), 0o644);
   }
 
+  /** wire a /proc/sys file to the setting it actually names: reads report the live value, writes
+   *  change it (or report a negative errno). */
+  setSysctl(path: string, get: () => string, set: (text: string) => number): void {
+    this.setDynamicFile(path, () => new TextEncoder().encode(get()));
+    const parts = path.split('/').filter((p) => p.length > 0);
+    const name = parts.pop()!;
+    let dir = this.root;
+    for (const part of parts) {
+      const child = dir.children.get(part);
+      if (!child || child.type !== 'dir') return;
+      dir = child;
+    }
+    const inode = dir.children.get(name);
+    if (inode && inode.type === 'file') inode.sysctlWrite = set;
+  }
+
+  /** how much guest memory exists, for the files that describe the address space. */
+  memSizeProvider: (() => number) | null = null;
+
+  private setRangedFile(path: string, size: number, read: (offset: number, len: number) => Uint8Array): void {
+    const parts = path.split('/').filter((p) => p.length > 0);
+    const name = parts.pop()!;
+    let dir = this.root;
+    for (const part of parts) {
+      const child = dir.children.get(part);
+      if (!child || child.type !== 'dir') return;
+      dir = child;
+    }
+    const inode = dir.children.get(name);
+    if (inode && inode.type === 'file') inode.ranged = { size, read };
+  }
+
   private setDynamicFile(path: string, gen: () => Uint8Array): void {
     const parts = path.split('/').filter(p => p.length > 0);
     const name = parts.pop()!;
@@ -400,6 +622,10 @@ export class InMemoryVFS implements VFS {
   private setFileData(path: string, data: Uint8Array, mode: number): void {
     const parts = path.split('/').filter(p => p.length > 0);
     const name = parts.pop()!;
+    // the directories a synthesised file sits in are part of synthesising it: bailing out when one
+    // was missing dropped the file silently, and /proc/sys/kernel/random/entropy_avail simply did
+    // not exist because nothing had made the directory above it first.
+    this.mkdirp('/' + parts.join('/'));
     let dir = this.root;
     for (const part of parts) {
       const child = dir.children.get(part);
@@ -416,7 +642,7 @@ export class InMemoryVFS implements VFS {
     }
   }
 
-  private addCharDev(path: string, devno: number, mode: number): void {
+  private addCharDev(path: string, major: number, minor: number, mode: number): void {
     const parts = path.split('/').filter(p => p.length > 0);
     const name = parts.pop()!;
     let dir = this.root;
@@ -425,22 +651,7 @@ export class InMemoryVFS implements VFS {
       if (!child || child.type !== 'dir') return;
       dir = child;
     }
-    dir.children.set(name, this.makeCharDev(devno, mode));
-  }
-
-  // a scratch block device (stat reports S_IFBLK) so ltp's `.needs_device` tests can
-  // acquire it via LTP_DEV. it is never read/written: those tests mount it as tmpfs.
-  private addBlockDev(path: string, devno: number, mode: number): void {
-    const parts = path.split('/').filter(p => p.length > 0);
-    const name = parts.pop()!;
-    let dir = this.root;
-    for (const part of parts) {
-      const child = dir.children.get(part);
-      if (!child || child.type !== 'dir') return;
-      dir = child;
-    }
-    const t = this.now();
-    dir.children.set(name, { type: 'chardev', ino: this.nextIno++, mode: S_IFBLK | (mode & 0o7777), nlink: 1, uid: 0, gid: 0, atime: t, mtime: t, ctime: t, devno });
+    dir.children.set(name, this.makeCharDev(major, minor, mode));
   }
 
   private addSymlinkNode(path: string, target: string): void {
@@ -491,8 +702,188 @@ export class InMemoryVFS implements VFS {
    * Resolve a path to an inode, following symlinks per Linux rules.
    * Uses pre-split path components to avoid redundant string splitting.
    */
+  /** live process list, supplied by the worker (which owns the shared process table). */
+  procListProvider: (() => ProcInfo[]) | null = null;
+
+  /** the text of /proc/sysvipc/<which>, straight from the kernel's registries. */
+  sysvipcProvider: ((which: 'sem' | 'msg' | 'shm') => string) | null = null;
+  // what /proc/self/fd should contain right now. the fd table lives in the syscall layer, so the
+  // directory can only be honest if that layer hands it over. it was an empty directory, which is a
+  // lie with consequences: anything that counts its own descriptors by listing it (ltp's pipe07,
+  // every "close all fds above 3" loop, lsof-shaped code) concluded it had none open.
+  fdListProvider: (() => Array<{ fd: number; target: string; info: string }>) | null = null;
+  /** which pid /proc/self refers to; the worker keeps it current across fork and exec. */
+  selfPid = 1;
+
+  /**
+   * bring /proc's per-process directories in line with who is actually alive. the tree is a plain
+   * inode structure, so the pid directories are materialised here rather than being faked at read
+   * time -- that way stat, open, getdents and readlink all see the same thing with no special
+   * cases. called on any walk into /proc, which is the only place it can be observed.
+   */
+  private syncProcPids(): void {
+    if (!this.procListProvider) return;
+    const procDir = this.root.children.get('proc');
+    if (!procDir || procDir.type !== 'dir') return;
+
+    const live = this.procListProvider();
+    const want = new Set(live.map((p) => String(p.pid)));
+    for (const name of [...procDir.children.keys()]) {
+      if (/^\d+$/.test(name) && !want.has(name)) procDir.children.delete(name);
+    }
+
+    for (const p of live) {
+      const dir = String(p.pid);
+      if (procDir.children.has(dir)) continue;
+      this.mkdirp(`/proc/${dir}`);
+      this.addFileContent(`/proc/${dir}/stat`, '');
+      this.setDynamicFile(`/proc/${dir}/stat`, () => new TextEncoder().encode(this.procStat(p.pid)));
+      // /proc/<pid>/syscall: the number of the call the process is inside, or "running".
+      this.addFileContent(`/proc/${dir}/syscall`, '');
+      this.setDynamicFile(`/proc/${dir}/syscall`, () => new TextEncoder().encode(this.procSyscall(p.pid)));
+      this.addFileContent(`/proc/${dir}/status`, '');
+      this.setDynamicFile(`/proc/${dir}/status`, () => new TextEncoder().encode(this.procStatus(p.pid)));
+      this.addFileContent(`/proc/${dir}/cmdline`, '');
+      this.setDynamicFile(`/proc/${dir}/cmdline`, () => new TextEncoder().encode(this.procOf(p.pid)?.cmdline ?? ''));
+      this.addFileContent(`/proc/${dir}/comm`, '');
+      this.setDynamicFile(`/proc/${dir}/comm`, () => new TextEncoder().encode((this.procOf(p.pid)?.comm ?? '') + '\n'));
+    }
+
+    // /proc/<pid>/task/<tid>: one directory per thread of the group. a thread's tgid names the
+    // process it belongs to, so the group's members are exactly the entries sharing that tgid.
+    // programs read their own name out of /proc/self/task/<tid>/comm rather than /proc/self/comm
+    // when they care about the THREAD's name -- prctl(PR_SET_NAME) renames a thread, not a process.
+    for (const p of live) {
+      const taskPath = `/proc/${p.pid}/task`;
+      this.mkdirp(taskPath);
+      const members = live.filter((t) => t.tgid === p.pid);
+      const taskDir = this.lookupDir(taskPath);
+      if (taskDir) {
+        const wantTids = new Set(members.map((t) => String(t.pid)));
+        for (const name of [...taskDir.children.keys()]) if (!wantTids.has(name)) taskDir.children.delete(name);
+      }
+      for (const t of members) {
+        const tp = `${taskPath}/${t.pid}`;
+        if (taskDir?.children.has(String(t.pid))) continue;
+        this.addTaskDir(tp, t.pid);
+      }
+    }
+
+    // /proc/self/task mirrors the caller's own group. /proc/self is a real directory here rather
+    // than a symlink, so it needs its own copy.
+    const selfProc = this.procOf(this.selfPid);
+    const selfGroup = selfProc ? live.filter((t) => t.tgid === selfProc.tgid) : [];
+    this.mkdirp('/proc/self/task');
+    const selfTaskDir = this.lookupDir('/proc/self/task');
+    if (selfTaskDir) {
+      const want = new Set(selfGroup.map((t) => String(t.pid)));
+      for (const name of [...selfTaskDir.children.keys()]) if (!want.has(name)) selfTaskDir.children.delete(name);
+      for (const t of selfGroup) {
+        if (selfTaskDir.children.has(String(t.pid))) continue;
+        this.addTaskDir(`/proc/self/task/${t.pid}`, t.pid);
+      }
+    }
+  }
+
+  /** the per-thread files under a /proc/<pid>/task/<tid> directory. */
+  private addTaskDir(path: string, tid: number): void {
+    this.mkdirp(path);
+    this.addFileContent(`${path}/comm`, '');
+    this.setDynamicFile(`${path}/comm`, () => new TextEncoder().encode((this.procOf(tid)?.comm ?? '') + '\n'));
+    this.addFileContent(`${path}/stat`, '');
+    this.setDynamicFile(`${path}/stat`, () => new TextEncoder().encode(this.procStat(tid)));
+    this.addFileContent(`${path}/status`, '');
+    this.setDynamicFile(`${path}/status`, () => new TextEncoder().encode(this.procStatus(tid)));
+  }
+
+  /** the directory inode at an absolute path, or null. */
+  private lookupDir(path: string): DirInode | null {
+    let node: Inode | undefined = this.root;
+    for (const part of path.split('/')) {
+      if (!part) continue;
+      if (!node || node.type !== 'dir') return null;
+      node = node.children.get(part);
+    }
+    return node && node.type === 'dir' ? node : null;
+  }
+
+  private syncSelfFds(): void {
+    if (!this.fdListProvider) return;
+    const live = this.fdListProvider();
+    // a process reaches its own descriptors by either name, so both have to be there and agree.
+    this.fillFdDirs('/proc/self', live);
+    this.fillFdDirs(`/proc/${this.selfPid}`, live);
+  }
+
+  /** the fd and fdinfo directories under one /proc process directory. */
+  private fillFdDirs(base: string, live: Array<{ fd: number; target: string; info: string }>): void {
+    this.mkdirp(`${base}/fd`);
+    this.mkdirp(`${base}/fdinfo`);
+    const dir = this.lookupDir(`${base}/fd`);
+    const infoDir = this.lookupDir(`${base}/fdinfo`);
+    if (!dir || !infoDir) return;
+    dir.children.clear();
+    infoDir.children.clear();
+    for (const e of live) {
+      dir.children.set(String(e.fd), this.makeSymlink(e.target));
+      this.addFileContent(`${base}/fdinfo/${e.fd}`, e.info);
+    }
+  }
+
+  private procOf(pid: number): ProcInfo | null {
+    return this.procListProvider?.().find((p) => p.pid === pid) ?? null;
+  }
+
+  private stateLetter(p: ProcInfo): string {
+    if (p.state === 2) return 'Z';   // PROC_ZOMBIE
+    if (p.state === 4) return 'T';   // PROC_STOPPED -- job control, not sleeping and not gone
+    return p.blocked ? 'S' : 'R';    // parked in a blocking syscall : on cpu
+  }
+
+  /**
+   * /proc/<pid>/stat. the fields we can answer honestly are filled in and the rest are zero, which
+   * is what a reader gets for a process with no accounting anyway. the layout matters more than the
+   * values: ps and friends index fields positionally, and comm is parenthesised because it may
+   * contain spaces (every parser finds it by the LAST ')').
+   */
+  private procStat(pid: number): string {
+    const p = this.procOf(pid) ?? { pid, ppid: 0, pgid: pid, tgid: pid, state: 1, blocked: false, comm: '', cmdline: '' };
+    const own = pid === this.selfPid ? this.selfCpuProvider?.() : undefined;
+    // cpu times here are in clock ticks, and USER_HZ is 100 -- so a hundredth of a second each.
+    const ticks = (ms: number) => Math.floor(ms / 10);
+    const nice = p.nice ?? 0;
+    const f: (string | number)[] = [p.pid, `(${p.comm})`, this.stateLetter(p), p.ppid, p.pgid, p.sid ?? p.pgid, 0, -1, 0];
+    while (f.length < 52) f.push(0);
+    f[13] = ticks(own?.utimeMs ?? p.utimeMs ?? 0);   // utime
+    f[14] = ticks(own?.stimeMs ?? p.stimeMs ?? 0);   // stime
+    f[17] = 20 + nice;                               // priority
+    f[18] = nice;
+    f[19] = 1; // num_threads
+    return f.join(' ') + '\n';
+  }
+
+  private procSyscall(pid: number): string {
+    const n = this.procOf(pid)?.syscall ?? -1;
+    return n < 0 ? 'running\n' : `${n} 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n`;
+  }
+
+  private procStatus(pid: number): string {
+    const p = this.procOf(pid) ?? { pid, ppid: 0, pgid: pid, tgid: pid, state: 1, blocked: false, comm: '', cmdline: '' };
+    const c = this.credsProvider ? this.credsProvider() : { ruid: 0, euid: 0, rgid: 0, egid: 0 };
+    const L = this.stateLetter(p);
+    const state = L === 'Z' ? 'Z (zombie)' : (L === 'S' ? 'S (sleeping)' : 'R (running)');
+    return `Name:\t${p.comm}\nUmask:\t0022\nState:\t${state}\nTgid:\t${p.tgid}\nNgid:\t0\n` +
+      `Pid:\t${p.pid}\nPPid:\t${p.ppid}\nTracerPid:\t0\n` +
+      `Uid:\t${c.ruid}\t${c.euid}\t${c.euid}\t${c.euid}\nGid:\t${c.rgid}\t${c.egid}\t${c.egid}\t${c.egid}\n` +
+      `FDSize:\t64\nGroups:\t0\nVmPeak:\t    65536 kB\nVmSize:\t    65536 kB\nVmRSS:\t    32768 kB\n` +
+      `VmLck:\t${String(this.vmLckKb).padStart(8)} kB\nVmSwap:\t       0 kB\nThreads:\t1\n`;
+  }
+
   private resolve(path: string, followFinal = true, depth = 0, searchEff = true): Inode | null {
-    if (depth === 0) { this.searchDenied = false; this.searchEff = searchEff; this.lastResolveErrno = ENOENT; } // fresh walk
+    if (depth === 0) {
+      this.searchDenied = false; this.searchEff = searchEff; this.lastResolveErrno = ENOENT; // fresh walk
+      if (path.startsWith('/proc') || this.cwd.startsWith('/proc')) { this.syncProcPids(); this.syncSelfFds(); }
+    }
     if (depth > MAX_SYMLINK_DEPTH) { this.lastResolveErrno = ELOOP; return null; }
     const parts = this.normalizeParts(path);
     for (const part of parts) {
@@ -503,11 +894,6 @@ export class InMemoryVFS implements VFS {
 
   // the errno (negative) for the most recent failed resolve().
   resolveErrno(): number { return -this.lastResolveErrno; }
-
-  // public: does a path resolve to an existing inode? used to validate a mount point.
-  exists(path: string): boolean {
-    return this.resolve(path) !== null;
-  }
 
   // execute (search) permission on a directory: needed to traverse into/through it. root can
   // always search. non-root needs the x bit for owner/group/other as applicable.
@@ -586,7 +972,10 @@ export class InMemoryVFS implements VFS {
   /** Resolve parent directory of path. Returns [parentDirInode, childName] or null; on null,
    *  lastResolveErrno holds the reason (ENOENT/ENOTDIR/ENAMETOOLONG/EACCES/ELOOP). */
   private resolveParent(path: string, depth = 0): [DirInode, string] | null {
-    if (depth === 0) this.lastResolveErrno = ENOENT;
+    if (depth === 0) {
+      this.lastResolveErrno = ENOENT;
+      if (path.startsWith('/proc') || this.cwd.startsWith('/proc')) { this.syncProcPids(); this.syncSelfFds(); }
+    }
     if (depth > MAX_SYMLINK_DEPTH) { this.lastResolveErrno = ELOOP; return null; }
 
     const resolved = this.resolvePath(path);
@@ -629,6 +1018,7 @@ export class InMemoryVFS implements VFS {
   }
 
   open(path: string, flags: number, mode: number): number {
+    const resolved = this.resolvePath(path);
     // Validate path length
     if (path.length > PATH_MAX) return -ENAMETOOLONG;
     for (const part of path.split('/')) {
@@ -700,14 +1090,14 @@ export class InMemoryVFS implements VFS {
       const fd = this.takeFd();
       // Snapshot entries including . and ..
       const entries = ['.', '..', ...inode.children.keys()];
-      this.openFds.set(fd, { type: 'dir', inode, entries, pos: 0, refcount: 1 });
+      this.openFds.set(fd, { type: 'dir', path: resolved, inode, entries, pos: 0, refcount: 1 });
       return fd;
     }
 
     // Character device
     if (inode.type === 'chardev') {
       const fd = this.takeFd();
-      this.openFds.set(fd, { type: 'chardev', inode, refcount: 1 });
+      this.openFds.set(fd, { type: 'chardev', path: resolved, inode, refcount: 1 });
       return fd;
     }
 
@@ -719,7 +1109,7 @@ export class InMemoryVFS implements VFS {
       if (acc === O_WRONLY && (flags & O_NONBLOCK) && (inode.readers ?? 0) === 0) return -ENXIO;
       const fd = this.takeFd();
       if (acc === O_RDONLY || acc === O_RDWR) inode.readers = (inode.readers ?? 0) + 1;
-      this.openFds.set(fd, { type: 'fifo', inode, accessMode: acc, refcount: 1 });
+      this.openFds.set(fd, { type: 'fifo', path: resolved, inode, accessMode: acc, refcount: 1 });
       return fd;
     }
 
@@ -737,12 +1127,25 @@ export class InMemoryVFS implements VFS {
     const fd = this.takeFd();
     const accessMode = flags & O_ACCMODE;
     const pos = (flags & O_APPEND) ? inode.data.length : 0;
-    this.openFds.set(fd, { type: 'file', inode, pos, flags, accessMode, refcount: 1, oPath: (flags & O_PATH) !== 0 });
+    this.openFds.set(fd, { type: 'file', path: resolved, inode, pos, flags, accessMode, refcount: 1, oPath: (flags & O_PATH) !== 0 });
     return fd;
   }
 
   /** true if the fd was opened O_PATH: it references a location only, so read/write/fchmod/fchown/
    *  ioctl/mmap on it must fail EBADF. */
+  /** the path an open descriptor was opened by, for /proc/self/fd. */
+  fdPath(fd: number): string | null { return this.openFds.get(fd)?.path ?? null; }
+
+  /** true when the descriptor names a character device. fsync has nothing to flush for one, which
+   *  is why linux answers EINVAL rather than pretending it wrote something back. */
+  isCharDev(fd: number): boolean { return this.openFds.get(fd)?.type === 'chardev'; }
+
+  /** does this descriptor name a directory? *at() syscalls need to know before they resolve. */
+  fdIsDir(fd: number): boolean { return this.openFds.get(fd)?.type === 'dir'; }
+
+  /** every descriptor this vfs holds open. */
+  openFdNumbers(): number[] { return [...this.openFds.keys()]; }
+
   isOPath(fd: number): boolean {
     return (this.openFds.get(fd) as { oPath?: boolean } | undefined)?.oPath === true;
   }
@@ -762,13 +1165,6 @@ export class InMemoryVFS implements VFS {
 
   hasFd(fd: number): boolean {
     return this.openFds.has(fd);
-  }
-
-  // stable inode number backing a descriptor, or null if unknown. used as the
-  // system-wide identity for advisory record locks (fcntl F_SETLK/F_GETLK).
-  inoOfFd(fd: number): number | null {
-    const ofd = this.openFds.get(fd) as { inode?: { ino: number } } | undefined;
-    return ofd?.inode ? ofd.inode.ino : null;
   }
 
   // the O_RDONLY/O_WRONLY/O_RDWR access mode a file descriptor was opened with, or -1 if
@@ -806,17 +1202,16 @@ export class InMemoryVFS implements VFS {
 
     if (ofd.type === 'chardev') {
       const bytes = new Uint8Array(memory.buffer);
-      switch (ofd.inode.devno) {
-        case 1: return 0; // /dev/null → EOF
-        case 2: // /dev/zero → zeros
+      switch (`${ofd.inode.major}:${ofd.inode.minor}`) {
+        case '1:3': return 0;                       // /dev/null -- always at end of file
+        case '1:5': case '1:7':                     // /dev/zero, /dev/full
           bytes.fill(0, buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count);
           return count;
-        case 3: return 0; // /dev/tty → EOF
-        case 4: // /dev/urandom → random
-          for (let i = 0; i < count; i++)
-            bytes[buf + GUEST_MEM_BASE + i] = (Math.random() * 256) | 0;
+        case '1:8': case '1:9': {                   // /dev/random, /dev/urandom
+          crypto.getRandomValues(bytes.subarray(buf + GUEST_MEM_BASE, buf + GUEST_MEM_BASE + count));
           return count;
-        default: return 0;
+        }
+        default: return 0;                          // tty and the control device read through the syscall layer
       }
     }
 
@@ -829,11 +1224,21 @@ export class InMemoryVFS implements VFS {
     // Check read permission
     if (ofd.accessMode === O_WRONLY) return -EBADF;
 
+    const bytes = new Uint8Array(memory.buffer);
+    const ranged = ofd.inode.ranged;
+    if (ranged) {
+      const avail = ranged.size - ofd.pos;
+      const n = Math.min(count, Math.max(0, avail));
+      if (n <= 0) return 0;
+      bytes.set(ranged.read(ofd.pos, n), buf + GUEST_MEM_BASE);
+      ofd.pos += n;
+      return n;
+    }
+
     const available = ofd.inode.data.length - ofd.pos;
     const toRead = Math.min(count, Math.max(0, available));
     if (toRead <= 0) return 0; // EOF
 
-    const bytes = new Uint8Array(memory.buffer);
     bytes.set(ofd.inode.data.subarray(ofd.pos, ofd.pos + toRead), buf + GUEST_MEM_BASE);
     ofd.pos += toRead;
     ofd.inode.atime = this.now();
@@ -845,7 +1250,9 @@ export class InMemoryVFS implements VFS {
     if (!ofd) return -EBADF;
     if (ofd.type === 'file' && ofd.oPath) return -EBADF; // O_PATH fd: not writable
 
-    if (ofd.type === 'chardev') return count; // /dev/null etc: discard
+    // /dev/full is the one device whose whole purpose is to fail a write, and programs test
+    // out-of-space handling against exactly it.
+    if (ofd.type === 'chardev') return (ofd.inode.major === 1 && ofd.inode.minor === 7) ? -28 : count;
     if (ofd.type === 'dir') return -EBADF;
     if (ofd.type !== 'file') return -EBADF;
 
@@ -856,6 +1263,12 @@ export class InMemoryVFS implements VFS {
 
     const guestMax = memory.buffer.byteLength - GUEST_MEM_BASE;
     if (buf < 0 || buf >= guestMax || buf + count > guestMax) return -14; // EFAULT
+
+    if (ofd.inode.sysctlWrite) {
+      const bytes = new Uint8Array(memory.buffer, buf + GUEST_MEM_BASE, count);
+      const rc = ofd.inode.sysctlWrite(new TextDecoder().decode(bytes).trim());
+      return rc < 0 ? rc : count;
+    }
 
     // O_APPEND: atomically seek to end
     if (ofd.flags & O_APPEND) {
@@ -889,7 +1302,7 @@ export class InMemoryVFS implements VFS {
     switch (whence) {
       case 0: newPos = off; break;                         // SEEK_SET
       case 1: newPos = ofd.pos + off; break;               // SEEK_CUR
-      case 2: newPos = ofd.inode.data.length + off; break; // SEEK_END
+      case 2: newPos = (ofd.inode.ranged ? ofd.inode.ranged.size : ofd.inode.data.length) + off; break; // SEEK_END
       default: return BigInt(-EINVAL);
     }
     if (newPos < 0) return BigInt(-EINVAL);
@@ -1242,27 +1655,94 @@ export class InMemoryVFS implements VFS {
 
   // ── Snapshot/restore for fork ───────────────────────────────────────────
 
-  snapshotFds(): Map<number, any> {
-    // Deep copy OFDs, preserving sharing (dup'd fds share same OFD)
-    const ofdMap = new Map<OFD, OFD>();
-    const snap = new Map<number, any>();
+  /**
+   * the open descriptions, as plain data.
+   *
+   * this crosses a postMessage (fork, and the promotion of a process to its first thread), so it
+   * must contain nothing that structured clone refuses. an OFD points at its inode, and a
+   * synthesised /proc inode carries the FUNCTION that computes its contents -- copying the object
+   * graph therefore threw DataCloneError and killed the worker, which is what any program that
+   * held a /proc descriptor across pthread_create saw.
+   *
+   * what the other side needs is the NAME. its own tree is built the same way, so it re-resolves.
+   * dup'd descriptors share one description, and that sharing survives as an index.
+   */
+  snapshotFds(): { ofds: any[]; fds: Array<[number, number]> } {
+    const idx = new Map<OFD, number>();
+    const ofds: any[] = [];
+    const fds: Array<[number, number]> = [];
     for (const [fd, ofd] of this.openFds) {
-      if (!ofdMap.has(ofd)) {
+      if (!idx.has(ofd)) {
+        idx.set(ofd, ofds.length);
+        const d: any = { type: ofd.type, path: ofd.path, refcount: ofd.refcount };
         if (ofd.type === 'file') {
-          ofdMap.set(ofd, { ...ofd });
+          d.pos = ofd.pos; d.flags = ofd.flags; d.accessMode = ofd.accessMode; d.oPath = ofd.oPath;
         } else if (ofd.type === 'dir') {
-          ofdMap.set(ofd, { ...ofd, entries: [...ofd.entries] });
-        } else {
-          ofdMap.set(ofd, { ...ofd });
+          d.entries = [...ofd.entries]; d.pos = ofd.pos;
+        } else if (ofd.type === 'fifo') {
+          d.accessMode = ofd.accessMode;
         }
+        ofds.push(d);
       }
-      snap.set(fd, ofdMap.get(ofd)!);
+      fds.push([fd, idx.get(ofd)!]);
     }
-    return snap;
+    return { ofds, fds };
   }
 
-  restoreFds(snap: Map<number, any>): void {
-    this.openFds = new Map(snap);
+  restoreFds(snap: { ofds: any[]; fds: Array<[number, number]> } | undefined): void {
+    this.openFds = new Map();
+    if (!snap || !Array.isArray(snap.ofds)) return;
+    // /proc/self/fd is filled on demand, so a descriptor into it may name something this tree has
+    // not built yet. build it once before giving up on a name.
+    let synced = false;
+    const rebuilt: Array<OFD | null> = snap.ofds.map((d) => {
+      let node = this.lookupNode(d.path);
+      if (!node && !synced) { synced = true; this.syncSelfFds(); node = this.lookupNode(d.path); }
+      if (!node) return null;
+      if (d.type === 'file' && node.type === 'file') {
+        return { type: 'file', path: d.path, inode: node, pos: d.pos ?? 0, flags: d.flags ?? 0,
+                 accessMode: d.accessMode ?? 0, refcount: d.refcount ?? 1, oPath: d.oPath };
+      }
+      if (d.type === 'dir' && node.type === 'dir') {
+        return { type: 'dir', path: d.path, inode: node, entries: [...(d.entries ?? [])],
+                 pos: d.pos ?? 0, refcount: d.refcount ?? 1 };
+      }
+      if (d.type === 'chardev' && node.type === 'chardev') {
+        return { type: 'chardev', path: d.path, inode: node, refcount: d.refcount ?? 1 };
+      }
+      if (d.type === 'fifo' && node.type === 'fifo') {
+        return { type: 'fifo', path: d.path, inode: node, accessMode: d.accessMode ?? 0,
+                 refcount: d.refcount ?? 1 };
+      }
+      return null;
+    });
+    for (const [fd, i] of snap.fds) {
+      const ofd = rebuilt[i];
+      if (ofd) this.openFds.set(fd, ofd);
+    }
+  }
+
+  /** the device numbers behind a descriptor open on one of our char devices, else null. */
+  fdDevice(fd: number): { major: number; minor: number } | null {
+    const ofd = this.openFds.get(fd);
+    if (!ofd || ofd.type !== 'chardev') return null;
+    return { major: ofd.inode.major, minor: ofd.inode.minor };
+  }
+
+  /** what kind of thing a descriptor of ours is open on, or null when it is not one of ours. */
+  fdOfdType(fd: number): 'file' | 'dir' | 'chardev' | 'fifo' | null {
+    return this.openFds.get(fd)?.type ?? null;
+  }
+
+  /** the inode a path names in this tree, of whatever type, or null. */
+  private lookupNode(path: string): Inode | null {
+    let node: Inode | undefined = this.root;
+    for (const part of path.split('/')) {
+      if (!part) continue;
+      if (!node || node.type !== 'dir') return null;
+      node = node.children.get(part);
+    }
+    return node ?? null;
   }
 
   closeAllExcept(...keep: number[]): void {
@@ -1279,7 +1759,9 @@ export class InMemoryVFS implements VFS {
 
   private writeStat(memory: DataView, guestAddr: number, inode: Inode): void {
     const b = guestAddr + GUEST_MEM_BASE;
-    const rdev = inode.type === 'chardev' ? inode.devno : 0;
+    // linux packs a device number as major in bits 8-19 with the minor split around it.
+    const rdev = inode.type === 'chardev'
+      ? ((inode.major << 8) | (inode.minor & 0xff) | ((inode.minor & ~0xff) << 12)) : 0;
     const size = inode.type === 'file' ? inode.data.length
       : inode.type === 'dir' ? 4096
       : inode.type === 'symlink' ? inode.target.length : 0;

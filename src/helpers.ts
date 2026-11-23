@@ -1,36 +1,16 @@
 // shared js helpers imported by translated wasm modules.
-// these implement arm semantics that don't map naturally to wasm: ieee 754
-// rounding, simd vector ops over linear memory, 128-bit multiply highs.
+// what is left here is what wasm has no instruction for: simd vector ops over linear memory,
+// 128-bit multiply highs, and the crypto extensions. every scalar floating-point helper is
+// gone -- those now emit native wasm f32/f64, which is both faster and bit-exact with the
+// hardware, including a software fma for f64 (see engine/src/softfp.zig).
 
-import { V_OFFSET, GUEST_MEM_BASE } from './types.js';
+import { V_OFFSET as V_BASE, GUEST_MEM_BASE } from './types.js';
 import { aese, aesd, aesmc, aesimc, pmull,
          sha1_3reg, sha1h, sha1su0, sha1su1,
          sha256h, sha256su0, sha256su1,
          sha512h, sha512h2, sha512su0, sha512su1 } from './crypto-ext.js';
 
-const _fpBuf = new ArrayBuffer(8);
-const _f64View = new Float64Array(_fpBuf);
-const _f32View = new Float32Array(_fpBuf);
-const _u64View = new BigUint64Array(_fpBuf);
-
-function f64FromBits(bits: bigint): number {
-  _u64View[0] = BigInt.asUintN(64, bits);
-  return _f64View[0];
-}
-function f64ToBits(val: number): bigint {
-  _f64View[0] = val;
-  return _u64View[0];
-}
-function f32FromBits(bits: number): number {
-  new DataView(_fpBuf).setUint32(0, bits, true);
-  return _f32View[0];
-}
-function f32ToBits(val: number): number {
-  _f32View[0] = val;
-  return new DataView(_fpBuf).getUint32(0, true);
-}
-
-export const helperFunctions: Record<string, Function> = {
+const helperFunctions: Record<string, Function> = {
   smulh(a: bigint, b: bigint): bigint {
     const sa = BigInt.asIntN(64, a);
     const sb = BigInt.asIntN(64, b);
@@ -40,47 +20,6 @@ export const helperFunctions: Record<string, Function> = {
     const ua = BigInt.asUintN(64, a);
     const ub = BigInt.asUintN(64, b);
     return BigInt.asUintN(64, (ua * ub) >> 64n);
-  },
-  f64_mul(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) * f64FromBits(b)); },
-  f64_div(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) / f64FromBits(b)); },
-  f64_add(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) + f64FromBits(b)); },
-  f64_sub(a: bigint, b: bigint): bigint { return f64ToBits(f64FromBits(a) - f64FromBits(b)); },
-  f64_abs(a: bigint): bigint { return f64ToBits(Math.abs(f64FromBits(a))); },
-  f64_neg(a: bigint): bigint { return f64ToBits(-f64FromBits(a)); },
-  f64_sqrt(a: bigint): bigint { return f64ToBits(Math.sqrt(f64FromBits(a))); },
-  f64_min(a: bigint, b: bigint): bigint {
-    const fa = f64FromBits(a); const fb = f64FromBits(b);
-    if (isNaN(fa) || isNaN(fb)) return f64ToBits(NaN);
-    return f64ToBits(Math.min(fa, fb));
-  },
-  f64_max(a: bigint, b: bigint): bigint {
-    const fa = f64FromBits(a); const fb = f64FromBits(b);
-    if (isNaN(fa) || isNaN(fb)) return f64ToBits(NaN);
-    return f64ToBits(Math.max(fa, fb));
-  },
-  f64_from_s64(a: bigint): bigint { return f64ToBits(Number(BigInt.asIntN(64, a))); },
-  f64_from_u64(a: bigint): bigint { return f64ToBits(Number(BigInt.asUintN(64, a))); },
-  f64_from_s32(a: bigint): bigint { return f64ToBits(Number(BigInt.asIntN(32, a))); },
-  f64_from_u32(a: bigint): bigint { return f64ToBits(Number(BigInt.asUintN(32, a))); },
-  f64_to_s64(a: bigint): bigint { return BigInt.asUintN(64, BigInt(Math.trunc(f64FromBits(a)))); },
-  f64_to_u64(a: bigint): bigint { const v = Math.trunc(f64FromBits(a)); return v < 0 ? 0n : BigInt.asUintN(64, BigInt(v)); },
-  f64_to_s32(a: bigint): bigint { return BigInt.asUintN(64, BigInt(Math.trunc(f64FromBits(a))) & 0xFFFFFFFFn); },
-  f64_to_u32(a: bigint): bigint { const v = Math.trunc(f64FromBits(a)); return v < 0 ? 0n : BigInt(v) & 0xFFFFFFFFn; },
-  f32_to_f64(a: bigint): bigint {
-    const f = f32FromBits(Number(a & 0xFFFFFFFFn));
-    return f64ToBits(f);
-  },
-  f64_to_f32(a: bigint): bigint {
-    const f = f64FromBits(a);
-    return BigInt(f32ToBits(Math.fround(f)));
-  },
-  f64_cmp(a: bigint, b: bigint): bigint {
-    const fa = f64FromBits(a);
-    const fb = f64FromBits(b);
-    if (isNaN(fa) || isNaN(fb)) return 3n;
-    if (fa === fb) return 6n;
-    if (fa < fb) return 8n;
-    return 2n;
   },
 };
 
@@ -107,6 +46,7 @@ export const SIMD_ADDHN = 73;
 export const SIMD_UMINP = 22;
 export const SIMD_EXT = 74;
 export const SIMD_REV = 76; // REV16/REV32/REV64: reverse `size`-byte elements within `extra`-byte containers
+export const SIMD_CLZ = 101, SIMD_CLS = 102; // CLZ/CLS (vector): wasm simd has no per-lane count
 export const SIMD_RBIT = 77; // RBIT (vector): reverse the bits within each byte
 export const SIMD_IDX_MUL = 78; // MUL/MLA/MLS + widening S/UMULL,S/UMLAL,S/UMLSL by indexed element
 export const SIMD_XTN = 79; // XTN/XTN2: narrow each element to its low half (size = dest element log2)
@@ -115,10 +55,29 @@ export const SIMD_AESE = 80, SIMD_AESD = 81, SIMD_AESMC = 82, SIMD_AESIMC = 83, 
 export const SIMD_SHA1C = 85, SIMD_SHA1P = 86, SIMD_SHA1M = 87, SIMD_SHA1H = 88, SIMD_SHA1SU0 = 89, SIMD_SHA1SU1 = 90;
 export const SIMD_SHA256H = 91, SIMD_SHA256H2 = 92, SIMD_SHA256SU0 = 93, SIMD_SHA256SU1 = 94;
 export const SIMD_SHA512H = 95, SIMD_SHA512H2 = 96, SIMD_SHA512SU0 = 97, SIMD_SHA512SU1 = 98;
+// gaps wasm SIMD has no instruction for, found by scanning the whole upstream corpus
+export const SIMD_SSHL = 110, SIMD_USHL = 111;   // per-lane variable shift, signed amount in Vm
+export const SIMD_SSRA = 112, SIMD_USRA = 113;   // shift right and accumulate into Vd
+export const SIMD_PAIR_SCALAR = 114;             // reduce the two halves of Vn to one value
+export const SIMD_FMUL_ELEM = 115;               // fp multiply/accumulate by an indexed lane
+export const SIMD_FCVT_HALF = 116;               // IEEE binary16 <-> single/double
 export const SIMD_LDST1_SINGLE = 99; // LD1/ST1 single-lane: extra = index | load<<4 | post<<5, rn=base gpr, rm=post gpr
 
-export function createSimdOp(memory: WebAssembly.Memory) {
+/**
+ * the vector ops wasm has no instruction for, done by hand over the register file.
+ *
+ * `regBase` is where THIS thread's registers live. a threaded process runs every thread against one
+ * shared memory with its own register block, and the translated code addresses registers relative to
+ * the imported reg_base global -- so a helper that assumed the block was at offset 0 read and wrote
+ * the LEADER's vector registers from every thread. anything that went through a helper (umaxv, tbl,
+ * the reductions, the crypto ext) silently operated on another thread's state: a memchr in a thread
+ * scanned for a byte it could never see, and ran off the end of the address space looking.
+ */
+export function createSimdOp(memory: WebAssembly.Memory, regBase?: WebAssembly.Global | null) {
   return function simd_op(packed: bigint, _extra: bigint): bigint {
+    // this thread's register block: the vector file and the general-purpose file both live in it.
+    const REG_BASE = regBase ? (regBase.value as number) : 0;
+    const V_OFFSET = V_BASE + REG_BASE;
     const op = Number((packed >> 56n) & 0xFFn);
     const Q = Number((packed >> 48n) & 0xFFn);
     const size = Number((packed >> 40n) & 0xFFn);
@@ -138,7 +97,7 @@ export function createSimdOp(memory: WebAssembly.Memory) {
         const laneBytes = Q ? 16 : 8;
         const lanes = laneBytes / es;
         const gview = new DataView(memory.buffer);
-        const addr = Number(gview.getBigUint64(rn * 8, true)) + GUEST_MEM_BASE;
+        const addr = Number(gview.getBigUint64(REG_BASE + rn * 8, true)) + GUEST_MEM_BASE;
         const cp = (from: number, to: number) => { for (let k = 0; k < es; k++) buf[to + k] = buf[from + k]; };
         if (isLoad) {
             for (let e = 0; e < lanes; e++) {
@@ -265,6 +224,37 @@ export function createSimdOp(memory: WebAssembly.Memory) {
       return 0n;
     }
 
+    // CLZ/CLS (vector): leading zeros, or leading bits matching the sign bit not counting the
+    // sign itself. wasm SIMD has no per-lane count of either, so both live here.
+    if (op === SIMD_CLZ || op === SIMD_CLS) {
+      const es = 1 << size;
+      const bits = es * 8;
+      const lanes = (Q ? 16 : 8) / es;
+      const view = new DataView(memory.buffer);
+      const vnA = V_OFFSET + rn * 16, vdA = V_OFFSET + rd * 16;
+      const src: bigint[] = [];
+      for (let i = 0; i < lanes; i++) {
+        let v = 0n;
+        for (let k = 0; k < es; k++) v |= BigInt(buf[vnA + i * es + k]) << BigInt(k * 8);
+        src.push(v);
+      }
+      for (let i = 0; i < lanes; i++) {
+        let v = src[i];
+        // CLS counts the run of bits equal to the sign bit, excluding it, which is CLZ of the
+        // value with its sign folded away.
+        // CLS folds the sign away and then counts leading zeros, minus one: the sign bit itself
+        // is not part of the run it reports, so an all-ones lane answers bits-1, not bits.
+        const cls = op === SIMD_CLS;
+        if (cls && ((v >> BigInt(bits - 1)) & 1n)) v = ~v & ((1n << BigInt(bits)) - 1n);
+        let n = 0;
+        for (let b = bits - 1; b >= 0; b--) { if ((v >> BigInt(b)) & 1n) break; n++; }
+        if (cls) n -= 1;
+        for (let k = 0; k < es; k++) buf[vdA + i * es + k] = Number((BigInt(n) >> BigInt(k * 8)) & 0xffn);
+      }
+      if (!Q) view.setBigUint64(vdA + 8, 0n, true);
+      return 0n;
+    }
+
     if (op === SIMD_XTN) {
       // narrow each source element to its low `destEs` bytes. XTN (Q=0) writes the low 64 bits of Vd
       // and zeroes the high half; XTN2 (Q=1) writes the high 64 bits and preserves the low half.
@@ -308,13 +298,13 @@ export function createSimdOp(memory: WebAssembly.Memory) {
       const isLoad = (extra >> 4) & 1;
       const isPost = (extra >> 5) & 1;
       const gv = new DataView(memory.buffer);
-      const addr = Number(gv.getBigUint64(rn * 8, true)) + GUEST_MEM_BASE;
+      const addr = Number(gv.getBigUint64(REG_BASE + rn * 8, true)) + GUEST_MEM_BASE;
       const laneAddr = V_OFFSET + rd * 16 + index * esize;
       if (isLoad) for (let k = 0; k < esize; k++) buf[laneAddr + k] = buf[addr + k];
       else for (let k = 0; k < esize; k++) buf[addr + k] = buf[laneAddr + k];
       if (isPost) {
-        const inc = rm === 31 ? esize : Number(gv.getBigUint64(rm * 8, true));
-        gv.setBigUint64(rn * 8, gv.getBigUint64(rn * 8, true) + BigInt(inc), true);
+        const inc = rm === 31 ? esize : Number(gv.getBigUint64(REG_BASE + rm * 8, true));
+        gv.setBigUint64(REG_BASE + rn * 8, gv.getBigUint64(REG_BASE + rn * 8, true) + BigInt(inc), true);
       }
       return 0n;
     }
@@ -352,6 +342,109 @@ export function createSimdOp(memory: WebAssembly.Memory) {
         for (let k = 0; k < destEs; k++) out[j * destEs + k] = Number((prod >> BigInt(k * 8)) & 0xffn);
       }
       buf.set(out, vdA);
+      return 0n;
+    }
+
+    // ── binary16 <-> single/double ────────────────────────────────────────────
+    // wasm has no f16 type, so the encode and decode are done by hand. extra packs the source
+    // ftype in bits 0..1 and the destination in 2..3 (0 single, 1 double, 3 half).
+    if (op === SIMD_FCVT_HALF) {
+      const srcT = extra & 3, dstT = (extra >> 2) & 3;
+      const vnH = V_OFFSET + rn * 16, vdH = V_OFFSET + rd * 16;
+      const view = new DataView(memory.buffer);
+      const h2f = (h: number): number => {
+        const sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, frac = h & 0x3ff;
+        if (exp === 0) return (sign ? -1 : 1) * frac * Math.pow(2, -24);
+        if (exp === 0x1f) return frac ? NaN : (sign ? -Infinity : Infinity);
+        return (sign ? -1 : 1) * (1 + frac / 1024) * Math.pow(2, exp - 15);
+      };
+      const f2h = (f: number): number => {
+        if (Number.isNaN(f)) return 0x7e00;
+        const sign = (f < 0 || Object.is(f, -0)) ? 0x8000 : 0;
+        const a = Math.abs(f);
+        if (a === Infinity) return sign | 0x7c00;
+        if (a === 0) return sign;
+        if (a >= 65520) return sign | 0x7c00;                 // overflows to infinity
+        if (a < Math.pow(2, -24)) return sign;                 // underflows to zero
+        if (a < Math.pow(2, -14)) return sign | Math.round(a / Math.pow(2, -24)); // subnormal
+        let e = Math.floor(Math.log2(a));
+        let m = a / Math.pow(2, e) - 1;
+        let frac = Math.round(m * 1024);
+        if (frac === 1024) { frac = 0; e += 1; }               // rounding carried into the exponent
+        if (e > 15) return sign | 0x7c00;
+        return sign | ((e + 15) << 10) | frac;
+      };
+      let value: number;
+      if (srcT === 3) value = h2f(view.getUint16(vnH, true));
+      else if (srcT === 0) value = view.getFloat32(vnH, true);
+      else value = view.getFloat64(vnH, true);
+      buf.fill(0, vdH, vdH + 16);
+      if (dstT === 3) view.setUint16(vdH, f2h(value), true);
+      else if (dstT === 0) view.setFloat32(vdH, Math.fround(value), true);
+      else view.setFloat64(vdH, value, true);
+      return 0n;
+    }
+
+    // ── scalar pairwise reduction ─────────────────────────────────────────────
+    // ADDP/FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP in their scalar form: combine the two halves of Vn
+    // into one element in Vd. `size` is 2 for a pair of singles, 3 for a pair of doubles.
+    if (op === SIMD_PAIR_SCALAR) {
+      const vnP = V_OFFSET + rn * 16, vdP = V_OFFSET + rd * 16;
+      const view = new DataView(memory.buffer);
+      const dbl = size === 3;
+      // read BOTH source lanes before touching Vd: the destination is usually the same register
+      // as the source (`addp d0, v0.2d`), so zeroing it first would erase the operands.
+      if (extra === 0) { // integer ADDP, doublewords only
+        const sum = BigInt.asUintN(64, view.getBigUint64(vnP, true) + view.getBigUint64(vnP + 8, true));
+        buf.fill(0, vdP, vdP + 16);
+        view.setBigUint64(vdP, sum, true);
+        return 0n;
+      }
+      const x = dbl ? view.getFloat64(vnP, true) : view.getFloat32(vnP, true);
+      const y = dbl ? view.getFloat64(vnP + 8, true) : view.getFloat32(vnP + 4, true);
+      let r: number;
+      switch (extra) {
+        case 1: r = x + y; break;                                     // fadd
+        // FMAX/FMIN propagate NaN; FMAXNM/FMINNM return the other operand instead.
+        case 2: r = (Number.isNaN(x) || Number.isNaN(y)) ? NaN : Math.max(x, y); break;
+        case 3: r = (Number.isNaN(x) || Number.isNaN(y)) ? NaN : Math.min(x, y); break;
+        case 4: r = Number.isNaN(x) ? y : Number.isNaN(y) ? x : Math.max(x, y); break;
+        default: r = Number.isNaN(x) ? y : Number.isNaN(y) ? x : Math.min(x, y); break;
+      }
+      buf.fill(0, vdP, vdP + 16);
+      if (dbl) view.setFloat64(vdP, r, true);
+      else view.setFloat32(vdP, Math.fround(r), true);
+      return 0n;
+    }
+
+    // ── fp multiply / multiply-accumulate by an indexed lane ──────────────────
+    // extra packs the lane index in bits 0..3, the variant (0 mul, 1 mla, 2 mls) in 4..6, and
+    // the scalar form in bit 7.
+    if (op === SIMD_FMUL_ELEM) {
+      const idxF = extra & 0xf, variantF = (extra >> 4) & 7, scalarF = (extra & 0x80) !== 0;
+      const dbl = size === 3;
+      const es = dbl ? 8 : 4;
+      const vnF = V_OFFSET + rn * 16, vmF = V_OFFSET + rm * 16, vdF = V_OFFSET + rd * 16;
+      const view = new DataView(memory.buffer);
+      const lanes = scalarF ? 1 : ((Q ? 16 : 8) / es);
+      const elem = dbl ? view.getFloat64(vmF + idxF * 8, true) : view.getFloat32(vmF + idxF * 4, true);
+      const out = new Float64Array(lanes);
+      for (let i = 0; i < lanes; i++) {
+        const src = dbl ? view.getFloat64(vnF + i * 8, true) : view.getFloat32(vnF + i * 4, true);
+        let v = src * elem;
+        if (variantF !== 0) {
+          const acc = dbl ? view.getFloat64(vdF + i * 8, true) : view.getFloat32(vdF + i * 4, true);
+          v = variantF === 1 ? acc + v : acc - v;
+        }
+        out[i] = v;
+      }
+      // write only after every lane is computed: Vd may also be Vn or Vm
+      for (let i = 0; i < lanes; i++) {
+        if (dbl) view.setFloat64(vdF + i * 8, out[i], true);
+        else view.setFloat32(vdF + i * 4, Math.fround(out[i]), true);
+      }
+      if (scalarF) buf.fill(0, vdF + es, vdF + 16);
+      else if (!Q) buf.fill(0, vdF + 8, vdF + 16);
       return 0n;
     }
 
@@ -576,6 +669,42 @@ export function createSimdOp(memory: WebAssembly.Memory) {
         }
         break;
       }
+      // SSHL/USHL: shift each lane by the SIGNED amount in the low byte of the corresponding lane
+      // of Vm -- left when positive, right when negative, and a count at or past the lane width
+      // clears the lane rather than wrapping the way a wasm shift would.
+      case SIMD_SSHL: case SIMD_USHL: {
+        const signed = op === SIMD_SSHL;
+        const ebits = esize * 8;
+        for (let i = 0; i < elems; i++) {
+          const amtByte = b_[i * esize];
+          const amt = amtByte > 127 ? amtByte - 256 : amtByte;   // an 8-bit signed shift count
+          let v = signed ? getS(aView, i) : getU(aView, i);
+          if (amt >= 0) {
+            v = amt >= ebits ? 0n : v << BigInt(amt);
+          } else {
+            const r = -amt;
+            if (r >= ebits) v = signed && v < 0n ? -1n : 0n;
+            else v >>= BigInt(r);
+          }
+          put(i, v);
+        }
+        break;
+      }
+      // SSRA/USRA: shift right by `extra` and ADD into what Vd already holds.
+      case SIMD_SSRA: case SIMD_USRA: {
+        const signed = op === SIMD_SSRA;
+        const dOld = new Uint8Array(16); dOld.set(buf.subarray(vd, vd + 16));
+        const oldView = new DataView(dOld.buffer);
+        const ebits = esize * 8;
+        for (let i = 0; i < elems; i++) {
+          let v = signed ? getS(aView, i) : getU(aView, i);
+          if (extra >= ebits) v = signed && v < 0n ? -1n : 0n;
+          else v >>= BigInt(extra);
+          const acc = signed ? getS(oldView, i) : getU(oldView, i);
+          put(i, acc + v);
+        }
+        break;
+      }
       case SIMD_TRN1: case SIMD_TRN2: {
         const phase = op === SIMD_TRN1 ? 0 : 1;
         for (let i = 0; i < elems / 2; i++) {
@@ -600,14 +729,17 @@ export function createEnv(
   regBase?: WebAssembly.Global | null,
   protActive?: WebAssembly.Global | null,
   memFault?: ((addr: number, isWrite: number) => void) | null,
+  protBase?: WebAssembly.Global | null,
 ): Record<string, unknown> {
-  const env: Record<string, unknown> = { memory, ...helperFunctions, simd_op: createSimdOp(memory) };
+  const env: Record<string, unknown> = { memory, ...helperFunctions, simd_op: createSimdOp(memory, regBase) };
   // threaded modules import `env.reg_base` (the per-thread register-block base). single-threaded
   // modules don't import it, so it's only added when provided.
   if (regBase) env.reg_base = regBase;
-  // page-protection modules import `env.prot_active` (the guard on/off flag) and `env.mem_fault`
-  // (raises SIGSEGV/SIGBUS). only added when protection is enabled.
+  // page-protection modules import `env.prot_active` (the guard on/off flag), `env.prot_base` (the
+  // permission table's current base — a global so the host can relocate the table without recompiling)
+  // and `env.mem_fault` (raises SIGSEGV/SIGBUS). only added when protection is enabled.
   if (protActive) env.prot_active = protActive;
+  if (protBase) env.prot_base = protBase;
   if (memFault) env.mem_fault = memFault;
   return env;
 }

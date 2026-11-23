@@ -194,7 +194,86 @@ export const ITER_OFFSET = 0x110;     // 272 — self-loop iteration count
 export const TPIDR_OFFSET = 0x118;    // 280 — TLS base pointer (TPIDR_EL0)
 export const V_OFFSET = 0x200;        // V0-V31 SIMD registers (32 × 16 bytes = 512 bytes)
 export const STATE_SIZE = 0x400;      // 1024 bytes reserved for CPU state (GPR + SIMD)
-export const GUEST_MEM_BASE = 0x10000; // guest memory starts at 64KB
+// guest linear memory starts here; everything BELOW is host-reserved. the low page keeps a guest null
+// dereference away from real data, and [PROT_TABLE_BASE, +PROT_TABLE_SIZE) holds the page-protection
+// permission table. keeping the table below the guest (rather than above its ceiling) means it is
+// always inside the initially-committed memory: it never needs a grow, never moves, and can never be
+// clobbered by the guest growing or by mmap's zero-fill. must match cpu.guest_mem_base in the engine.
+export const GUEST_MEM_BASE = 0x80000;   // 512 KiB
+// 36 KiB, just above the painted flag. it sits as low as it can because everything between here
+// and the guest is the permission table, and the table's size is what caps how much address space
+// a process may have: one byte per 4 KiB page.
+export const PROT_TABLE_BASE = 0x9000;
+// has the permission table been painted yet? it has to live in the memory itself rather than in a
+// worker variable, because the threads of one process share the memory but not their variables:
+// a second thread with its own idea of "not painted yet" would repaint from its own view and wipe
+// what the first one recorded.
+export const PROT_PAINTED_FLAG = 0x8000; // 32 KiB — host-reserved, below the table
+// the lock word the engine uses for 128-bit pair atomics (stxp/casp) in a threaded process. wasm
+// has no 128-bit atomic, so the pair takes this for the few instructions it spans. it is here
+// rather than in the cpu state block because the state block is per-thread and the point is to
+// exclude the other threads of the same process. must match cpu.pair_lock_offset in the engine.
+export const PAIR_LOCK_OFFSET = 0x8008;
+
+// ── threaded-process shared-memory layout ───────────────────────────────────
+// a threaded (pthread-using) process needs a SHARED WebAssembly.Memory, and a shared memory reserves
+// its declared `maximum` as address space the moment it is created — measured on device: only ~4.5 GiB
+// of such reservation exists for the whole WebContent process, regardless of how little is committed
+// (3 x 1.5 GiB with initial:1 page already exhausts it). at the old 1.5 GiB per threaded process, two
+// live groups plus the parked spare sat exactly at that edge, so a third allocation either threw
+// "Out of memory" (pthread_create -> EAGAIN) or got the whole content process jetsam-killed, which
+// looks like the app spontaneously rebooting. sizing the reservation to 512 MiB buys ~8 concurrent
+// threaded processes with real headroom. these constants must agree between kernel and worker, hence
+// living here. layout: guest [GUEST_MEM_BASE, THREAD_REGS_BASE), the 64 per-thread register blocks at
+// THREAD_REGS_BASE, and the atomics shadow at THREADED_SHADOW_BASE (guest_size/512).
+export interface ThreadLayout {
+  /** guest address ceiling; the 64 per-thread register blocks start here */
+  regsBase: number;
+  /** atomics shadow, 4 MiB above the register blocks; sized guest_size/512 */
+  shadowBase: number;
+  /** the thread group's shared vma table, just past the shadow. the address space belongs to the
+   *  PROCESS, so its map of mappings has to live where every thread of it can see the same one. */
+  vmaBase: number;
+  /** the thread group's shared signal dispositions, just past the vma table. sigaction is a
+   *  PROCESS-wide setting -- a handler installed by one thread is the handler every thread of the
+   *  group runs -- so it belongs beside the address space rather than in each thread's own copy. */
+  sigBase: number;
+  /** total wasm pages, through the end of the shadow — this is the memory's `maximum`, i.e. the
+   *  address-space reservation, so it is what limits how many threaded processes can coexist */
+  pages: number;
+}
+
+// tiers, smallest first. the kernel picks one per threaded process from its footprint at promote time
+// and from how much of the reservation budget is left (pickThreadTier), so the common small process
+// costs 256 MiB (~14 concurrent) while a process that is already large still gets room. a shared
+// memory's `maximum` is fixed at creation and cannot be raised, so this choice is one-shot: growing
+// past the chosen tier means ENOMEM to the guest (what a real kernel does at RLIMIT_AS), not a resize.
+// the shared vma table: a 16-byte header (lock, generation, count) then one 12-byte record per
+// mapping, sized for vm.max_map_count. rounded up to whole wasm pages so it can simply be appended
+// to a tier's reservation.
+export const VMA_ENTRY_BYTES = 12;
+// header words: lock, generation, count, brk, mmap cursor. the break and the arena cursor belong
+// to the address space just as much as the mappings do, so they travel with it.
+export const VMA_TABLE_FIRST = 8;   // first entry word, leaving room for the header
+export const VMA_TABLE_HEADER = VMA_TABLE_FIRST * 4;
+export const VMA_TABLE_ENTRIES = 65536;
+export const VMA_TABLE_PAGES = 13; // ceil((16 + 65536*12) / 65536)
+export const VMA_TABLE_BYTES = VMA_TABLE_PAGES * 65536;
+
+// the shared signal dispositions: a header (lock, generation, and which signals have been set at
+// all) then one 8-word record per signal -- handler, flags, restorer and mask, each 64 bits. two
+// kilobytes, rounded up to the one wasm page it is appended to a tier's reservation as.
+export const SIG_TABLE_FIRST = 8;   // first entry word, leaving room for the header
+export const SIG_TABLE_PAGES = 1;
+export const SIG_TABLE_BYTES = SIG_TABLE_PAGES * 65536;
+
+export const THREAD_TIERS: ThreadLayout[] = [
+  { regsBase: 0x10000000, shadowBase: 0x10400000, vmaBase: 0x10480000, sigBase: 0x10480000 + VMA_TABLE_BYTES, pages: 0x1048 + VMA_TABLE_PAGES + SIG_TABLE_PAGES }, // 256 MiB guest
+  { regsBase: 0x20000000, shadowBase: 0x20400000, vmaBase: 0x20500000, sigBase: 0x20500000 + VMA_TABLE_BYTES, pages: 0x2050 + VMA_TABLE_PAGES + SIG_TABLE_PAGES }, // 512 MiB guest
+  { regsBase: 0x40000000, shadowBase: 0x40400000, vmaBase: 0x40600000, sigBase: 0x40600000 + VMA_TABLE_BYTES, pages: 0x4060 + VMA_TABLE_PAGES + SIG_TABLE_PAGES }, // 1 GiB guest
+  { regsBase: 0x60000000, shadowBase: 0x60400000, vmaBase: 0x60700000, sigBase: 0x60700000 + VMA_TABLE_BYTES, pages: 0x6070 + VMA_TABLE_PAGES + SIG_TABLE_PAGES }, // 1.5 GiB guest
+];
+export const DEFAULT_THREAD_LAYOUT = THREAD_TIERS[1];
 
 export function regOffset(r: number): number {
   if (r === 31) return SP_OFFSET;

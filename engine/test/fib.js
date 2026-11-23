@@ -54,8 +54,8 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
   const moduleBytes = new Uint8Array(outLen);
   for (let i = 0; i < outLen; i++) moduleBytes[i] = buf[outOff + i];
 
-  const guestMem = new WebAssembly.Memory({ initial: Math.max(1, 3), maximum: 65536, shared: true });
-  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem } }).then(({ instance: inst2 }) => {
+  const guestMem = new WebAssembly.Memory({ initial: 40, maximum: 40 });
+  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem, reg_base: 0, simd_op: () => { throw new Error('simd_op'); }, mem_fault: () => { throw new Error('mem_fault: guest access out of bounds'); } } }).then(({ instance: inst2 }) => {
     const t2 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     inst2.exports.run();
     const t3 = (typeof performance !== 'undefined' ? performance.now() : Date.now());

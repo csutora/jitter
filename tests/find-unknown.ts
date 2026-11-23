@@ -9,7 +9,6 @@ import { readFileSync } from 'fs';
 const path = process.argv[2] || 'tests/conformance/bin/ltp/getcwd_getcwd01';
 const elfBytes = new Uint8Array(readFileSync(path).buffer);
 const emu = new Emulator(1024);
-emu.singleBlockMode = true;
 emu.elfBytes = elfBytes;
 const vfs = new InMemoryVFS();
 const elfInfo = loadElf(elfBytes, emu.memory);

@@ -58,8 +58,8 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
   const moduleBytes = new Uint8Array(outLen);
   for (let i = 0; i < outLen; i++) moduleBytes[i] = buf[outOff + i];
 
-  const guestMem = new WebAssembly.Memory({ initial: 3, maximum: 65536, shared: true });
-  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem } }).then(({ instance: inst2 }) => {
+  const guestMem = new WebAssembly.Memory({ initial: 40, maximum: 40 });
+  return WebAssembly.instantiate(moduleBytes, { env: { memory: guestMem, reg_base: 0, simd_op: () => { throw new Error('simd_op'); }, mem_fault: () => { throw new Error('mem_fault: guest access out of bounds'); } } }).then(({ instance: inst2 }) => {
     inst2.exports.run();
     const gb = new BigUint64Array(guestMem.buffer);
 
@@ -69,8 +69,8 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
     out('V0.lo=0x' + gb[64].toString(16) + ' (want 0xabcd)');
     out('V0.hi=0x' + gb[65].toString(16) + ' (want 0x1234)');
 
-    const src = new BigUint64Array(guestMem.buffer, 0x10000 + 0x200, 2);
-    const dst = new BigUint64Array(guestMem.buffer, 0x10000 + 0x300, 2);
+    const src = new BigUint64Array(guestMem.buffer, 0x80000 + 0x200, 2);
+    const dst = new BigUint64Array(guestMem.buffer, 0x80000 + 0x300, 2);
     out('src qword pair = (0x' + src[0].toString(16) + ', 0x' + src[1].toString(16) + ')');
     out('dst qword pair = (0x' + dst[0].toString(16) + ', 0x' + dst[1].toString(16) + ')');
 
@@ -78,8 +78,8 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
     out('V1.lo=0x' + gb[66].toString(16) + ' (want 0xbeef)');
     out('V1.hi=0x' + gb[67].toString(16) + ' (want 0)');
 
-    const srcD = new BigUint64Array(guestMem.buffer, 0x10000 + 0x210, 1);
-    const dstD = new BigUint64Array(guestMem.buffer, 0x10000 + 0x310, 1);
+    const srcD = new BigUint64Array(guestMem.buffer, 0x80000 + 0x210, 1);
+    const dstD = new BigUint64Array(guestMem.buffer, 0x80000 + 0x310, 1);
     out('src D = 0x' + srcD[0].toString(16));
     out('dst D = 0x' + dstD[0].toString(16));
 

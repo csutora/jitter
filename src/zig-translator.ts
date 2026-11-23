@@ -37,7 +37,6 @@ interface TranslatorExports {
     shadow_base: number,
     shared_monitor: number,
     protection: number,
-    prot_base: number,
   ): number;
   translator_result_offset(): number;
   translator_result_len(): number;
@@ -50,7 +49,7 @@ let autoloadTried = false;
 /// initialize the zig translator synchronously. `wasmBytes` is the translator.wasm bytecode.
 export function initZigTranslator(wasmBytes: Uint8Array | ArrayBuffer): void {
   const bytes = wasmBytes instanceof Uint8Array ? wasmBytes : new Uint8Array(wasmBytes);
-  initZigTranslatorModule(new WebAssembly.Module(bytes));
+  initZigTranslatorModule(new WebAssembly.Module(bytes as unknown as BufferSource));
 }
 
 /// initialize from an already-compiled module. the kernel compiles translator.wasm ONCE on the
@@ -120,7 +119,7 @@ export function translateRegionZig(
   singleBlock = false,
   threaded = false,
   regBase: WebAssembly.Global | null = null,
-  protection: { protBase: number; protActive: WebAssembly.Global; memFault: (addr: number, isWrite: number) => void } | null = null,
+  protection: { protBase: WebAssembly.Global; protActive: WebAssembly.Global; memFault: (addr: number, isWrite: number) => void } | null = null,
 ): CompiledRegion | null {
   if (!ensureInit()) return null;
 
@@ -137,6 +136,7 @@ export function translateRegionZig(
   if (codeBytes.length < 4) return null;
 
   const ex = exports_;
+  if (!ex) return null;
   const tbuf = new Uint8Array(ex.memory.buffer);
   const inOff = ex.translator_input_buf_offset();
   tbuf.set(codeBytes, inOff);
@@ -151,7 +151,7 @@ export function translateRegionZig(
   // shared_monitor: threaded processes emit reg_base-relative registers, real atomics (LDXR/STXR
   // shadow protocol + LSE), and fences on a SHARED memory. single-threaded (each fork has its own
   // private memory) uses plain value-CAS and skips the shadow protocol entirely.
-  const rc = ex.translator_translate_region(basePCLo, basePCHi, entryLo, entryHi, codeBytes.length, shadowBase, threaded ? 1 : 0, protection ? 1 : 0, protection ? protection.protBase : 0);
+  const rc = ex.translator_translate_region(basePCLo, basePCHi, entryLo, entryHi, codeBytes.length, shadowBase, threaded ? 1 : 0, protection ? 1 : 0);
   if (rc !== 0) return null;
 
   const outLen = ex.translator_result_len();
@@ -180,7 +180,7 @@ export function translateRegionZig(
 
   let inst: WebAssembly.Instance;
   try {
-    inst = new WebAssembly.Instance(mod, { env: createEnv(memory, regBase, protection?.protActive ?? null, protection?.memFault ?? null) });
+    inst = new WebAssembly.Instance(mod, { env: createEnv(memory, regBase, protection?.protActive ?? null, protection?.memFault ?? null, protection?.protBase ?? null) as unknown as WebAssembly.ModuleImports });
   } catch {
     return null;
   }

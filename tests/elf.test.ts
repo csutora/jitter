@@ -91,6 +91,7 @@ describe('elf', () => {
       phentSize: 56,
       phnum: 1,
       brkStart: 0x401000n,
+      loadBase: 0n, segs: [],
     };
 
     const sp = setupStack(memory, elfInfo, ['sh'], ['HOME=/root']);

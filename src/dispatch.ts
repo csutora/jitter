@@ -1,4 +1,4 @@
-import { HALT_PC, SVC_PC, GUEST_MEM_BASE, ITER_OFFSET, PC_OFFSET } from './types.js';
+import { HALT_PC, SVC_PC, GUEST_MEM_BASE, PROT_TABLE_BASE, ITER_OFFSET, PC_OFFSET } from './types.js';
 import type { CompiledRegion } from './types.js';
 import { CpuState } from './cpu.js';
 import { translateRegionZig } from './zig-translator.js';
@@ -19,7 +19,12 @@ const MEM_FAULT = { memFault: true } as const;
 /** true if `e` is the sentinel thrown by a page-protection guard (a guest access to a restricted
  *  page). callers should deliver SIGSEGV to the faulting process. */
 export function isMemFault(e: unknown): boolean { return e === MEM_FAULT; }
-const MAX_PROCESS_BYTES = 1610612736; // 1.5 GiB — must match syscall.ts (per-process address ceiling)
+// how much guest address space one process may have. 1.5 GiB was chosen when we believed the
+// platform ceiling was about 1.25 GiB; it is not -- a single wasm memory reaches 4 GiB, written,
+// and what actually bounds us is total committed bytes across the app (~3.7 GiB measured). the
+// limit now is the permission table, which must fit between PROT_TABLE_BASE and GUEST_MEM_BASE at
+// one byte per 4 KiB page. 1856 MiB needs 464 KiB of table and leaves room to spare.
+const MAX_PROCESS_BYTES = 1856 * 1024 * 1024;
 const SIGSEGV = 11;
 
 export type SyscallHandlerFn = (cpu: CpuState, memory: WebAssembly.Memory) => SyscallResult;
@@ -49,7 +54,10 @@ export class Emulator {
   private protActive: WebAssembly.Global | null = null;
   // permission table's linear-memory offset: placed just above the per-process address ceiling so no
   // guest mapping can ever collide with (and corrupt) it. lazily grown/committed on first use.
-  private readonly protBase = MAX_PROCESS_BYTES + GUEST_MEM_BASE; // 1.5 GiB + 64 KiB
+  // the table's base is an imported mutable global (not a constant), so it can sit just above the
+  // memory's current end instead of forcing a grow out to the process ceiling. see worker.ts.
+  private protBaseGlobal: WebAssembly.Global | null = null;
+  private readonly protBase = PROT_TABLE_BASE;
   private protReady = false;
   private readonly protTableSize = MAX_PROCESS_BYTES >>> 12; // 1 byte per 4 KiB guest page
   private pendingFault: { addr: number; isWrite: number } | null = null;
@@ -70,9 +78,6 @@ export class Emulator {
     // fast path (pages default to accessible). once active, we still record it to clear stale bytes.
     if ((b & 3) === 3 && !this.protReady) return;
     if (!this.protReady) {
-      const need = this.protBase + this.protTableSize;
-      const cur = this.memory.buffer.byteLength;
-      if (need > cur) this.memory.grow(Math.ceil((need - cur) / 65536));
       new Uint8Array(this.memory.buffer).fill(7, this.protBase, this.protBase + this.protTableSize);
       this.protReady = true;
     }
@@ -103,6 +108,7 @@ export class Emulator {
       // the guard reads this mutable global; it stays 0 (fast path — guard skipped) until the first
       // restricted page is created via setPageProt.
       this.protActive = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+      this.protBaseGlobal = new WebAssembly.Global({ value: 'i32', mutable: true }, PROT_TABLE_BASE);
     }
     this.cpu = new CpuState(this.memory, this.stateBase);
   }
@@ -129,7 +135,7 @@ export class Emulator {
     const view = new DataView(this.memory.buffer);
 
     const protection = this.protActive
-      ? { protBase: this.protBase, protActive: this.protActive, memFault: this.memFault }
+      ? { protBase: this.protBaseGlobal!, protActive: this.protActive, memFault: this.memFault }
       : null;
     const zigRegion = translateRegionZig(view, pc, this.memory, this.zigShadowBase, this.zigSingleBlock, this.threaded, this.regBase, protection);
     if (!zigRegion) {
@@ -405,9 +411,9 @@ export class Emulator {
       const sig = sh.pendingSignals.shift()!;
       const r = sh.deliverSignal(this.cpu, this.memory, sig);
       if (r.action === 'exit') {
-        const restored = this.processManager.exit(this.memory, this.cpu, r.exitCode ?? 128 + sig);
+        const restored = this.processManager.exit(this.memory, this.cpu, r.exitCode ?? (0x10000 | sig));
         if (restored) {
-          sh.lastWaitStatus = r.exitCode ?? 128 + sig;
+          sh.lastWaitStatus = r.exitCode ?? (0x10000 | sig);
           sh.lastWaitPid = restored.childPid;
           sh.restoreState(restored.syscallState);
           sh.currentPid = restored.parentPid;

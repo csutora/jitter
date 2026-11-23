@@ -36,7 +36,14 @@ WebAssembly.instantiate(wasm).then(({ instance }) => {
     [0x58000040, 'LDR X0, .+8 (literal)'],
   ];
 
+  // kind 0 is `unknown`: an instruction the decoder does not recognise. printing the kinds is
+  // useful, but the thing worth failing over is any of these landing there.
+  let ok = true;
   for (const [insn, label] of cases) {
-    out('  0x' + insn.toString(16).padStart(8, '0') + '  kind=' + ex.translator_decode_kind(insn) + '  ' + label);
+    const kind = ex.translator_decode_kind(insn);
+    out('  0x' + insn.toString(16).padStart(8, '0') + '  kind=' + kind + '  ' + label);
+    if (kind === 0) { out('    ^ decoded as unknown'); ok = false; }
   }
+  if (!ok) { out('FAIL: some instructions decode as unknown'); return; }
+  out('PASS — every sample instruction decodes');
 });
