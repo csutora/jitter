@@ -1,0 +1,31 @@
+NOTICE
+
+This repository is MIT licensed (see LICENSE), with one exception, recorded here.
+
+assets/busybox-aarch64
+
+  A prebuilt BusyBox binary, included so the emulator has a userspace to boot.
+  It is not covered by LICENSE. BusyBox is licensed under the GNU General Public
+  License, version 2.
+
+    version:  1.37.0 (build timestamp 2026-01-10 15:38:28 UTC)
+    target:   aarch64, statically linked against musl
+    sha256:   973413b9fc64ec686c4c09b157141de17a9c254edf3fca0be86af05e8e7619a2
+    source:   https://busybox.net/downloads/busybox-1.37.0.tar.bz2
+    license:  https://busybox.net/license.html
+
+  No modifications to BusyBox are kept in this repository. The binary is a build
+  of the unmodified 1.37.0 release linked above, and that release is the
+  corresponding source for it.
+
+  The copy at Jitter/Jitter/Resources/busybox-aarch64 is not tracked: build.ts
+  writes it from assets/busybox-aarch64 when the bundle is built.
+
+ghostty/
+
+  A git submodule, not content of this repository. See that project for its own
+  license.
+
+Everything else here is original work covered by LICENSE, including the small
+probe binaries under Jitter/Jitter/Resources, which were built here for the
+emulator to run against.

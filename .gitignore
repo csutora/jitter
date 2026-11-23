@@ -19,6 +19,10 @@ engine/.zig-cache/
 engine/zig-out/
 engine/.claude/
 
+# Prebuilt guest userspace, written into the app bundle by build.ts from
+# assets/busybox-aarch64 (the tracked copy). see NOTICE for its license.
+Jitter/Jitter/Resources/busybox-aarch64
+
 # Large external / regenerable assets (not source)
 Jitter/Jitter/Resources/ltp.tar
 tests/dynamic/alpine/
